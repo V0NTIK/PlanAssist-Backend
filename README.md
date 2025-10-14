@@ -1,2 +1,2 @@
-# oneschool-study-planner
-OneSchool Global AI-powered study planner
+# PlanAssist
+OSG Centered AI-Powered Plan Assistant
