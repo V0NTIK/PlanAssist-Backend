@@ -218,9 +218,26 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
 
+    if (!canvasUrl) {
+      return res.status(400).json({ error: 'Canvas URL is required' });
+    }
+
     // Fetch ICS from Canvas
-    const response = await axios.get(canvasUrl);
+    const response = await axios.get(canvasUrl, {
+      headers: {
+        'Accept': 'text/calendar, text/plain, */*'
+      },
+      timeout: 10000
+    });
+
     const icsData = response.data;
+
+    // Check if response is actually ICS format
+    if (!icsData.includes('BEGIN:VCALENDAR')) {
+      return res.status(400).json({ 
+        error: 'Invalid calendar format. Please check your Canvas calendar URL.' 
+      });
+    }
 
     // Parse ICS
     const events = await ical.async.parseICS(icsData);
@@ -236,10 +253,22 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       }
     }
 
+    // Save Canvas URL for user
+    await pool.query(
+      'UPDATE users SET canvas_url = $1 WHERE id = $2',
+      [canvasUrl, req.user.id]
+    );
+
     res.json({ tasks });
   } catch (error) {
     console.error('Fetch calendar error:', error);
-    res.status(500).json({ error: 'Failed to fetch calendar' });
+    if (error.code === 'ECONNABORTED') {
+      res.status(408).json({ error: 'Request timeout. Please check your Canvas URL and try again.' });
+    } else if (error.response?.status === 404) {
+      res.status(404).json({ error: 'Canvas calendar not found. Please verify your URL is correct.' });
+    } else {
+      res.status(500).json({ error: 'Failed to fetch calendar. Please verify your Canvas URL is correct.' });
+    }
   }
 });
 
@@ -265,11 +294,13 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
 
-    // Insert new tasks
-    const insertPromises = tasks.map(task =>
-      pool.query(
+    // Insert new tasks and return their IDs
+    const insertedTasks = [];
+    for (const task of tasks) {
+      const result = await pool.query(
         `INSERT INTO tasks (user_id, title, description, due_date, task_type, estimated_time, user_estimate, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, title, description, due_date, task_type, estimated_time, user_estimate, completed`,
         [
           req.user.id,
           task.title,
@@ -277,14 +308,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           task.dueDate,
           task.type,
           task.estimatedTime,
-          task.userEstimate,
+          task.userEstimate || null,
           task.completed || false
         ]
-      )
-    );
+      );
+      insertedTasks.push(result.rows[0]);
+    }
 
-    await Promise.all(insertPromises);
-    res.json({ success: true });
+    res.json({ success: true, tasks: insertedTasks });
   } catch (error) {
     console.error('Save tasks error:', error);
     res.status(500).json({ error: 'Failed to save tasks' });
