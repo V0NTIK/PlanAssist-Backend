@@ -23,7 +23,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Increased limit for ICS files
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Database connection
 const pool = new Pool({
