@@ -1,4 +1,4 @@
-// OneSchool Global Study Planner - Backend API
+// OneSchool Global Study Planner - Backend API (ENHANCED)
 // server.js
 
 const express = require('express');
@@ -23,7 +23,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json({ limit: '10mb' })); // Increased limit for ICS files
+app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Database connection
@@ -75,17 +75,14 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Email must be in format: first.last##@na.oneschoolglobal.com' });
     }
 
-    // Check if user exists
     const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (existingUser.rows.length > 0) {
       return res.status(400).json({ error: 'User already exists' });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
     const name = extractNameFromEmail(email);
 
-    // Create user
     const result = await pool.query(
       'INSERT INTO users (email, password, name, is_new_user) VALUES ($1, $2, $3, $4) RETURNING id, email, name, is_new_user',
       [email, hashedPassword, name, true]
@@ -162,7 +159,6 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 
     const user = result.rows[0];
 
-    // Get schedule
     const scheduleResult = await pool.query(
       'SELECT day, period, type FROM schedules WHERE user_id = $1',
       [req.user.id]
@@ -191,16 +187,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const { grade, canvasUrl, presentPeriods, schedule } = req.body;
 
-    // Update user info
     await pool.query(
       'UPDATE users SET grade = $1, canvas_url = $2, present_periods = $3, is_new_user = false WHERE id = $4',
       [grade, canvasUrl, presentPeriods, req.user.id]
     );
 
-    // Clear existing schedule
     await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
 
-    // Insert new schedule
     const insertPromises = [];
     for (const [day, periods] of Object.entries(schedule)) {
       for (const [period, type] of Object.entries(periods)) {
@@ -232,7 +225,6 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Canvas URL is required' });
     }
 
-    // Fetch ICS from Canvas
     const response = await axios.get(canvasUrl, {
       headers: {
         'Accept': 'text/calendar, text/plain, */*'
@@ -242,14 +234,12 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 
     const icsData = response.data;
 
-    // Check if response is actually ICS format
     if (!icsData.includes('BEGIN:VCALENDAR')) {
       return res.status(400).json({ 
         error: 'Invalid calendar format. Please check your Canvas calendar URL.' 
       });
     }
 
-    // Parse ICS
     const events = await ical.async.parseICS(icsData);
     const tasks = [];
 
@@ -263,7 +253,6 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       }
     }
 
-    // Save Canvas URL for user
     await pool.query(
       'UPDATE users SET canvas_url = $1 WHERE id = $2',
       [canvasUrl, req.user.id]
@@ -282,11 +271,11 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   }
 });
 
-// Get tasks
+// Get tasks (including completed for display purposes)
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM tasks WHERE user_id = $1 AND completed = false ORDER BY due_date ASC',
+      'SELECT * FROM tasks WHERE user_id = $1 ORDER BY due_date ASC',
       [req.user.id]
     );
     res.json(result.rows);
@@ -296,17 +285,31 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Save tasks
+// Save tasks (ENHANCED: preserves manual overrides)
 app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
 
+    // Get existing tasks with manual overrides
+    const existingTasks = await pool.query(
+      'SELECT title, user_estimate FROM tasks WHERE user_id = $1 AND user_estimate IS NOT NULL',
+      [req.user.id]
+    );
+
+    // Create a map of manual overrides
+    const overrideMap = {};
+    existingTasks.rows.forEach(task => {
+      overrideMap[task.title] = task.user_estimate;
+    });
+
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
 
-    // Insert new tasks and return their IDs
+    // Insert new tasks, preserving manual overrides
     const insertedTasks = [];
     for (const task of tasks) {
+      const userEstimate = overrideMap[task.title] || task.userEstimate || null;
+      
       const result = await pool.query(
         `INSERT INTO tasks (user_id, title, description, due_date, task_type, estimated_time, user_estimate, completed)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -318,7 +321,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           task.dueDate,
           task.type,
           task.estimatedTime,
-          task.userEstimate || null,
+          userEstimate,
           task.completed || false
         ]
       );
@@ -350,6 +353,52 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
   }
 });
 
+// NEW: Manual task completion (no time recorded)
+app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+
+    await pool.query(
+      'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// NEW: Get global estimate for a task title
+app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res) => {
+  try {
+    const taskTitle = decodeURIComponent(req.params.title);
+
+    const result = await pool.query(
+      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as completion_count
+       FROM completion_history 
+       WHERE task_title = $1
+       GROUP BY task_title
+       HAVING COUNT(*) >= 3`,
+      [taskTitle]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({ 
+        estimate: result.rows[0].avg_time,
+        completionCount: result.rows[0].completion_count,
+        source: 'global'
+      });
+    } else {
+      res.json({ estimate: null });
+    }
+  } catch (error) {
+    console.error('Get global estimate error:', error);
+    res.status(500).json({ error: 'Failed to get global estimate' });
+  }
+});
+
 // ============ SESSION ROUTES ============
 
 // Get completion history (for AI learning)
@@ -371,7 +420,6 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
   try {
     const { completions, day, period } = req.body;
 
-    // Save each completion
     const insertPromises = completions.map(completion =>
       pool.query(
         `INSERT INTO completion_history 
@@ -389,7 +437,6 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
 
     await Promise.all(insertPromises);
 
-    // Mark tasks as completed
     const taskIds = completions.map(c => c.task.id);
     if (taskIds.length > 0) {
       await pool.query(
@@ -402,6 +449,69 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Save session error:', error);
     res.status(500).json({ error: 'Failed to save session' });
+  }
+});
+
+// NEW: Save session state (for resume capability)
+app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
+  try {
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completions } = req.body;
+
+    // Delete any existing session state for this user
+    await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+
+    // Insert new session state
+    await pool.query(
+      `INSERT INTO session_state 
+       (user_id, session_id, day, period, remaining_time, current_task_index, task_start_time, completions, saved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+      [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, JSON.stringify(completions)]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save session state error:', error);
+    res.status(500).json({ error: 'Failed to save session state' });
+  }
+});
+
+// NEW: Get saved session state
+app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM session_state WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length > 0) {
+      const state = result.rows[0];
+      res.json({
+        sessionId: state.session_id,
+        day: state.day,
+        period: state.period,
+        remainingTime: state.remaining_time,
+        currentTaskIndex: state.current_task_index,
+        taskStartTime: state.task_start_time,
+        completions: JSON.parse(state.completions),
+        savedAt: state.saved_at
+      });
+    } else {
+      res.json({ savedState: null });
+    }
+  } catch (error) {
+    console.error('Get session state error:', error);
+    res.status(500).json({ error: 'Failed to get session state' });
+  }
+});
+
+// NEW: Clear saved session state
+app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Clear session state error:', error);
+    res.status(500).json({ error: 'Failed to clear session state' });
   }
 });
 
