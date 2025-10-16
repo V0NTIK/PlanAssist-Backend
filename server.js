@@ -32,6 +32,23 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// Initialize session_state table if it doesn't exist
+pool.query(`
+  CREATE TABLE IF NOT EXISTS session_state (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    session_id VARCHAR(100) NOT NULL,
+    day VARCHAR(20) NOT NULL,
+    period INTEGER NOT NULL,
+    remaining_time INTEGER NOT NULL,
+    current_task_index INTEGER NOT NULL,
+    task_start_time INTEGER NOT NULL,
+    completions JSONB,
+    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id)
+  )
+`).catch(err => console.error('Error creating session_state table:', err));
+
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-key';
 
@@ -353,7 +370,7 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Manual task completion (no time recorded)
+// Manual task completion (no time recorded)
 app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
     const taskId = req.params.id;
@@ -370,7 +387,7 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Get global estimate for a task title
+// Get global estimate for a task title
 app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res) => {
   try {
     const taskTitle = decodeURIComponent(req.params.title);
@@ -452,7 +469,7 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Save session state (for resume capability)
+// Save session state (for resume capability)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
     const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completions } = req.body;
@@ -475,7 +492,7 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Get saved session state
+// Get saved session state
 app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -504,7 +521,7 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Clear saved session state
+// Clear saved session state
 app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
