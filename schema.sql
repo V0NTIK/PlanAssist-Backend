@@ -50,6 +50,31 @@ CREATE TABLE completion_history (
     completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Session state table (for resume capability)
+CREATE TABLE session_state (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    session_id VARCHAR(100) NOT NULL,
+    day VARCHAR(20) NOT NULL,
+    period INTEGER NOT NULL,
+    remaining_time INTEGER NOT NULL,
+    current_task_index INTEGER NOT NULL,
+    task_start_time INTEGER NOT NULL,
+    completions JSONB,
+    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id)
+);
+
+-- Feedback table (for user feedback and bug reports)
+CREATE TABLE feedback (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_email VARCHAR(255),
+    user_name VARCHAR(255),
+    feedback_text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes for performance
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_tasks_user_id ON tasks(user_id);
@@ -58,6 +83,9 @@ CREATE INDEX idx_tasks_completed ON tasks(completed);
 CREATE INDEX idx_schedules_user_id ON schedules(user_id);
 CREATE INDEX idx_completion_history_user_id ON completion_history(user_id);
 CREATE INDEX idx_completion_history_type ON completion_history(task_type);
+CREATE INDEX idx_session_state_user_id ON session_state(user_id);
+CREATE INDEX idx_feedback_user_id ON feedback(user_id);
+CREATE INDEX idx_feedback_created_at ON feedback(created_at);
 
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -72,8 +100,10 @@ $$ language 'plpgsql';
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Sample comment for verification
+-- Comments for documentation
 COMMENT ON TABLE users IS 'OneSchool Global student accounts';
 COMMENT ON TABLE tasks IS 'Student tasks from Canvas calendar';
 COMMENT ON TABLE schedules IS 'Weekly period schedule (Study vs Lesson)';
 COMMENT ON TABLE completion_history IS 'Task completion data for AI learning';
+COMMENT ON TABLE session_state IS 'Saved study session state for resume capability';
+COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests';
