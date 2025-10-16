@@ -295,11 +295,13 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       'SELECT * FROM tasks WHERE user_id = $1 ORDER BY due_date ASC',
       [req.user.id]
     );
-    // Ensure we always return an array
-    res.json(result.rows || []);
+    // Always return an array
+    const rows = result.rows || [];
+    res.json(rows);
   } catch (error) {
     console.error('Get tasks error:', error);
-    res.status(500).json({ error: 'Failed to get tasks' });
+    // Return empty array on error instead of error object
+    res.json([]);
   }
 });
 
@@ -431,10 +433,13 @@ app.get('/api/learning', authenticateToken, async (req, res) => {
       'SELECT * FROM completion_history WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 100',
       [req.user.id]
     );
-    res.json(result.rows);
+    // Always return an array, even if empty
+    const rows = result.rows || [];
+    res.json(rows);
   } catch (error) {
     console.error('Get learning error:', error);
-    res.status(500).json({ error: 'Failed to get learning data' });
+    // Return empty array on error instead of error object
+    res.json([]);
   }
 });
 
