@@ -188,9 +188,9 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
     });
 
     res.json({
-      grade: user.grade,
-      canvasUrl: user.canvas_url,
-      presentPeriods: user.present_periods,
+      grade: user.grade || '',
+      canvasUrl: user.canvas_url || '',
+      presentPeriods: user.present_periods || '2-6',
       schedule
     });
   } catch (error) {
