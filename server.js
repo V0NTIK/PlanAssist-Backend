@@ -295,7 +295,8 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       'SELECT * FROM tasks WHERE user_id = $1 ORDER BY due_date ASC',
       [req.user.id]
     );
-    res.json(result.rows);
+    // Ensure we always return an array
+    res.json(result.rows || []);
   } catch (error) {
     console.error('Get tasks error:', error);
     res.status(500).json({ error: 'Failed to get tasks' });
@@ -307,6 +308,11 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
 
+    // Validate that tasks is an array
+    if (!Array.isArray(tasks)) {
+      return res.status(400).json({ error: 'Tasks must be an array' });
+    }
+
     // Get existing tasks with manual overrides
     const existingTasks = await pool.query(
       'SELECT title, user_estimate FROM tasks WHERE user_id = $1 AND user_estimate IS NOT NULL',
@@ -315,7 +321,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
     // Create a map of manual overrides
     const overrideMap = {};
-    existingTasks.rows.forEach(task => {
+    (existingTasks.rows || []).forEach(task => {
       overrideMap[task.title] = task.user_estimate;
     });
 
