@@ -532,6 +532,28 @@ app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   }
 });
 
+// ============ FEEDBACK ROUTE ============
+
+app.post('/api/feedback', authenticateToken, async (req, res) => {
+  try {
+    const { feedback, userEmail, userName } = req.body;
+
+    if (!feedback || feedback.trim().length === 0) {
+      return res.status(400).json({ error: 'Feedback cannot be empty' });
+    }
+
+    await pool.query(
+      'INSERT INTO feedback (user_id, user_email, user_name, feedback_text, created_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)',
+      [req.user.id, userEmail, userName, feedback]
+    );
+
+    res.json({ success: true, message: 'Feedback submitted successfully' });
+  } catch (error) {
+    console.error('Feedback error:', error);
+    res.status(500).json({ error: 'Failed to submit feedback' });
+  }
+});
+
 // ============ HEALTH CHECK ============
 
 app.get('/health', (req, res) => {
