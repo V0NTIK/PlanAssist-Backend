@@ -1,4 +1,4 @@
--- OneSchool Global Study Planner - Database Schema
+-- OneSchool Global Study Planner - Database Schema (UPDATED)
 -- Run this in your Supabase SQL Editor
 
 -- Users table
@@ -10,6 +10,7 @@ CREATE TABLE users (
     grade VARCHAR(10),
     canvas_url TEXT,
     present_periods VARCHAR(10) DEFAULT '2-6',
+    priority_locked BOOLEAN DEFAULT FALSE,
     is_new_user BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -25,6 +26,8 @@ CREATE TABLE tasks (
     task_type VARCHAR(50),
     estimated_time INTEGER NOT NULL,
     user_estimate INTEGER,
+    priority_order INTEGER,
+    is_new BOOLEAN DEFAULT FALSE,
     completed BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -80,6 +83,8 @@ CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_tasks_user_id ON tasks(user_id);
 CREATE INDEX idx_tasks_due_date ON tasks(due_date);
 CREATE INDEX idx_tasks_completed ON tasks(completed);
+CREATE INDEX idx_tasks_priority_order ON tasks(priority_order);
+CREATE INDEX idx_tasks_is_new ON tasks(is_new);
 CREATE INDEX idx_schedules_user_id ON schedules(user_id);
 CREATE INDEX idx_completion_history_user_id ON completion_history(user_id);
 CREATE INDEX idx_completion_history_type ON completion_history(task_type);
@@ -107,3 +112,17 @@ COMMENT ON TABLE schedules IS 'Weekly period schedule (Study vs Lesson)';
 COMMENT ON TABLE completion_history IS 'Task completion data for AI learning';
 COMMENT ON TABLE session_state IS 'Saved study session state for resume capability';
 COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests';
+
+-- Migration script for existing databases
+-- Run these ALTER statements if you already have the tables created:
+
+-- Add new columns to users table
+ALTER TABLE users ADD COLUMN IF NOT EXISTS priority_locked BOOLEAN DEFAULT FALSE;
+
+-- Add new columns to tasks table
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority_order INTEGER;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_new BOOLEAN DEFAULT FALSE;
+
+-- Create new indexes
+CREATE INDEX IF NOT EXISTS idx_tasks_priority_order ON tasks(priority_order);
+CREATE INDEX IF NOT EXISTS idx_tasks_is_new ON tasks(is_new);
