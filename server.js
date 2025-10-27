@@ -861,54 +861,65 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 
     // If there's a partial task with time spent, save or update its partial completion time
     if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
+      console.log('Attempting to save partial completion for task ID:', partialTaskId);
+      
       // Get the task title for the partial completion
       const taskResult = await pool.query(
-        'SELECT title FROM tasks WHERE id = $1 AND user_id = $2',
+        'SELECT title, completed FROM tasks WHERE id = $1 AND user_id = $2',
         [partialTaskId, req.user.id]
       );
 
       if (taskResult.rows.length > 0) {
-        const taskTitle = taskResult.rows[0].title;
-        console.log('Saving partial completion for task:', taskTitle);
+        const task = taskResult.rows[0];
+        
+        // Only save partial completion if task is not already completed
+        if (!task.completed) {
+          const taskTitle = task.title;
+          console.log('✓ Found task:', taskTitle);
 
-        // Check if partial completion already exists
-        const existingPartial = await pool.query(
-          'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
-          [req.user.id, partialTaskId]
-        );
-
-        if (existingPartial.rows.length > 0) {
-          const previousTime = existingPartial.rows[0].accumulated_time;
-          console.log('Existing partial time:', previousTime, 'minutes');
-          
-          // Update existing partial completion
-          const result = await pool.query(
-            `UPDATE partial_completions 
-             SET accumulated_time = accumulated_time + $1,
-                 last_updated = CURRENT_TIMESTAMP
-             WHERE user_id = $2 AND task_id = $3
-             RETURNING accumulated_time`,
-            [partialTaskTime, req.user.id, partialTaskId]
+          // Check if partial completion already exists
+          const existingPartial = await pool.query(
+            'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+            [req.user.id, partialTaskId]
           );
-          
-          console.log('Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
+
+          if (existingPartial.rows.length > 0) {
+            const previousTime = existingPartial.rows[0].accumulated_time;
+            console.log('→ Existing partial time:', previousTime, 'minutes');
+            
+            // Update existing partial completion
+            const result = await pool.query(
+              `UPDATE partial_completions 
+               SET accumulated_time = accumulated_time + $1,
+                   last_updated = CURRENT_TIMESTAMP
+               WHERE user_id = $2 AND task_id = $3
+               RETURNING accumulated_time`,
+              [partialTaskTime, req.user.id, partialTaskId]
+            );
+            
+            console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
+          } else {
+            // Insert new partial completion
+            const result = await pool.query(
+              `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
+               VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+               RETURNING accumulated_time`,
+              [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+            );
+            
+            console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+          }
         } else {
-          // Insert new partial completion
-          const result = await pool.query(
-            `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
-             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-             RETURNING accumulated_time`,
-            [req.user.id, partialTaskId, taskTitle, partialTaskTime]
-          );
-          
-          console.log('Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+          console.log('⚠ Task is already completed, skipping partial completion save');
         }
       } else {
-        console.log('ERROR: Task not found for partial completion. Task ID:', partialTaskId);
-        return res.status(400).json({ error: 'Task not found for partial completion' });
+        // Task not found - log warning but don't fail the entire save
+        console.log('⚠ WARNING: Task ID', partialTaskId, 'not found in database.');
+        console.log('  This could mean the task was deleted or the ID is invalid.');
+        console.log('  Continuing with session save without partial completion.');
       }
     } else {
-      console.log('No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
+      console.log('ℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
     }
 
     // Insert new session state
