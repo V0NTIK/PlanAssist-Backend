@@ -850,13 +850,17 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
     const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
 
-    console.log('Save state request:', { sessionId, partialTaskId, partialTaskTime });
+    console.log('=== SAVE STATE REQUEST ===');
+    console.log('Session ID:', sessionId);
+    console.log('Partial Task ID:', partialTaskId);
+    console.log('Partial Task Time:', partialTaskTime);
+    console.log('Completed Task IDs:', completedTaskIds);
 
     // Delete any existing session state for this user
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
 
-    // If there's a partial task, save or update its partial completion time
-    if (partialTaskId && partialTaskTime > 0) {
+    // If there's a partial task with time spent, save or update its partial completion time
+    if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
       // Get the task title for the partial completion
       const taskResult = await pool.query(
         'SELECT title FROM tasks WHERE id = $1 AND user_id = $2',
@@ -865,24 +869,46 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 
       if (taskResult.rows.length > 0) {
         const taskTitle = taskResult.rows[0].title;
-        console.log('Saving partial completion:', { taskId: partialTaskId, taskTitle, time: partialTaskTime });
+        console.log('Saving partial completion for task:', taskTitle);
 
-        // Upsert partial completion
-        const result = await pool.query(
-          `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
-           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-           ON CONFLICT (user_id, task_id)
-           DO UPDATE SET 
-             accumulated_time = partial_completions.accumulated_time + EXCLUDED.accumulated_time,
-             last_updated = CURRENT_TIMESTAMP
-           RETURNING accumulated_time`,
-          [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+        // Check if partial completion already exists
+        const existingPartial = await pool.query(
+          'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+          [req.user.id, partialTaskId]
         );
-        
-        console.log('Partial completion saved. Total accumulated:', result.rows[0].accumulated_time);
+
+        if (existingPartial.rows.length > 0) {
+          const previousTime = existingPartial.rows[0].accumulated_time;
+          console.log('Existing partial time:', previousTime, 'minutes');
+          
+          // Update existing partial completion
+          const result = await pool.query(
+            `UPDATE partial_completions 
+             SET accumulated_time = accumulated_time + $1,
+                 last_updated = CURRENT_TIMESTAMP
+             WHERE user_id = $2 AND task_id = $3
+             RETURNING accumulated_time`,
+            [partialTaskTime, req.user.id, partialTaskId]
+          );
+          
+          console.log('Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
+        } else {
+          // Insert new partial completion
+          const result = await pool.query(
+            `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+             RETURNING accumulated_time`,
+            [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+          );
+          
+          console.log('Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+        }
       } else {
-        console.log('Task not found for partial completion:', partialTaskId);
+        console.log('ERROR: Task not found for partial completion. Task ID:', partialTaskId);
+        return res.status(400).json({ error: 'Task not found for partial completion' });
       }
+    } else {
+      console.log('No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
     }
 
     // Insert new session state
@@ -893,11 +919,14 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
       [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds || []]
     );
 
-    console.log('Session state saved successfully');
+    console.log('✓ Session state saved successfully');
+    console.log('=========================\n');
     res.json({ success: true });
   } catch (error) {
-    console.error('Save session state error:', error);
-    res.status(500).json({ error: 'Failed to save session state' });
+    console.error('❌ Save session state error:', error);
+    console.error('Error details:', error.message);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ error: 'Failed to save session state', details: error.message });
   }
 });
 
