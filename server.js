@@ -32,7 +32,7 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Initialize session_state table if it doesn't exist
+// Initialize tables if they don't exist
 pool.query(`
   CREATE TABLE IF NOT EXISTS session_state (
     id SERIAL PRIMARY KEY,
@@ -43,11 +43,23 @@ pool.query(`
     remaining_time INTEGER NOT NULL,
     current_task_index INTEGER NOT NULL,
     task_start_time INTEGER NOT NULL,
-    completions JSONB,
+    completed_task_ids INTEGER[] DEFAULT '{}',
     saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id)
   )
 `).catch(err => console.error('Error creating session_state table:', err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS partial_completions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    task_title VARCHAR(500) NOT NULL,
+    accumulated_time INTEGER NOT NULL DEFAULT 0,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, task_id)
+  )
+`).catch(err => console.error('Error creating partial_completions table:', err));
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-key';
@@ -593,34 +605,218 @@ app.get('/api/learning', authenticateToken, async (req, res) => {
   }
 });
 
-// Save session completion
-app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
-  try {
-    const { completions, day, period } = req.body;
+// Helper function to extract parent task title from segment title
+const extractParentTaskTitle = (taskTitle) => {
+  // Matches patterns like "Task - Part 1", "Task  - Segment 2", etc.
+  const segmentPattern = /^(.+?)\s*-\s*(Part|Segment)\s+\d+$/i;
+  const match = taskTitle.match(segmentPattern);
+  return match ? match[1].trim() : null;
+};
 
-    const insertPromises = completions.map(completion =>
-      pool.query(
-        `INSERT INTO completion_history 
-         (user_id, task_title, task_type, estimated_time, actual_time)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          req.user.id,
-          completion.task.title,
-          completion.task.type,
-          completion.task.estimatedTime,
-          completion.timeSpent
-        ]
-      )
+// Helper function to check if a task is a segment
+const isTaskSegment = (taskTitle) => {
+  return /\s*-\s*(Part|Segment)\s+\d+$/i.test(taskTitle);
+};
+
+// Immediate task completion (called when user clicks "Mark Complete" in session)
+app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, taskTitle, taskType, estimatedTime, actualTime } = req.body;
+
+    // Get any partial time for this task
+    const partialResult = await pool.query(
+      'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+      [req.user.id, taskId]
     );
 
-    await Promise.all(insertPromises);
+    const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
+    const totalTime = actualTime + partialTime;
 
-    const taskIds = completions.map(c => c.task.id);
-    if (taskIds.length > 0) {
-      await pool.query(
-        'UPDATE tasks SET completed = true WHERE id = ANY($1::int[]) AND user_id = $2',
-        [taskIds, req.user.id]
+    // Check if this is a task segment
+    const parentTaskTitle = extractParentTaskTitle(taskTitle);
+    const isSegment = parentTaskTitle !== null;
+
+    // Insert into completion_history
+    await pool.query(
+      `INSERT INTO completion_history 
+       (user_id, task_id, task_title, task_type, estimated_time, actual_time, parent_task_title, is_segment)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        req.user.id,
+        taskId,
+        taskTitle,
+        taskType,
+        estimatedTime,
+        totalTime,
+        parentTaskTitle,
+        isSegment
+      ]
+    );
+
+    // Mark task as completed
+    await pool.query(
+      'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    // Remove from partial_completions if exists
+    await pool.query(
+      'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+      [req.user.id, taskId]
+    );
+
+    // If this is a segment, check if all segments of the parent task are complete
+    if (isSegment) {
+      // Find all segments of the same parent task
+      const segmentsResult = await pool.query(
+        `SELECT id, title, task_type, estimated_time 
+         FROM tasks 
+         WHERE user_id = $1 
+         AND title LIKE $2`,
+        [req.user.id, `${parentTaskTitle} - %`]
       );
+
+      // Check if all segments are completed
+      const completedSegmentsResult = await pool.query(
+        `SELECT task_id, task_title, actual_time 
+         FROM completion_history 
+         WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true`,
+        [req.user.id, parentTaskTitle]
+      );
+
+      const allSegments = segmentsResult.rows;
+      const completedSegments = completedSegmentsResult.rows;
+
+      if (allSegments.length > 0 && allSegments.length === completedSegments.length) {
+        // All segments are complete, create aggregated completion
+        const totalActualTime = completedSegments.reduce((sum, seg) => sum + seg.actual_time, 0);
+        const totalEstimatedTime = allSegments.reduce((sum, seg) => sum + seg.estimated_time, 0);
+
+        // Insert aggregated completion for parent task
+        await pool.query(
+          `INSERT INTO completion_history 
+           (user_id, task_title, task_type, estimated_time, actual_time, is_segment)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            req.user.id,
+            parentTaskTitle,
+            allSegments[0].task_type,
+            totalEstimatedTime,
+            totalActualTime,
+            false
+          ]
+        );
+
+        // Optionally, delete individual segment completions to keep history clean
+        // (Commented out to preserve segment data for detailed analysis)
+        // await pool.query(
+        //   'DELETE FROM completion_history WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true',
+        //   [req.user.id, parentTaskTitle]
+        // );
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Save session completion (batch completion at end of session)
+app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
+  try {
+    const { completions } = req.body;
+
+    // Process each completion
+    for (const completion of completions) {
+      const taskId = completion.task.id;
+      const taskTitle = completion.task.title;
+      const taskType = completion.task.type;
+      const estimatedTime = completion.task.estimatedTime;
+      const actualTime = completion.timeSpent;
+
+      // Get any partial time for this task
+      const partialResult = await pool.query(
+        'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+        [req.user.id, taskId]
+      );
+
+      const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
+      const totalTime = actualTime + partialTime;
+
+      // Check if this is a task segment
+      const parentTaskTitle = extractParentTaskTitle(taskTitle);
+      const isSegment = parentTaskTitle !== null;
+
+      // Insert into completion_history
+      await pool.query(
+        `INSERT INTO completion_history 
+         (user_id, task_id, task_title, task_type, estimated_time, actual_time, parent_task_title, is_segment)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          req.user.id,
+          taskId,
+          taskTitle,
+          taskType,
+          estimatedTime,
+          totalTime,
+          parentTaskTitle,
+          isSegment
+        ]
+      );
+
+      // Mark task as completed
+      await pool.query(
+        'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+        [taskId, req.user.id]
+      );
+
+      // Remove from partial_completions if exists
+      await pool.query(
+        'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+        [req.user.id, taskId]
+      );
+
+      // If this is a segment, check if all segments of the parent task are complete
+      if (isSegment) {
+        const segmentsResult = await pool.query(
+          `SELECT id, title, task_type, estimated_time 
+           FROM tasks 
+           WHERE user_id = $1 
+           AND title LIKE $2`,
+          [req.user.id, `${parentTaskTitle} - %`]
+        );
+
+        const completedSegmentsResult = await pool.query(
+          `SELECT task_id, task_title, actual_time 
+           FROM completion_history 
+           WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true`,
+          [req.user.id, parentTaskTitle]
+        );
+
+        const allSegments = segmentsResult.rows;
+        const completedSegments = completedSegmentsResult.rows;
+
+        if (allSegments.length > 0 && allSegments.length === completedSegments.length) {
+          const totalActualTime = completedSegments.reduce((sum, seg) => sum + seg.actual_time, 0);
+          const totalEstimatedTime = allSegments.reduce((sum, seg) => sum + seg.estimated_time, 0);
+
+          await pool.query(
+            `INSERT INTO completion_history 
+             (user_id, task_title, task_type, estimated_time, actual_time, is_segment)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              req.user.id,
+              parentTaskTitle,
+              allSegments[0].task_type,
+              totalEstimatedTime,
+              totalActualTime,
+              false
+            ]
+          );
+        }
+      }
     }
 
     res.json({ success: true });
@@ -633,22 +829,41 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
 // Save session state (for resume capability)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completions, partialTaskTimes } = req.body;
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
 
     // Delete any existing session state for this user
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
 
-    // Insert new session state (including partialTaskTimes in completions JSONB)
-    const stateData = {
-      completions: completions || [],
-      partialTaskTimes: partialTaskTimes || {}
-    };
-    
+    // If there's a partial task, save or update its partial completion time
+    if (partialTaskId && partialTaskTime > 0) {
+      // Get the task title for the partial completion
+      const taskResult = await pool.query(
+        'SELECT title FROM tasks WHERE id = $1 AND user_id = $2',
+        [partialTaskId, req.user.id]
+      );
+
+      if (taskResult.rows.length > 0) {
+        const taskTitle = taskResult.rows[0].title;
+
+        // Upsert partial completion
+        await pool.query(
+          `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
+           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+           ON CONFLICT (user_id, task_id)
+           DO UPDATE SET 
+             accumulated_time = partial_completions.accumulated_time + EXCLUDED.accumulated_time,
+             last_updated = CURRENT_TIMESTAMP`,
+          [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+        );
+      }
+    }
+
+    // Insert new session state
     await pool.query(
       `INSERT INTO session_state 
-       (user_id, session_id, day, period, remaining_time, current_task_index, task_start_time, completions, saved_at)
+       (user_id, session_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids, saved_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
-      [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, JSON.stringify(stateData)]
+      [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds || []]
     );
 
     res.json({ success: true });
@@ -668,7 +883,17 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
 
     if (result.rows.length > 0) {
       const state = result.rows[0];
-      const stateData = JSON.parse(state.completions);
+
+      // Get all partial completions for this user
+      const partialResult = await pool.query(
+        'SELECT task_id, accumulated_time FROM partial_completions WHERE user_id = $1',
+        [req.user.id]
+      );
+
+      const partialTaskTimes = {};
+      partialResult.rows.forEach(row => {
+        partialTaskTimes[row.task_id] = row.accumulated_time;
+      });
       
       res.json({
         sessionId: state.session_id,
@@ -677,8 +902,8 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
         remainingTime: state.remaining_time,
         currentTaskIndex: state.current_task_index,
         taskStartTime: state.task_start_time,
-        completions: stateData.completions || stateData, // Handle both old and new format
-        partialTaskTimes: stateData.partialTaskTimes || {},
+        completedTaskIds: state.completed_task_ids || [],
+        partialTaskTimes: partialTaskTimes,
         savedAt: state.saved_at
       });
     } else {
