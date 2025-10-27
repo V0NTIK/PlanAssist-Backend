@@ -259,25 +259,14 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 
     const events = await ical.async.parseICS(icsData);
     const tasks = [];
-    
-    // Calculate one month window from today
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const oneMonthFromNow = new Date(today);
-    oneMonthFromNow.setMonth(oneMonthFromNow.getMonth() + 1);
 
     for (const event of Object.values(events)) {
       if (event.type === 'VEVENT' && event.summary) {
-        const eventDate = new Date(event.start || event.end || new Date());
-        
-        // Only include tasks within the next month
-        if (eventDate >= today && eventDate <= oneMonthFromNow) {
-          tasks.push({
-            title: event.summary,
-            description: event.description || '',
-            dueDate: event.start || event.end || new Date(),
-          });
-        }
+        tasks.push({
+          title: event.summary,
+          description: event.description || '',
+          dueDate: event.start || event.end || new Date(),
+        });
       }
     }
 
@@ -303,7 +292,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, due_date ASC',
+      'SELECT * FROM tasks WHERE user_id = $1 ORDER BY due_date ASC',
       [req.user.id]
     );
     // Always return an array
@@ -316,7 +305,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Save tasks (ENHANCED: preserves manual overrides and handles priority)
+// Save tasks (ENHANCED: preserves manual overrides)
 app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
@@ -326,66 +315,30 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Tasks must be an array' });
     }
 
-    // Get user's priority lock setting
-    const userResult = await pool.query(
-      'SELECT priority_locked FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    const priorityLocked = userResult.rows[0]?.priority_locked || false;
-
-    // Get existing tasks with manual overrides and titles
+    // Get existing tasks with manual overrides
     const existingTasks = await pool.query(
-      'SELECT id, title, user_estimate, priority_order FROM tasks WHERE user_id = $1',
+      'SELECT title, user_estimate FROM tasks WHERE user_id = $1 AND user_estimate IS NOT NULL',
       [req.user.id]
     );
 
-    // Create a map of existing tasks by title
-    const existingTaskMap = {};
+    // Create a map of manual overrides
+    const overrideMap = {};
     (existingTasks.rows || []).forEach(task => {
-      existingTaskMap[task.title] = {
-        userEstimate: task.user_estimate,
-        priorityOrder: task.priority_order
-      };
+      overrideMap[task.title] = task.user_estimate;
     });
-
-    // Identify new tasks
-    const existingTitles = new Set(Object.keys(existingTaskMap));
-    const incomingTitles = new Set(tasks.map(t => t.title));
-    const newTaskTitles = new Set([...incomingTitles].filter(t => !existingTitles.has(t)));
-
-    // Get max priority order for appending new tasks
-    const maxPriorityResult = await pool.query(
-      'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
 
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
 
-    // Insert new tasks, preserving manual overrides and priorities
+    // Insert new tasks, preserving manual overrides
     const insertedTasks = [];
     for (const task of tasks) {
-      const userEstimate = existingTaskMap[task.title]?.userEstimate || task.userEstimate || null;
-      const isNewTask = newTaskTitles.has(task.title);
-      
-      // Determine priority order
-      let priorityOrder = null;
-      if (existingTaskMap[task.title]?.priorityOrder !== undefined) {
-        // Preserve existing priority
-        priorityOrder = existingTaskMap[task.title].priorityOrder;
-      } else if (!priorityLocked) {
-        // Auto-assign priority if not locked (will sort by due_date via NULL)
-        priorityOrder = null;
-      } else if (isNewTask) {
-        // New task with locked priorities - append to end
-        priorityOrder = nextPriority++;
-      }
+      const userEstimate = overrideMap[task.title] || task.userEstimate || null;
       
       const result = await pool.query(
-        `INSERT INTO tasks (user_id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed`,
+        `INSERT INTO tasks (user_id, title, description, due_date, task_type, estimated_time, user_estimate, completed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, title, description, due_date, task_type, estimated_time, user_estimate, completed`,
         [
           req.user.id,
           task.title,
@@ -394,8 +347,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           task.type,
           task.estimatedTime,
           userEstimate,
-          priorityOrder,
-          priorityLocked && isNewTask, // Mark as new only if priority is locked
           task.completed || false
         ]
       );
@@ -424,98 +375,6 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update task estimate error:', error);
     res.status(500).json({ error: 'Failed to update estimate' });
-  }
-});
-
-// Reorder tasks (update priority_order for all tasks)
-app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
-  try {
-    const { taskOrder } = req.body; // Array of task IDs in desired order
-
-    if (!Array.isArray(taskOrder)) {
-      return res.status(400).json({ error: 'taskOrder must be an array' });
-    }
-
-    // Update priority_order for each task
-    const updatePromises = taskOrder.map((taskId, index) =>
-      pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3',
-        [index + 1, taskId, req.user.id]
-      )
-    );
-
-    await Promise.all(updatePromises);
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Reorder tasks error:', error);
-    res.status(500).json({ error: 'Failed to reorder tasks' });
-  }
-});
-
-// Toggle priority lock
-app.patch('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const { locked } = req.body;
-
-    await pool.query(
-      'UPDATE users SET priority_locked = $1 WHERE id = $2',
-      [locked, req.user.id]
-    );
-
-    // If unlocking, clear all priority orders and new flags
-    if (!locked) {
-      await pool.query(
-        'UPDATE tasks SET priority_order = NULL, is_new = FALSE WHERE user_id = $1',
-        [req.user.id]
-      );
-    }
-
-    res.json({ success: true, locked });
-  } catch (error) {
-    console.error('Toggle priority lock error:', error);
-    res.status(500).json({ error: 'Failed to toggle priority lock' });
-  }
-});
-
-// Get priority lock status
-app.get('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT priority_locked FROM users WHERE id = $1',
-      [req.user.id]
-    );
-
-    const locked = result.rows[0]?.priority_locked || false;
-    res.json({ locked });
-  } catch (error) {
-    console.error('Get priority lock error:', error);
-    res.status(500).json({ error: 'Failed to get priority lock status' });
-  }
-});
-
-// Clear new task flags (move from sidebar to main list)
-app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
-  try {
-    const { taskIds } = req.body;
-
-    if (!Array.isArray(taskIds)) {
-      return res.status(400).json({ error: 'taskIds must be an array' });
-    }
-
-    if (taskIds.length === 0) {
-      return res.json({ success: true });
-    }
-
-    await pool.query(
-      'UPDATE tasks SET is_new = FALSE WHERE id = ANY($1::int[]) AND user_id = $2',
-      [taskIds, req.user.id]
-    );
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Clear new flags error:', error);
-    res.status(500).json({ error: 'Failed to clear new flags' });
   }
 });
 
@@ -624,17 +483,22 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
 // Save session state (for resume capability)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completions } = req.body;
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completions, partialTaskTimes } = req.body;
 
     // Delete any existing session state for this user
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
 
-    // Insert new session state
+    // Insert new session state (including partialTaskTimes in completions JSONB)
+    const stateData = {
+      completions: completions || [],
+      partialTaskTimes: partialTaskTimes || {}
+    };
+    
     await pool.query(
       `INSERT INTO session_state 
        (user_id, session_id, day, period, remaining_time, current_task_index, task_start_time, completions, saved_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
-      [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, JSON.stringify(completions)]
+      [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, JSON.stringify(stateData)]
     );
 
     res.json({ success: true });
@@ -654,6 +518,8 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
 
     if (result.rows.length > 0) {
       const state = result.rows[0];
+      const stateData = JSON.parse(state.completions);
+      
       res.json({
         sessionId: state.session_id,
         day: state.day,
@@ -661,7 +527,8 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
         remainingTime: state.remaining_time,
         currentTaskIndex: state.current_task_index,
         taskStartTime: state.task_start_time,
-        completions: JSON.parse(state.completions),
+        completions: stateData.completions || stateData, // Handle both old and new format
+        partialTaskTimes: stateData.partialTaskTimes || {},
         savedAt: state.saved_at
       });
     } else {
