@@ -88,6 +88,10 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
     if (!isValidOneSchoolEmail(email)) {
       return res.status(400).json({ error: 'Email must be in format: first.last##@na.oneschoolglobal.com' });
     }
@@ -119,7 +123,12 @@ app.post('/api/auth/register', async (req, res) => {
     });
   } catch (error) {
     console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+    console.error('Error details:', error.message);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Registration failed', 
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined 
+    });
   }
 });
 
@@ -716,8 +725,24 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
 
 // ============ HEALTH CHECK ============
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'OneSchool Global Study Planner API' });
+app.get('/health', async (req, res) => {
+  try {
+    // Test database connection
+    await pool.query('SELECT 1');
+    res.json({ 
+      status: 'ok', 
+      message: 'OneSchool Global Study Planner API',
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({ 
+      status: 'error', 
+      message: 'Database connection failed',
+      error: error.message 
+    });
+  }
 });
 
 // Start server
