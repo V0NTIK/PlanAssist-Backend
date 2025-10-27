@@ -607,15 +607,19 @@ app.get('/api/learning', authenticateToken, async (req, res) => {
 
 // Helper function to extract parent task title from segment title
 const extractParentTaskTitle = (taskTitle) => {
-  // Matches patterns like "Task - Part 1", "Task  - Segment 2", etc.
-  const segmentPattern = /^(.+?)\s*-\s*(Part|Segment)\s+\d+$/i;
+  // Matches patterns like "Task - Part 1", "Task - Segment 2", etc.
+  // More flexible to handle variations in spacing
+  const segmentPattern = /^(.+?)\s+-\s+(Part|Segment)\s+\d+$/i;
   const match = taskTitle.match(segmentPattern);
-  return match ? match[1].trim() : null;
+  if (match) {
+    return match[1].trim();
+  }
+  return null;
 };
 
 // Helper function to check if a task is a segment
 const isTaskSegment = (taskTitle) => {
-  return /\s*-\s*(Part|Segment)\s+\d+$/i.test(taskTitle);
+  return /\s+-\s+(Part|Segment)\s+\d+$/i.test(taskTitle);
 };
 
 // Immediate task completion (called when user clicks "Mark Complete" in session)
@@ -667,6 +671,8 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
 
     // If this is a segment, check if all segments of the parent task are complete
     if (isSegment) {
+      console.log('Task is a segment. Parent title:', parentTaskTitle);
+      
       // Find all segments of the same parent task
       const segmentsResult = await pool.query(
         `SELECT id, title, task_type, estimated_time 
@@ -676,6 +682,8 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
         [req.user.id, `${parentTaskTitle} - %`]
       );
 
+      console.log('Found segments in tasks table:', segmentsResult.rows.length, segmentsResult.rows.map(r => r.title));
+
       // Check if all segments are completed
       const completedSegmentsResult = await pool.query(
         `SELECT task_id, task_title, actual_time 
@@ -684,13 +692,20 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
         [req.user.id, parentTaskTitle]
       );
 
+      console.log('Completed segments:', completedSegmentsResult.rows.length, '/', segmentsResult.rows.length);
+      console.log('Completed segment titles:', completedSegmentsResult.rows.map(r => r.task_title));
+
       const allSegments = segmentsResult.rows;
       const completedSegments = completedSegmentsResult.rows;
 
       if (allSegments.length > 0 && allSegments.length === completedSegments.length) {
+        console.log('All segments complete! Creating aggregated completion for:', parentTaskTitle);
+        
         // All segments are complete, create aggregated completion
         const totalActualTime = completedSegments.reduce((sum, seg) => sum + seg.actual_time, 0);
         const totalEstimatedTime = allSegments.reduce((sum, seg) => sum + seg.estimated_time, 0);
+
+        console.log('Aggregated times - Estimated:', totalEstimatedTime, 'Actual:', totalActualTime);
 
         // Insert aggregated completion for parent task
         await pool.query(
@@ -707,12 +722,16 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
           ]
         );
 
+        console.log('✓ Aggregated completion created successfully');
+
         // Optionally, delete individual segment completions to keep history clean
         // (Commented out to preserve segment data for detailed analysis)
         // await pool.query(
         //   'DELETE FROM completion_history WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true',
         //   [req.user.id, parentTaskTitle]
         // );
+      } else {
+        console.log('Not all segments complete yet');
       }
     }
 
@@ -831,6 +850,8 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
     const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
 
+    console.log('Save state request:', { sessionId, partialTaskId, partialTaskTime });
+
     // Delete any existing session state for this user
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
 
@@ -844,17 +865,23 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 
       if (taskResult.rows.length > 0) {
         const taskTitle = taskResult.rows[0].title;
+        console.log('Saving partial completion:', { taskId: partialTaskId, taskTitle, time: partialTaskTime });
 
         // Upsert partial completion
-        await pool.query(
+        const result = await pool.query(
           `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
            ON CONFLICT (user_id, task_id)
            DO UPDATE SET 
              accumulated_time = partial_completions.accumulated_time + EXCLUDED.accumulated_time,
-             last_updated = CURRENT_TIMESTAMP`,
+             last_updated = CURRENT_TIMESTAMP
+           RETURNING accumulated_time`,
           [req.user.id, partialTaskId, taskTitle, partialTaskTime]
         );
+        
+        console.log('Partial completion saved. Total accumulated:', result.rows[0].accumulated_time);
+      } else {
+        console.log('Task not found for partial completion:', partialTaskId);
       }
     }
 
@@ -866,6 +893,7 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
       [req.user.id, sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds || []]
     );
 
+    console.log('Session state saved successfully');
     res.json({ success: true });
   } catch (error) {
     console.error('Save session state error:', error);
