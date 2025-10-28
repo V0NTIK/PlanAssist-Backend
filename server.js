@@ -88,6 +88,36 @@ const extractNameFromEmail = (email) => {
   return `${first} ${lastName}`.trim();
 };
 
+// Helper: Extract base task title (without segment suffixes)
+// This allows segmented tasks to share the same partial completion record
+const extractBaseTitle = (title) => {
+  if (!title) return title;
+  
+  // Remove common segment suffixes like " - Part 1", " - Research", etc.
+  const segmentPatterns = [
+    / - Part \d+$/i,
+    / - Research$/i,
+    / - Writing$/i,
+    / - Editing$/i,
+    / - Review$/i,
+    / - Study$/i,
+    / - Practice$/i,
+    / - Reading$/i,
+    / - Planning$/i,
+    / - Analysis$/i,
+    / \(Segment \d+\)$/i,
+    / \(Part \d+\)$/i,
+    / - \d+$/  // Generic numbered suffix
+  ];
+  
+  let baseTitle = title;
+  for (const pattern of segmentPatterns) {
+    baseTitle = baseTitle.replace(pattern, '');
+  }
+  
+  return baseTitle.trim();
+};
+
 // Validate OneSchool email
 const isValidOneSchoolEmail = (email) => {
   return email.endsWith('@na.oneschoolglobal.com');
@@ -889,35 +919,40 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
       }
 
       if (shouldSave) {
-        // Check if partial completion already exists
+        // Extract base task title (remove segment suffix like " - Part 1", " - Research", etc.)
+        // This allows all segments of the same task to share one partial completion record
+        const baseTitle = extractBaseTitle(taskTitle);
+        console.log('→ Base title (for grouping segments):', baseTitle);
+        
+        // Check if partial completion already exists for this base title
         const existingPartial = await pool.query(
-          'SELECT accumulated_time, task_title FROM partial_completions WHERE user_id = $1 AND task_id = $2',
-          [req.user.id, partialTaskId]
+          'SELECT accumulated_time, task_title FROM partial_completions WHERE user_id = $1 AND task_title = $2',
+          [req.user.id, baseTitle]
         );
 
         if (existingPartial.rows.length > 0) {
           const previousTime = existingPartial.rows[0].accumulated_time;
           console.log('→ Existing partial time:', previousTime, 'minutes');
           
-          // Update existing partial completion
+          // Update existing partial completion (add new time to accumulated time)
           const result = await pool.query(
             `UPDATE partial_completions 
              SET accumulated_time = accumulated_time + $1,
-                 task_title = $2,
                  last_updated = CURRENT_TIMESTAMP
-             WHERE user_id = $3 AND task_id = $4
+             WHERE user_id = $2 AND task_title = $3
              RETURNING accumulated_time`,
-            [partialTaskTime, taskTitle, req.user.id, partialTaskId]
+            [partialTaskTime, req.user.id, baseTitle]
           );
           
           console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
         } else {
           // Insert new partial completion
+          // Note: We store the task_id but use task_title (base title) as the unique key
           const result = await pool.query(
             `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
              VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
              RETURNING accumulated_time`,
-            [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+            [req.user.id, partialTaskId, baseTitle, partialTaskTime]
           );
           
           console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
@@ -959,14 +994,22 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
 
       // Get all partial completions for this user
       const partialResult = await pool.query(
-        'SELECT task_id, accumulated_time FROM partial_completions WHERE user_id = $1',
+        'SELECT task_id, task_title, accumulated_time FROM partial_completions WHERE user_id = $1',
         [req.user.id]
       );
 
       const partialTaskTimes = {};
       partialResult.rows.forEach(row => {
+        // Index by both task_id and base title
+        // This allows segments to find the accumulated time regardless of their specific ID
         partialTaskTimes[row.task_id] = row.accumulated_time;
+        
+        // Also index by the task_title (which is already the base title from save-state)
+        const baseTitle = extractBaseTitle(row.task_title);
+        partialTaskTimes[baseTitle] = row.accumulated_time;
       });
+      
+      console.log('Loaded partial times:', partialTaskTimes);
       
       res.json({
         sessionId: state.session_id,
