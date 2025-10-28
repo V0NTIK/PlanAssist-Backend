@@ -848,11 +848,12 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
 // Save session state (for resume capability)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime, partialTaskTitle } = req.body;
 
     console.log('=== SAVE STATE REQUEST ===');
     console.log('Session ID:', sessionId);
     console.log('Partial Task ID:', partialTaskId);
+    console.log('Partial Task Title:', partialTaskTitle);
     console.log('Partial Task Time:', partialTaskTime);
     console.log('Completed Task IDs:', completedTaskIds);
 
@@ -863,60 +864,64 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
     if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
       console.log('Attempting to save partial completion for task ID:', partialTaskId);
       
-      // Get the task title for the partial completion
+      // Try to get the task from database for validation
       const taskResult = await pool.query(
         'SELECT title, completed FROM tasks WHERE id = $1 AND user_id = $2',
         [partialTaskId, req.user.id]
       );
 
+      let taskTitle = partialTaskTitle || 'Unknown Task'; // Use provided title or fallback
+      let shouldSave = true;
+
       if (taskResult.rows.length > 0) {
         const task = taskResult.rows[0];
+        taskTitle = task.title; // Use database title if available (more accurate)
         
-        // Only save partial completion if task is not already completed
-        if (!task.completed) {
-          const taskTitle = task.title;
-          console.log('✓ Found task:', taskTitle);
-
-          // Check if partial completion already exists
-          const existingPartial = await pool.query(
-            'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
-            [req.user.id, partialTaskId]
-          );
-
-          if (existingPartial.rows.length > 0) {
-            const previousTime = existingPartial.rows[0].accumulated_time;
-            console.log('→ Existing partial time:', previousTime, 'minutes');
-            
-            // Update existing partial completion
-            const result = await pool.query(
-              `UPDATE partial_completions 
-               SET accumulated_time = accumulated_time + $1,
-                   last_updated = CURRENT_TIMESTAMP
-               WHERE user_id = $2 AND task_id = $3
-               RETURNING accumulated_time`,
-              [partialTaskTime, req.user.id, partialTaskId]
-            );
-            
-            console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
-          } else {
-            // Insert new partial completion
-            const result = await pool.query(
-              `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
-               VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-               RETURNING accumulated_time`,
-              [req.user.id, partialTaskId, taskTitle, partialTaskTime]
-            );
-            
-            console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
-          }
+        if (task.completed) {
+          console.log('⚠ Task is already marked as completed in database, skipping save');
+          shouldSave = false;
         } else {
-          console.log('⚠ Task is already completed, skipping partial completion save');
+          console.log('✓ Found task in database:', taskTitle);
         }
       } else {
-        // Task not found - log warning but don't fail the entire save
-        console.log('⚠ WARNING: Task ID', partialTaskId, 'not found in database.');
-        console.log('  This could mean the task was deleted or the ID is invalid.');
-        console.log('  Continuing with session save without partial completion.');
+        console.log('⚠ Task not found in tasks table, but will save with provided title:', taskTitle);
+        console.log('  (This can happen if task was deleted but session is still active)');
+      }
+
+      if (shouldSave) {
+        // Check if partial completion already exists
+        const existingPartial = await pool.query(
+          'SELECT accumulated_time, task_title FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+          [req.user.id, partialTaskId]
+        );
+
+        if (existingPartial.rows.length > 0) {
+          const previousTime = existingPartial.rows[0].accumulated_time;
+          console.log('→ Existing partial time:', previousTime, 'minutes');
+          
+          // Update existing partial completion
+          const result = await pool.query(
+            `UPDATE partial_completions 
+             SET accumulated_time = accumulated_time + $1,
+                 task_title = $2,
+                 last_updated = CURRENT_TIMESTAMP
+             WHERE user_id = $3 AND task_id = $4
+             RETURNING accumulated_time`,
+            [partialTaskTime, taskTitle, req.user.id, partialTaskId]
+          );
+          
+          console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
+        } else {
+          // Insert new partial completion
+          const result = await pool.query(
+            `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+             RETURNING accumulated_time`,
+            [req.user.id, partialTaskId, taskTitle, partialTaskTime]
+          );
+          
+          console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+        }
       }
     } else {
       console.log('ℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
