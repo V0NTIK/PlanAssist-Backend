@@ -88,34 +88,121 @@ const extractNameFromEmail = (email) => {
   return `${first} ${lastName}`.trim();
 };
 
-// Helper: Extract base task title (without segment suffixes)
-// This allows segmented tasks to share the same partial completion record
-const extractBaseTitle = (title) => {
-  if (!title) return title;
+// ============================================================================
+// HIERARCHICAL TASK MATCHING SYSTEM
+// ============================================================================
+// Tasks can be split up to 2 levels deep:
+// Level 0 (Root): parent_task_id=NULL, split1_task_id=NULL, split2_task_id=NULL
+// Level 1 (First split): parent_task_id=X, split1_task_id=X, split2_task_id=NULL
+// Level 2 (Second split): parent_task_id=X, split1_task_id=Y, split2_task_id=Y
+//
+// Partial completions are grouped by matching IDs in a "ladder" system:
+// - Level 2 tasks match if ALL 3 IDs match (parent + split1 + split2)
+// - Level 1 tasks match if 2 IDs match (parent + split1)
+// - Level 0 tasks match only their own task_id
+// ============================================================================
+
+/**
+ * Find matching partial completion record for a task using hierarchical ID matching
+ * @param {number} userId - User ID
+ * @param {number} taskId - Task ID
+ * @param {number|null} parentTaskId - Parent task ID
+ * @param {number|null} split1TaskId - First split level ID
+ * @param {number|null} split2TaskId - Second split level ID
+ * @returns {Promise<object|null>} Existing partial completion or null
+ */
+const findMatchingPartialCompletion = async (userId, taskId, parentTaskId, split1TaskId, split2TaskId) => {
+  // Determine the matching strategy based on split level
+  let query, params;
   
-  // Remove common segment suffixes like " - Part 1", " - Research", etc.
-  const segmentPatterns = [
-    / - Part \d+$/i,
-    / - Research$/i,
-    / - Writing$/i,
-    / - Editing$/i,
-    / - Review$/i,
-    / - Study$/i,
-    / - Practice$/i,
-    / - Reading$/i,
-    / - Planning$/i,
-    / - Analysis$/i,
-    / \(Segment \d+\)$/i,
-    / \(Part \d+\)$/i,
-    / - \d+$/  // Generic numbered suffix
-  ];
-  
-  let baseTitle = title;
-  for (const pattern of segmentPatterns) {
-    baseTitle = baseTitle.replace(pattern, '');
+  if (split2TaskId) {
+    // Level 2 task: Match ALL 3 IDs (parent + split1 + split2)
+    console.log(`  Matching strategy: Level 2 (ALL 3 IDs must match)`);
+    console.log(`  Looking for: parent=${parentTaskId}, split1=${split1TaskId}, split2=${split2TaskId}`);
+    
+    query = `
+      SELECT id, accumulated_time, task_title, task_subtitle
+      FROM partial_completions
+      WHERE user_id = $1 
+        AND parent_task_id = $2 
+        AND split1_task_id = $3 
+        AND split2_task_id = $4
+    `;
+    params = [userId, parentTaskId, split1TaskId, split2TaskId];
+    
+  } else if (split1TaskId) {
+    // Level 1 task: Match 2 IDs (parent + split1)
+    console.log(`  Matching strategy: Level 1 (parent + split1 must match)`);
+    console.log(`  Looking for: parent=${parentTaskId}, split1=${split1TaskId}`);
+    
+    query = `
+      SELECT id, accumulated_time, task_title, task_subtitle
+      FROM partial_completions
+      WHERE user_id = $1 
+        AND parent_task_id = $2 
+        AND split1_task_id = $3
+        AND split2_task_id IS NULL
+    `;
+    params = [userId, parentTaskId, split1TaskId];
+    
+  } else {
+    // Level 0 task (root): Match only task_id
+    console.log(`  Matching strategy: Level 0 (root task, exact task_id match)`);
+    console.log(`  Looking for: task_id=${taskId}`);
+    
+    query = `
+      SELECT id, accumulated_time, task_title, task_subtitle
+      FROM partial_completions
+      WHERE user_id = $1 AND task_id = $2
+    `;
+    params = [userId, taskId];
   }
   
-  return baseTitle.trim();
+  const result = await pool.query(query, params);
+  return result.rows.length > 0 ? result.rows[0] : null;
+};
+
+/**
+ * Find all sibling tasks that share the same hierarchical level
+ * Used for completion grouping - when all siblings complete, mark parent as done
+ * @param {number} userId - User ID
+ * @param {number|null} parentTaskId - Parent task ID
+ * @param {number|null} split1TaskId - First split level ID
+ * @param {number|null} split2TaskId - Second split level ID
+ * @returns {Promise<Array>} Array of sibling task IDs
+ */
+const findSiblingTasks = async (userId, parentTaskId, split1TaskId, split2TaskId) => {
+  let query, params;
+  
+  if (split2TaskId) {
+    // Find all tasks at same level 2 (same parent + split1)
+    query = `
+      SELECT id FROM tasks
+      WHERE user_id = $1 
+        AND parent_task_id = $2 
+        AND split1_task_id = $3
+        AND split2_task_id IS NOT NULL
+    `;
+    params = [userId, parentTaskId, split1TaskId];
+    
+  } else if (split1TaskId) {
+    // Find all tasks at same level 1 (same parent)
+    query = `
+      SELECT id FROM tasks
+      WHERE user_id = $1 
+        AND parent_task_id = $2
+        AND split1_task_id IS NOT NULL
+        AND split2_task_id IS NULL
+    `;
+    params = [userId, parentTaskId];
+    
+  } else {
+    // Root task has no siblings in this context
+    return [];
+  }
+  
+  const result = await pool.query(query, params);
+  return result.rows.map(row => row.id);
 };
 
 // Validate OneSchool email
@@ -878,12 +965,13 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
 // Save session state (for resume capability)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime, partialTaskTitle } = req.body;
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime, partialTaskTitle, partialTaskSubtitle } = req.body;
 
-    console.log('=== SAVE STATE REQUEST ===');
+    console.log('\n=== SAVE STATE REQUEST (HIERARCHICAL) ===');
     console.log('Session ID:', sessionId);
     console.log('Partial Task ID:', partialTaskId);
     console.log('Partial Task Title:', partialTaskTitle);
+    console.log('Partial Task Subtitle:', partialTaskSubtitle);
     console.log('Partial Task Time:', partialTaskTime);
     console.log('Completed Task IDs:', completedTaskIds);
 
@@ -892,74 +980,74 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 
     // If there's a partial task with time spent, save or update its partial completion time
     if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
+      console.log('\n--- Processing Partial Completion ---');
       console.log('Attempting to save partial completion for task ID:', partialTaskId);
       
-      // Try to get the task from database for validation
+      // Get the task from database with hierarchical IDs
       const taskResult = await pool.query(
-        'SELECT title, completed FROM tasks WHERE id = $1 AND user_id = $2',
+        `SELECT title, subtitle, completed, parent_task_id, split1_task_id, split2_task_id 
+         FROM tasks 
+         WHERE id = $1 AND user_id = $2`,
         [partialTaskId, req.user.id]
       );
 
-      let taskTitle = partialTaskTitle || 'Unknown Task'; // Use provided title or fallback
-      let shouldSave = true;
-
-      if (taskResult.rows.length > 0) {
+      if (taskResult.rows.length === 0) {
+        console.log('⚠ Task not found in database, skipping partial save');
+      } else {
         const task = taskResult.rows[0];
-        taskTitle = task.title; // Use database title if available (more accurate)
         
         if (task.completed) {
-          console.log('⚠ Task is already marked as completed in database, skipping save');
-          shouldSave = false;
+          console.log('⚠ Task is already marked as completed, skipping save');
         } else {
-          console.log('✓ Found task in database:', taskTitle);
-        }
-      } else {
-        console.log('⚠ Task not found in tasks table, but will save with provided title:', taskTitle);
-        console.log('  (This can happen if task was deleted but session is still active)');
-      }
-
-      if (shouldSave) {
-        // Extract base task title (remove segment suffix like " - Part 1", " - Research", etc.)
-        // This allows all segments of the same task to share one partial completion record
-        const baseTitle = extractBaseTitle(taskTitle);
-        console.log('→ Base title (for grouping segments):', baseTitle);
-        
-        // Check if partial completion already exists for this base title
-        const existingPartial = await pool.query(
-          'SELECT accumulated_time, task_title FROM partial_completions WHERE user_id = $1 AND task_title = $2',
-          [req.user.id, baseTitle]
-        );
-
-        if (existingPartial.rows.length > 0) {
-          const previousTime = existingPartial.rows[0].accumulated_time;
-          console.log('→ Existing partial time:', previousTime, 'minutes');
+          const taskTitle = task.title;
+          const taskSubtitle = task.subtitle || null;
+          const parentTaskId = task.parent_task_id;
+          const split1TaskId = task.split1_task_id;
+          const split2TaskId = task.split2_task_id;
           
-          // Update existing partial completion (add new time to accumulated time)
-          const result = await pool.query(
-            `UPDATE partial_completions 
-             SET accumulated_time = accumulated_time + $1,
-                 last_updated = CURRENT_TIMESTAMP
-             WHERE user_id = $2 AND task_title = $3
-             RETURNING accumulated_time`,
-            [partialTaskTime, req.user.id, baseTitle]
+          console.log('✓ Found task in database:', taskTitle, taskSubtitle ? `(${taskSubtitle})` : '');
+          console.log('  Hierarchical IDs: parent=%s, split1=%s, split2=%s', 
+                     parentTaskId || 'null', split1TaskId || 'null', split2TaskId || 'null');
+          
+          // Find matching partial completion using hierarchical ID ladder
+          const existingPartial = await findMatchingPartialCompletion(
+            req.user.id, partialTaskId, parentTaskId, split1TaskId, split2TaskId
           );
-          
-          console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
-        } else {
-          // Insert new partial completion
-          // Note: We store the task_id but use task_title (base title) as the unique key
-          const result = await pool.query(
-            `INSERT INTO partial_completions (user_id, task_id, task_title, accumulated_time, last_updated)
-             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-             RETURNING accumulated_time`,
-            [req.user.id, partialTaskId, baseTitle, partialTaskTime]
-          );
-          
-          console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+
+          if (existingPartial) {
+            const previousTime = existingPartial.accumulated_time;
+            console.log('→ Found existing partial completion:', previousTime, 'minutes');
+            
+            // Update existing partial completion (add new time to accumulated time)
+            const result = await pool.query(
+              `UPDATE partial_completions 
+               SET accumulated_time = accumulated_time + $1,
+                   last_updated = CURRENT_TIMESTAMP
+               WHERE id = $2
+               RETURNING accumulated_time`,
+              [partialTaskTime, existingPartial.id]
+            );
+            
+            console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
+          } else {
+            // Insert new partial completion with hierarchical IDs
+            console.log('→ No existing match found, creating new partial completion');
+            const result = await pool.query(
+              `INSERT INTO partial_completions 
+               (user_id, task_id, parent_task_id, split1_task_id, split2_task_id, 
+                task_title, task_subtitle, accumulated_time, last_updated)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+               RETURNING accumulated_time`,
+              [req.user.id, partialTaskId, parentTaskId, split1TaskId, split2TaskId,
+               taskTitle, taskSubtitle, partialTaskTime]
+            );
+            
+            console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
+          }
         }
       }
     } else {
-      console.log('ℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
+      console.log('\nℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
     }
 
     // Insert new session state
@@ -971,7 +1059,7 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
     );
 
     console.log('✓ Session state saved successfully');
-    console.log('=========================\n');
+    console.log('=================================\n');
     res.json({ success: true });
   } catch (error) {
     console.error('❌ Save session state error:', error);
@@ -992,24 +1080,34 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
     if (result.rows.length > 0) {
       const state = result.rows[0];
 
-      // Get all partial completions for this user
+      // Get all partial completions for this user with hierarchical IDs
       const partialResult = await pool.query(
-        'SELECT task_id, task_title, accumulated_time FROM partial_completions WHERE user_id = $1',
+        `SELECT task_id, parent_task_id, split1_task_id, split2_task_id, 
+                task_title, task_subtitle, accumulated_time 
+         FROM partial_completions 
+         WHERE user_id = $1`,
         [req.user.id]
       );
 
+      // Build a map that allows lookup by task_id OR hierarchical match
       const partialTaskTimes = {};
+      const partialRecords = [];
+      
       partialResult.rows.forEach(row => {
-        // Index by both task_id and base title
-        // This allows segments to find the accumulated time regardless of their specific ID
-        partialTaskTimes[row.task_id] = row.accumulated_time;
+        // Store the full record for hierarchical matching
+        partialRecords.push({
+          taskId: row.task_id,
+          parentTaskId: row.parent_task_id,
+          split1TaskId: row.split1_task_id,
+          split2TaskId: row.split2_task_id,
+          time: row.accumulated_time
+        });
         
-        // Also index by the task_title (which is already the base title from save-state)
-        const baseTitle = extractBaseTitle(row.task_title);
-        partialTaskTimes[baseTitle] = row.accumulated_time;
+        // Also index by task_id for direct lookups
+        partialTaskTimes[row.task_id] = row.accumulated_time;
       });
       
-      console.log('Loaded partial times:', partialTaskTimes);
+      console.log('Loaded', partialRecords.length, 'partial completion records');
       
       res.json({
         sessionId: state.session_id,
@@ -1020,6 +1118,7 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
         taskStartTime: state.task_start_time,
         completedTaskIds: state.completed_task_ids || [],
         partialTaskTimes: partialTaskTimes,
+        partialRecords: partialRecords,  // Send full records for frontend hierarchical matching
         savedAt: state.saved_at
       });
     } else {
