@@ -1,5 +1,5 @@
-// OneSchool Global Study Planner - Backend API (TWO-ID SYSTEM + ID PRESERVATION FIX)
-// server.js - COMPLETE FILE WITH FIXED /api/tasks ENDPOINT
+// OneSchool Global Study Planner - Backend API (TWO-ID SYSTEM)
+// server.js - PART 1 of 2
 
 const express = require('express');
 const cors = require('cors');
@@ -234,14 +234,18 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
 
     await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
 
-    for (const day in schedule) {
-      for (const period in schedule[day]) {
-        await pool.query(
-          'INSERT INTO schedules (user_id, day, period, type) VALUES ($1, $2, $3, $4)',
-          [req.user.id, day, parseInt(period), schedule[day][period]]
+    const insertPromises = [];
+    for (const [day, periods] of Object.entries(schedule)) {
+      for (const [period, type] of Object.entries(periods)) {
+        insertPromises.push(
+          pool.query(
+            'INSERT INTO schedules (user_id, day, period, type) VALUES ($1, $2, $3, $4)',
+            [req.user.id, day, parseInt(period), type]
+          )
         );
       }
     }
+    await Promise.all(insertPromises);
 
     res.json({ success: true });
   } catch (error) {
@@ -250,97 +254,106 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
   }
 });
 
-// ============ CANVAS INTEGRATION ============
-
-app.post('/api/canvas/fetch', authenticateToken, async (req, res) => {
+// Fetch Canvas calendar
+app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
     
-    if (!canvasUrl) {
-      return res.status(400).json({ error: 'Canvas URL is required' });
+    // Accept both instructure.com and oneschoolglobal.com Canvas URLs
+    const isValidCanvasUrl = canvasUrl && 
+      (canvasUrl.includes('instructure.com/feeds/calendars') || 
+       canvasUrl.includes('oneschoolglobal.com/feeds/calendars'));
+    
+    if (!isValidCanvasUrl) {
+      return res.status(400).json({ 
+        error: 'Invalid Canvas URL. Please use the format: https://canvas.oneschoolglobal.com/feeds/calendars/user_...' 
+      });
     }
 
-    const response = await axios.get(canvasUrl, {
-      timeout: 10000,
-      headers: {
-        'User-Agent': 'PlanAssist/1.0'
-      }
-    });
+    let icsData;
+    try {
+      console.log('Fetching calendar from:', canvasUrl);
+      const response = await axios.get(canvasUrl, { 
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'PlanAssist/1.0'
+        }
+      });
+      console.log('Calendar fetch successful, response status:', response.status);
+      icsData = response.data;
+    } catch (error) {
+      console.error('Error fetching calendar:', error.message);
+      console.error('Error details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        url: canvasUrl
+      });
+      return res.status(500).json({ 
+        error: 'Failed to fetch calendar data. Please verify your Canvas URL is correct and accessible.',
+        details: error.message 
+      });
+    }
 
-    const events = ical.sync.parseICS(response.data);
+    const events = await ical.async.parseICS(icsData);
     const tasks = [];
+    
+    // Calculate one month window from today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const oneMonthFromNow = new Date(today);
+    oneMonthFromNow.setMonth(oneMonthFromNow.getMonth() + 1);
 
     for (const event of Object.values(events)) {
-      if (event.type === 'VEVENT') {
-        const title = event.summary || 'Untitled';
-        const description = event.description || '';
-        const dueDate = event.end || event.start;
+      if (event.type === 'VEVENT' && event.summary) {
+        const eventDate = new Date(event.start || event.end || new Date());
         
-        let type = 'other';
-        const lowerTitle = title.toLowerCase();
-        if (lowerTitle.includes('quiz') || lowerTitle.includes('test')) {
-          type = 'quiz';
-        } else if (lowerTitle.includes('assignment') || lowerTitle.includes('homework')) {
-          type = 'assignment';
-        }
-
-        if (dueDate) {
+        // Only include tasks within the next month
+        if (eventDate >= today && eventDate <= oneMonthFromNow) {
           tasks.push({
-            title,
-            description,
-            dueDate: dueDate.toISOString(),
-            type,
-            estimatedTime: type === 'quiz' ? 30 : 60,
-            completed: false
+            title: event.summary,
+            description: event.description || '',
+            dueDate: event.start || event.end || new Date(),
           });
         }
       }
     }
 
+    await pool.query(
+      'UPDATE users SET canvas_url = $1 WHERE id = $2',
+      [canvasUrl, req.user.id]
+    );
+
     res.json({ tasks });
   } catch (error) {
-    console.error('Canvas fetch error:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch Canvas tasks',
-      details: error.message 
-    });
+    console.error('Fetch calendar error:', error);
+    if (error.code === 'ECONNABORTED') {
+      res.status(408).json({ error: 'Request timeout. Please check your Canvas URL and try again.' });
+    } else if (error.response?.status === 404) {
+      res.status(404).json({ error: 'Canvas calendar not found. Please verify your URL is correct.' });
+    } else {
+      res.status(500).json({ error: 'Failed to fetch calendar. Please verify your Canvas URL is correct.' });
+    }
   }
 });
 
-// ============ TASK ROUTES ============
-
-// Get all tasks
+// Get tasks (including completed for display purposes)
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM tasks WHERE user_id = $1 ORDER BY priority_order NULLS FIRST, due_date ASC',
+      'SELECT * FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, due_date ASC',
       [req.user.id]
     );
-
-    const tasks = result.rows.map(task => ({
-      id: task.id,
-      title: task.title,
-      description: task.description,
-      dueDate: task.due_date,
-      type: task.task_type,
-      estimatedTime: task.estimated_time,
-      userEstimate: task.user_estimate,
-      completed: task.completed,
-      completedAt: task.completed_at,
-      priorityOrder: task.priority_order,
-      isNew: task.is_new,
-      parent_task_id: task.parent_task_id,
-      split_task_id: task.split_task_id
-    }));
-
-    res.json(tasks);
+    // Always return an array
+    const rows = result.rows || [];
+    res.json(rows);
   } catch (error) {
     console.error('Get tasks error:', error);
-    res.status(500).json({ error: 'Failed to get tasks' });
+    // Return empty array on error instead of error object
+    res.json([]);
   }
 });
 
-// ============ FIXED: SAVE TASKS (UPDATE INSTEAD OF DELETE+INSERT) ============
+// Save tasks (TWO-ID SYSTEM - UPDATED)
 app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
@@ -350,70 +363,50 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Tasks must be an array' });
     }
 
-    console.log('=== SAVE TASKS (ID PRESERVATION) ===');
-    console.log('Incoming tasks:', tasks.length);
-
-    // Get priority lock status
+    // Get user's priority lock setting
     const userResult = await pool.query(
       'SELECT priority_locked FROM users WHERE id = $1',
       [req.user.id]
     );
     const priorityLocked = userResult.rows[0]?.priority_locked || false;
 
-    // Get existing incomplete tasks (for preserving user estimates and priority)
-    const existingResult = await pool.query(
-      'SELECT id, title, user_estimate, priority_order FROM tasks WHERE user_id = $1 AND completed = false',
+    // Get existing tasks with manual overrides and titles
+    const existingTasks = await pool.query(
+      'SELECT id, title, user_estimate, priority_order, parent_task_id, split_task_id FROM tasks WHERE user_id = $1',
       [req.user.id]
     );
-    
+
+    // Create a map of existing tasks by title
     const existingTaskMap = {};
-    existingResult.rows.forEach(t => {
-      existingTaskMap[t.title] = {
-        id: t.id,
-        userEstimate: t.user_estimate,
-        priorityOrder: t.priority_order
+    (existingTasks.rows || []).forEach(task => {
+      existingTaskMap[task.title] = {
+        userEstimate: task.user_estimate,
+        priorityOrder: task.priority_order,
+        parentTaskId: task.parent_task_id,
+        splitTaskId: task.split_task_id
       };
     });
 
-    // Identify new tasks (not in existing map)
-    const newTaskTitles = new Set();
-    tasks.forEach(task => {
-      if (!existingTaskMap[task.title]) {
-        newTaskTitles.add(task.title);
-      }
-    });
+    // Identify new tasks
+    const existingTitles = new Set(Object.keys(existingTaskMap));
+    const incomingTitles = new Set(tasks.map(t => t.title));
+    const newTaskTitles = new Set([...incomingTitles].filter(t => !existingTitles.has(t)));
 
-    // Get max priority for new tasks
+    // Get max priority order for appending new tasks
     const maxPriorityResult = await pool.query(
       'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1',
       [req.user.id]
     );
     let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
 
-    // Get ALL existing incomplete tasks with their full details for matching
-    const allExistingResult = await pool.query(
-      'SELECT id, title, parent_task_id, split_task_id FROM tasks WHERE user_id = $1 AND completed = false',
-      [req.user.id]
-    );
-    
-    // Create mapping: "title|parent|split" -> task
-    const existingTasksByKey = {};
-    allExistingResult.rows.forEach(t => {
-      const key = `${t.title}|${t.parent_task_id || 'null'}|${t.split_task_id || 'null'}`;
-      existingTasksByKey[key] = t;
-    });
-
-    console.log('Existing tasks by key:', Object.keys(existingTasksByKey).length);
-
-    // Track which existing IDs we update (to delete the rest)
-    const updatedIds = new Set();
-    
-    // Track split_task_id counters per parent
+    // Counter for generating unique split_task_ids PER PARENT (TWO-ID FIX)
     const splitCountersByParent = {};
 
-    // Process all tasks
-    const processedTasks = [];
-    
+    // Clear existing incomplete tasks
+    await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
+
+    // Insert new tasks, preserving manual overrides and priorities
+    const insertedTasks = [];
     for (const task of tasks) {
       const userEstimate = existingTaskMap[task.title]?.userEstimate || task.userEstimate || null;
       const isNewTask = newTaskTitles.has(task.title);
@@ -421,128 +414,67 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       // Determine priority order
       let priorityOrder = null;
       if (existingTaskMap[task.title]?.priorityOrder !== undefined) {
+        // Preserve existing priority
         priorityOrder = existingTaskMap[task.title].priorityOrder;
       } else if (!priorityLocked) {
+        // Auto-assign priority if not locked (will sort by due_date via NULL)
         priorityOrder = null;
       } else if (isNewTask) {
+        // New task with locked priorities - append to end
         priorityOrder = nextPriority++;
       }
 
-      // Determine parent_task_id and split_task_id
+      // Determine parent_task_id and split_task_id (TWO-ID SYSTEM - FIXED)
       let parentTaskId = task.parent_task_id || null;
       let splitTaskId = task.split_task_id || null;
       
-      // Assign split ID if needed
+      // If this is a split task with parent but no split ID yet, assign one
       if (parentTaskId && !splitTaskId) {
+        // Initialize counter for this parent if not exists
         if (!splitCountersByParent[parentTaskId]) {
           splitCountersByParent[parentTaskId] = 0;
         }
+        // Assign next split ID for this parent
         splitTaskId = ++splitCountersByParent[parentTaskId];
       }
       
-      // Create matching key
-      const taskKey = `${task.title}|${parentTaskId || 'null'}|${splitTaskId || 'null'}`;
-      const existingTask = existingTasksByKey[taskKey];
-      
-      if (existingTask) {
-        // UPDATE existing task (preserves ID and partial completions)
-        console.log(`✓ Updating task ID ${existingTask.id}: ${task.title.substring(0, 30)}...`);
-        
-        const result = await pool.query(
-          `UPDATE tasks 
-           SET description = $1,
-               due_date = $2,
-               task_type = $3,
-               estimated_time = $4,
-               user_estimate = $5,
-               priority_order = $6,
-               is_new = $7,
-               parent_task_id = $8,
-               split_task_id = $9
-           WHERE id = $10 AND user_id = $11
-           RETURNING *`,
-          [
-            task.description,
-            task.dueDate,
-            task.type,
-            task.estimatedTime,
-            userEstimate,
-            priorityOrder,
-            priorityLocked && isNewTask,
-            parentTaskId || existingTask.id, // Set to self if null
-            splitTaskId,
-            existingTask.id,
-            req.user.id
-          ]
-        );
-        
-        const updatedTask = result.rows[0];
-        
-        // Ensure parent_task_id is set for base tasks
-        if (!parentTaskId) {
-          await pool.query('UPDATE tasks SET parent_task_id = id WHERE id = $1', [updatedTask.id]);
-          updatedTask.parent_task_id = updatedTask.id;
-        }
-        
-        processedTasks.push(updatedTask);
-        updatedIds.add(existingTask.id);
-        
-      } else {
-        // INSERT new task
-        console.log(`+ Inserting new task: ${task.title.substring(0, 30)}...`);
-        
-        const result = await pool.query(
-          `INSERT INTO tasks (user_id, parent_task_id, split_task_id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           RETURNING *`,
-          [
-            req.user.id,
-            parentTaskId,
-            splitTaskId,
-            task.title,
-            task.description,
-            task.dueDate,
-            task.type,
-            task.estimatedTime,
-            userEstimate,
-            priorityOrder,
-            priorityLocked && isNewTask,
-            task.completed || false
-          ]
-        );
-        
-        const insertedTask = result.rows[0];
-        
-        // Set parent_task_id = id for base tasks
-        if (!parentTaskId) {
-          await pool.query('UPDATE tasks SET parent_task_id = id WHERE id = $1', [insertedTask.id]);
-          insertedTask.parent_task_id = insertedTask.id;
-        }
-        
-        processedTasks.push(insertedTask);
-        updatedIds.add(insertedTask.id);
-      }
-    }
-    
-    // Delete tasks that were removed
-    const allExistingIds = allExistingResult.rows.map(t => t.id);
-    const idsToDelete = allExistingIds.filter(id => !updatedIds.has(id));
-    
-    if (idsToDelete.length > 0) {
-      await pool.query(
-        'DELETE FROM tasks WHERE id = ANY($1::int[]) AND user_id = $2',
-        [idsToDelete, req.user.id]
+      const result = await pool.query(
+        `INSERT INTO tasks (user_id, parent_task_id, split_task_id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING *`,
+        [
+          req.user.id,
+          parentTaskId,
+          splitTaskId,
+          task.title,
+          task.description,
+          task.dueDate,
+          task.type,
+          task.estimatedTime,
+          userEstimate,
+          priorityOrder,
+          priorityLocked && isNewTask, // Mark as new only if priority is locked
+          task.completed || false
+        ]
       );
-      console.log('- Deleted', idsToDelete.length, 'removed tasks:', idsToDelete);
+      
+      const insertedTask = result.rows[0];
+      
+      // CRITICAL FIX: If this is a new base task (no parent set), set parent_task_id = id
+      if (!parentTaskId) {
+        await pool.query(
+          'UPDATE tasks SET parent_task_id = id WHERE id = $1',
+          [insertedTask.id]
+        );
+        insertedTask.parent_task_id = insertedTask.id;
+      }
+      
+      insertedTasks.push(insertedTask);
     }
 
-    console.log('Updated/kept:', updatedIds.size, 'tasks');
-    console.log('=== SAVE COMPLETE ===\n');
-
-    res.json({ success: true, tasks: processedTasks });
+    res.json({ success: true, tasks: insertedTasks });
   } catch (error) {
     console.error('Save tasks error:', error);
-    console.error('Error details:', error.message);
     res.status(500).json({ error: 'Failed to save tasks' });
   }
 });
@@ -568,14 +500,21 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
 // Reorder tasks (update priority_order for all tasks)
 app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
   try {
-    const { taskIds } = req.body;
+    const { taskOrder } = req.body; // Array of task IDs in desired order
 
-    for (let i = 0; i < taskIds.length; i++) {
-      await pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3',
-        [i + 1, taskIds[i], req.user.id]
-      );
+    if (!Array.isArray(taskOrder)) {
+      return res.status(400).json({ error: 'taskOrder must be an array' });
     }
+
+    // Update priority_order for each task
+    const updatePromises = taskOrder.map((taskId, index) =>
+      pool.query(
+        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3',
+        [index + 1, taskId, req.user.id]
+      )
+    );
+
+    await Promise.all(updatePromises);
 
     res.json({ success: true });
   } catch (error) {
@@ -585,7 +524,7 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
 });
 
 // Toggle priority lock
-app.post('/api/tasks/priority-lock', authenticateToken, async (req, res) => {
+app.patch('/api/user/priority-lock', authenticateToken, async (req, res) => {
   try {
     const { locked } = req.body;
 
@@ -594,21 +533,10 @@ app.post('/api/tasks/priority-lock', authenticateToken, async (req, res) => {
       [locked, req.user.id]
     );
 
-    if (locked) {
-      const tasks = await pool.query(
-        'SELECT id FROM tasks WHERE user_id = $1 AND completed = false AND priority_order IS NULL ORDER BY due_date ASC, id ASC',
-        [req.user.id]
-      );
-
-      for (let i = 0; i < tasks.rows.length; i++) {
-        await pool.query(
-          'UPDATE tasks SET priority_order = $1 WHERE id = $2',
-          [i + 1, tasks.rows[i].id]
-        );
-      }
-    } else {
+    // If unlocking, clear all priority orders and new flags
+    if (!locked) {
       await pool.query(
-        'UPDATE tasks SET priority_order = NULL WHERE user_id = $1',
+        'UPDATE tasks SET priority_order = NULL, is_new = FALSE WHERE user_id = $1',
         [req.user.id]
       );
     }
@@ -621,134 +549,403 @@ app.post('/api/tasks/priority-lock', authenticateToken, async (req, res) => {
 });
 
 // Get priority lock status
-app.get('/api/tasks/priority-lock', authenticateToken, async (req, res) => {
+app.get('/api/user/priority-lock', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT priority_locked FROM users WHERE id = $1',
       [req.user.id]
     );
 
-    res.json({ locked: result.rows[0]?.priority_locked || false });
+    const locked = result.rows[0]?.priority_locked || false;
+    res.json({ locked });
   } catch (error) {
     console.error('Get priority lock error:', error);
     res.status(500).json({ error: 'Failed to get priority lock status' });
   }
 });
 
-// Clear new task flags
-app.post('/api/tasks/clear-new', authenticateToken, async (req, res) => {
+// Clear new task flags (move from sidebar to main list)
+app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
   try {
+    const { taskIds } = req.body;
+
+    if (!Array.isArray(taskIds)) {
+      return res.status(400).json({ error: 'taskIds must be an array' });
+    }
+
+    if (taskIds.length === 0) {
+      return res.json({ success: true });
+    }
+
     await pool.query(
-      'UPDATE tasks SET is_new = false WHERE user_id = $1 AND is_new = true',
-      [req.user.id]
+      'UPDATE tasks SET is_new = FALSE WHERE id = ANY($1::int[]) AND user_id = $2',
+      [taskIds, req.user.id]
     );
 
     res.json({ success: true });
   } catch (error) {
     console.error('Clear new flags error:', error);
-    res.status(500).json({ error: 'Failed to clear new task flags' });
+    res.status(500).json({ error: 'Failed to clear new flags' });
+  }
+});
+
+// Manual task completion (no time recorded)
+app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+
+    await pool.query(
+      'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Get global estimate for a task title
+app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res) => {
+  try {
+    const taskTitle = decodeURIComponent(req.params.title);
+
+    const result = await pool.query(
+      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as completion_count
+       FROM completion_history 
+       WHERE task_title = $1
+       GROUP BY task_title
+       HAVING COUNT(*) >= 3`,
+      [taskTitle]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({ 
+        estimate: result.rows[0].avg_time,
+        completionCount: result.rows[0].completion_count,
+        source: 'global'
+      });
+    } else {
+      res.json({ estimate: null });
+    }
+  } catch (error) {
+    console.error('Get global estimate error:', error);
+    res.status(500).json({ error: 'Failed to get global estimate' });
+  }
+});
+
+// Get partial completions
+app.get('/api/tasks/partial-completions', authenticateToken, async (req, res) => {
+  try {
+    // Get all partial completions with parent_task_id
+    const result = await pool.query(
+      `SELECT 
+         parent_task_id,
+         task_id,
+         split_task_id,
+         task_title,
+         accumulated_time,
+         last_updated
+       FROM partial_completions 
+       WHERE user_id = $1
+       ORDER BY parent_task_id, split_task_id`,
+      [req.user.id]
+    );
+
+    res.json({ partialCompletions: result.rows });
+  } catch (error) {
+    console.error('Get partial completions error:', error);
+    res.status(500).json({ error: 'Failed to get partial completions' });
   }
 });
 
 // ============ SESSION ROUTES ============
 
-// Get all sessions
-app.get('/api/sessions', authenticateToken, async (req, res) => {
+// Get completion history (for AI learning)
+app.get('/api/learning', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at DESC',
+      'SELECT * FROM completion_history WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 100',
       [req.user.id]
     );
-
-    res.json(result.rows);
+    // Always return an array, even if empty
+    const rows = result.rows || [];
+    res.json(rows);
   } catch (error) {
-    console.error('Get sessions error:', error);
-    res.status(500).json({ error: 'Failed to get sessions' });
+    console.error('Get learning error:', error);
+    // Return empty array on error instead of error object
+    res.json([]);
   }
 });
 
-// Create session
-app.post('/api/sessions', authenticateToken, async (req, res) => {
-  try {
-    const { sessionId, day, period, startTime, plannedTasks } = req.body;
+// END OF PART 1
+// Continue to server_part2.js
 
-    const result = await pool.query(
-      `INSERT INTO sessions (user_id, session_id, day, period, start_time, planned_tasks)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [req.user.id, sessionId, day, period, startTime, JSON.stringify(plannedTasks)]
+// OneSchool Global Study Planner - Backend API (TWO-ID SYSTEM)
+// server.js - PART 2 of 2
+// This continues from server_part1.js
+
+// Immediate task completion (TWO-ID SYSTEM - UPDATED)
+app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, taskTitle, taskType, estimatedTime, actualTime } = req.body;
+
+    console.log(`\n=== COMPLETING TASK ${taskId} ===`);
+
+    // Get the task details including parent_task_id and split_task_id
+    const taskResult = await pool.query(
+      'SELECT title, task_type, estimated_time, parent_task_id, split_task_id FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
 
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error('Create session error:', error);
-    res.status(500).json({ error: 'Failed to create session' });
-  }
-});
+    if (taskResult.rows.length === 0) {
+      console.log('Task not found');
+      return res.status(404).json({ error: 'Task not found' });
+    }
 
-// Complete session
-app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
-  try {
-    const { sessionId, completedTasks, totalTime, completionsSummary } = req.body;
+    const task = taskResult.rows[0];
+    const parentTaskId = task.parent_task_id || taskId; // If no parent, this IS the parent
+    const splitTaskId = task.split_task_id;
+    const isSegment = task.parent_task_id !== null;
 
-    console.log('=== BATCH COMPLETE START ===');
-    console.log('Session ID:', sessionId);
-    console.log('Total completions:', completedTasks.length);
-    console.log('Completions summary:', completionsSummary);
+    console.log('Task:', task.title);
+    console.log('Parent ID:', parentTaskId, '| Split ID:', splitTaskId, '| Is Segment:', isSegment);
 
+    // Get any accumulated partial time for this specific task
+    const partialResult = await pool.query(
+      'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+      [req.user.id, taskId]
+    );
+
+    const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
+    const totalTime = actualTime + partialTime;
+
+    console.log('Time - Session:', actualTime, '| Partial:', partialTime, '| Total:', totalTime);
+
+    // Mark task as completed
     await pool.query(
-      `UPDATE sessions 
-       SET completed = true, 
-           end_time = CURRENT_TIMESTAMP,
-           actual_time = $1,
-           completed_tasks = $2
-       WHERE session_id = $3 AND user_id = $4`,
-      [totalTime, JSON.stringify(completedTasks), sessionId, req.user.id]
+      'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
 
-    const processedParents = new Set();
+    // Remove this task's partial completion
+    await pool.query(
+      'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+      [req.user.id, taskId]
+    );
 
-    for (const task of completedTasks) {
-      console.log('\n--- Processing task:', task.title);
-      console.log('  Task ID:', task.id);
-      console.log('  Parent ID:', task.parent_task_id);
-      console.log('  Split ID:', task.split_task_id);
-      console.log('  Time spent:', task.timeSpent, 'min');
+    // Insert individual completion record
+    await pool.query(
+      `INSERT INTO completion_history 
+       (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        req.user.id,
+        taskId,
+        parentTaskId,
+        task.title,
+        task.task_type,
+        task.estimated_time,
+        totalTime,
+        isSegment
+      ]
+    );
 
-      const result = await pool.query(
-        `INSERT INTO completions (user_id, task_id, session_id, time_spent, completed_at)
-         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-         RETURNING *`,
-        [req.user.id, task.id, sessionId, task.timeSpent]
+    console.log('✓ Individual completion recorded');
+
+    // If this is a segment, check if ALL segments of the parent are now complete
+    if (isSegment) {
+      console.log('Checking if all segments of parent', parentTaskId, 'are complete...');
+
+      // Get all segments of this parent task
+      const allSegmentsResult = await pool.query(
+        'SELECT id, completed, estimated_time FROM tasks WHERE user_id = $1 AND parent_task_id = $2',
+        [req.user.id, parentTaskId]
       );
 
-      await pool.query(
-        'UPDATE tasks SET completed = true, completed_at = CURRENT_TIMESTAMP WHERE id = $1',
-        [task.id]
-      );
+      const allSegments = allSegmentsResult.rows;
+      const allComplete = allSegments.every(seg => seg.completed);
 
-      console.log('  âœ" Marked complete, logged completion');
+      console.log(`Found ${allSegments.length} segments, ${allComplete ? 'ALL' : 'NOT ALL'} complete`);
 
-      const parentTaskId = task.parent_task_id;
+      if (allComplete && allSegments.length > 0) {
+        console.log('🎉 All segments complete! Creating consolidated completion record...');
 
-      if (parentTaskId && !processedParents.has(parentTaskId)) {
-        const segments = await pool.query(
-          `SELECT id, split_task_id, completed 
-           FROM tasks 
-           WHERE user_id = $1 AND parent_task_id = $2 AND split_task_id IS NOT NULL
-           ORDER BY split_task_id`,
+        // Get all individual segment completions for this parent
+        const segmentCompletionsResult = await pool.query(
+          `SELECT task_title, task_type, estimated_time, actual_time 
+           FROM completion_history 
+           WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
           [req.user.id, parentTaskId]
         );
 
-        console.log('  Found', segments.rows.length, 'total segments for parent', parentTaskId);
+        const segmentCompletions = segmentCompletionsResult.rows;
+        
+        // Calculate totals
+        const totalEstimatedTime = segmentCompletions.reduce((sum, seg) => sum + seg.estimated_time, 0);
+        const totalActualTime = segmentCompletions.reduce((sum, seg) => sum + seg.actual_time, 0);
+        
+        // Get the parent task title (remove segment suffix from first segment)
+        const firstSegmentTitle = segmentCompletions[0].task_title;
+        const parentTitle = firstSegmentTitle
+          .replace(/ - Part \d+$/, '')
+          .replace(/ - Segment \d+$/, '')
+          .trim();
 
-        const allComplete = segments.rows.every(seg => seg.completed);
-        console.log('  All segments complete?', allComplete);
+        console.log('Consolidated stats:');
+        console.log('  Title:', parentTitle);
+        console.log('  Estimated:', totalEstimatedTime, '| Actual:', totalActualTime);
 
-        if (allComplete) {
+        // Check if consolidated record already exists (shouldn't, but just in case)
+        const existingConsolidated = await pool.query(
+          `SELECT id FROM completion_history 
+           WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = false`,
+          [req.user.id, parentTaskId]
+        );
+
+        if (existingConsolidated.rows.length === 0) {
+          // Insert consolidated completion record
           await pool.query(
-            `DELETE FROM partial_completions 
-             WHERE user_id = $1 AND parent_task_id = $2`,
+            `INSERT INTO completion_history 
+             (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+            [
+              req.user.id,
+              parentTaskId,
+              parentTaskId,
+              parentTitle,
+              segmentCompletions[0].task_type,
+              totalEstimatedTime,
+              totalActualTime
+            ]
+          );
+
+          // CRITICAL FIX: Delete individual segment records now that we have consolidated
+          await pool.query(
+            `DELETE FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+            [req.user.id, parentTaskId]
+          );
+
+          console.log('✓ Consolidated completion record created and segment records removed!');
+        } else {
+          console.log('ℹ Consolidated record already exists');
+        }
+      }
+    }
+
+    console.log('=== COMPLETION DONE ===\n');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Save session completion (batch completion at end of session) (TWO-ID SYSTEM - UPDATED)
+app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
+  try {
+    const { completions } = req.body;
+
+    console.log('\n=== BATCH COMPLETING', completions.length, 'TASKS ===');
+
+    // Track which parent tasks we've processed
+    const processedParents = new Set();
+
+    // Process each completion
+    for (const completion of completions) {
+      const taskId = completion.task.id;
+      const taskTitle = completion.task.title;
+      const taskType = completion.task.type;
+      const estimatedTime = completion.task.estimatedTime;
+      const actualTime = completion.timeSpent;
+
+      // Get task details including parent_task_id and split_task_id
+      const taskResult = await pool.query(
+        'SELECT parent_task_id, split_task_id FROM tasks WHERE id = $1 AND user_id = $2',
+        [taskId, req.user.id]
+      );
+
+      const parentTaskId = taskResult.rows.length > 0 
+        ? (taskResult.rows[0].parent_task_id || taskId)
+        : taskId;
+      const splitTaskId = taskResult.rows.length > 0 
+        ? taskResult.rows[0].split_task_id 
+        : null;
+      const isSegment = taskResult.rows.length > 0 && taskResult.rows[0].parent_task_id !== null;
+
+      // Get any partial time
+      const partialResult = await pool.query(
+        'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+        [req.user.id, taskId]
+      );
+
+      const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
+      const totalTime = actualTime + partialTime;
+
+      // Insert individual completion
+      await pool.query(
+        `INSERT INTO completion_history 
+         (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [req.user.id, taskId, parentTaskId, taskTitle, taskType, estimatedTime, totalTime, isSegment]
+      );
+
+      // Mark task as completed
+      await pool.query(
+        'UPDATE tasks SET completed = true WHERE id = $1 AND user_id = $2',
+        [taskId, req.user.id]
+      );
+
+      // Remove from partial completions
+      await pool.query(
+        'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+        [req.user.id, taskId]
+      );
+
+      console.log('✓ Completed:', taskTitle.substring(0, 50), `(${totalTime} min)`);
+
+      // Check if we need to create consolidated record for this parent
+      if (isSegment && !processedParents.has(parentTaskId)) {
+        // Get all segments of this parent
+        const allSegmentsResult = await pool.query(
+          'SELECT id, completed FROM tasks WHERE user_id = $1 AND parent_task_id = $2',
+          [req.user.id, parentTaskId]
+        );
+
+        const allComplete = allSegmentsResult.rows.every(seg => seg.completed);
+
+        if (allComplete && allSegmentsResult.rows.length > 0) {
+          // Get all segment completions
+          const segmentCompletionsResult = await pool.query(
+            `SELECT task_title, task_type, estimated_time, actual_time 
+             FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+            [req.user.id, parentTaskId]
+          );
+
+          const segments = segmentCompletionsResult.rows;
+          const totalEst = segments.reduce((sum, s) => sum + s.estimated_time, 0);
+          const totalAct = segments.reduce((sum, s) => sum + s.actual_time, 0);
+          
+          const parentTitle = segments[0].task_title
+            .replace(/ - Part \d+$/, '')
+            .replace(/ - Segment \d+$/, '')
+            .trim();
+
+          // Insert consolidated record
+          await pool.query(
+            `INSERT INTO completion_history 
+             (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+            [req.user.id, parentTaskId, parentTaskId, parentTitle, segments[0].task_type, totalEst, totalAct]
+          );
+
+          // CRITICAL FIX: Delete individual segment records now that we have consolidated
+          await pool.query(
+            `DELETE FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
             [req.user.id, parentTaskId]
           );
 
@@ -961,7 +1158,7 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     res.json({ 
       status: 'ok', 
-      message: 'OneSchool Global Study Planner API (TWO-ID + ID PRESERVATION)',
+      message: 'OneSchool Global Study Planner API (TWO-ID SYSTEM)',
       database: 'connected',
       timestamp: new Date().toISOString()
     });
@@ -978,5 +1175,7 @@ app.get('/health', async (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('TWO-ID SYSTEM + ID PRESERVATION ACTIVE');
+  console.log('TWO-ID SYSTEM ACTIVE');
 });
+
+// END OF PART 2
