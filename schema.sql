@@ -140,3 +140,77 @@ COMMENT ON TABLE completion_history IS 'Task completion data for AI learning, in
 COMMENT ON TABLE session_state IS 'Saved study session state for resume capability';
 COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests';
 COMMENT ON COLUMN partial_completions.task_id IS 'Task ID (no foreign key constraint - allows saving even if task deleted)';
+
+
+-- Migration Script: Add Two-ID System to Existing Database
+-- Run this in your Supabase SQL Editor
+
+-- Step 1: Add new columns to tasks table
+ALTER TABLE tasks 
+ADD COLUMN IF NOT EXISTS parent_task_id INTEGER,
+ADD COLUMN IF NOT EXISTS split_task_id INTEGER;
+
+-- Step 2: Add new columns to partial_completions table
+ALTER TABLE partial_completions
+ADD COLUMN IF NOT EXISTS parent_task_id INTEGER,
+ADD COLUMN IF NOT EXISTS split_task_id INTEGER;
+
+-- Step 3: Add new column to completion_history table
+ALTER TABLE completion_history
+ADD COLUMN IF NOT EXISTS parent_task_id INTEGER;
+
+-- Step 4: Create indexes for new columns
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_split_task_id ON tasks(split_task_id);
+CREATE INDEX IF NOT EXISTS idx_partial_completions_parent_task_id ON partial_completions(parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_completion_history_parent_task_id ON completion_history(parent_task_id);
+
+-- Step 5: Initialize parent_task_id for existing tasks (all NULL means they're base tasks)
+-- This is already done by default since we added columns with no default value
+
+-- Step 6: Update existing partial_completions to have parent_task_id
+-- For now, we'll set parent_task_id equal to task_id for existing entries (they're all base tasks)
+UPDATE partial_completions
+SET parent_task_id = task_id
+WHERE parent_task_id IS NULL;
+
+-- Step 7: Make parent_task_id NOT NULL in partial_completions now that it's populated
+ALTER TABLE partial_completions
+ALTER COLUMN parent_task_id SET NOT NULL;
+
+-- Step 8: Update existing completion_history entries
+-- Set parent_task_id equal to task_id for all existing entries (they're all base tasks)
+UPDATE completion_history
+SET parent_task_id = task_id
+WHERE parent_task_id IS NULL;
+
+-- Verify the migration
+SELECT 'Tasks table structure:' as info;
+SELECT column_name, data_type, is_nullable 
+FROM information_schema.columns 
+WHERE table_name = 'tasks' 
+ORDER BY ordinal_position;
+
+SELECT 'Partial completions table structure:' as info;
+SELECT column_name, data_type, is_nullable 
+FROM information_schema.columns 
+WHERE table_name = 'partial_completions' 
+ORDER BY ordinal_position;
+
+SELECT 'Completion history table structure:' as info;
+SELECT column_name, data_type, is_nullable 
+FROM information_schema.columns 
+WHERE table_name = 'completion_history' 
+ORDER BY ordinal_position;
+
+-- Test query: Show any tasks with parent relationships
+SELECT 
+    id,
+    parent_task_id,
+    split_task_id,
+    LEFT(title, 50) as title_preview,
+    completed
+FROM tasks
+WHERE parent_task_id IS NOT NULL
+ORDER BY parent_task_id, split_task_id
+LIMIT 10;
