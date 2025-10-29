@@ -1,5 +1,5 @@
-// OneSchool Global Study Planner - Backend API (ENHANCED)
-// server.js
+// OneSchool Global Study Planner - Backend API (TWO-ID SYSTEM)
+// server.js - PART 1 of 2
 
 const express = require('express');
 const cors = require('cors');
@@ -53,7 +53,9 @@ pool.query(`
   CREATE TABLE IF NOT EXISTS partial_completions (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL,
+    parent_task_id INTEGER NOT NULL,
+    split_task_id INTEGER,
     task_title VARCHAR(500) NOT NULL,
     accumulated_time INTEGER NOT NULL DEFAULT 0,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -86,123 +88,6 @@ const extractNameFromEmail = (email) => {
   const last = parts[1] ? parts[1].replace(/\d+/g, '') : '';
   const lastName = last ? last.charAt(0).toUpperCase() + last.slice(1) : '';
   return `${first} ${lastName}`.trim();
-};
-
-// ============================================================================
-// HIERARCHICAL TASK MATCHING SYSTEM
-// ============================================================================
-// Tasks can be split up to 2 levels deep:
-// Level 0 (Root): parent_task_id=NULL, split1_task_id=NULL, split2_task_id=NULL
-// Level 1 (First split): parent_task_id=X, split1_task_id=X, split2_task_id=NULL
-// Level 2 (Second split): parent_task_id=X, split1_task_id=Y, split2_task_id=Y
-//
-// Partial completions are grouped by matching IDs in a "ladder" system:
-// - Level 2 tasks match if ALL 3 IDs match (parent + split1 + split2)
-// - Level 1 tasks match if 2 IDs match (parent + split1)
-// - Level 0 tasks match only their own task_id
-// ============================================================================
-
-/**
- * Find matching partial completion record for a task using hierarchical ID matching
- * @param {number} userId - User ID
- * @param {number} taskId - Task ID
- * @param {number|null} parentTaskId - Parent task ID
- * @param {number|null} split1TaskId - First split level ID
- * @param {number|null} split2TaskId - Second split level ID
- * @returns {Promise<object|null>} Existing partial completion or null
- */
-const findMatchingPartialCompletion = async (userId, taskId, parentTaskId, split1TaskId, split2TaskId) => {
-  // Determine the matching strategy based on split level
-  let query, params;
-  
-  if (split2TaskId) {
-    // Level 2 task: Match ALL 3 IDs (parent + split1 + split2)
-    console.log(`  Matching strategy: Level 2 (ALL 3 IDs must match)`);
-    console.log(`  Looking for: parent=${parentTaskId}, split1=${split1TaskId}, split2=${split2TaskId}`);
-    
-    query = `
-      SELECT id, accumulated_time, task_title, task_subtitle
-      FROM partial_completions
-      WHERE user_id = $1 
-        AND parent_task_id = $2 
-        AND split1_task_id = $3 
-        AND split2_task_id = $4
-    `;
-    params = [userId, parentTaskId, split1TaskId, split2TaskId];
-    
-  } else if (split1TaskId) {
-    // Level 1 task: Match 2 IDs (parent + split1)
-    console.log(`  Matching strategy: Level 1 (parent + split1 must match)`);
-    console.log(`  Looking for: parent=${parentTaskId}, split1=${split1TaskId}`);
-    
-    query = `
-      SELECT id, accumulated_time, task_title, task_subtitle
-      FROM partial_completions
-      WHERE user_id = $1 
-        AND parent_task_id = $2 
-        AND split1_task_id = $3
-        AND split2_task_id IS NULL
-    `;
-    params = [userId, parentTaskId, split1TaskId];
-    
-  } else {
-    // Level 0 task (root): Match only task_id
-    console.log(`  Matching strategy: Level 0 (root task, exact task_id match)`);
-    console.log(`  Looking for: task_id=${taskId}`);
-    
-    query = `
-      SELECT id, accumulated_time, task_title, task_subtitle
-      FROM partial_completions
-      WHERE user_id = $1 AND task_id = $2
-    `;
-    params = [userId, taskId];
-  }
-  
-  const result = await pool.query(query, params);
-  return result.rows.length > 0 ? result.rows[0] : null;
-};
-
-/**
- * Find all sibling tasks that share the same hierarchical level
- * Used for completion grouping - when all siblings complete, mark parent as done
- * @param {number} userId - User ID
- * @param {number|null} parentTaskId - Parent task ID
- * @param {number|null} split1TaskId - First split level ID
- * @param {number|null} split2TaskId - Second split level ID
- * @returns {Promise<Array>} Array of sibling task IDs
- */
-const findSiblingTasks = async (userId, parentTaskId, split1TaskId, split2TaskId) => {
-  let query, params;
-  
-  if (split2TaskId) {
-    // Find all tasks at same level 2 (same parent + split1)
-    query = `
-      SELECT id FROM tasks
-      WHERE user_id = $1 
-        AND parent_task_id = $2 
-        AND split1_task_id = $3
-        AND split2_task_id IS NOT NULL
-    `;
-    params = [userId, parentTaskId, split1TaskId];
-    
-  } else if (split1TaskId) {
-    // Find all tasks at same level 1 (same parent)
-    query = `
-      SELECT id FROM tasks
-      WHERE user_id = $1 
-        AND parent_task_id = $2
-        AND split1_task_id IS NOT NULL
-        AND split2_task_id IS NULL
-    `;
-    params = [userId, parentTaskId];
-    
-  } else {
-    // Root task has no siblings in this context
-    return [];
-  }
-  
-  const result = await pool.query(query, params);
-  return result.rows.map(row => row.id);
 };
 
 // Validate OneSchool email
@@ -369,29 +254,31 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
   }
 });
 
-// ============ CALENDAR/TASK ROUTES ============
-
 // Fetch Canvas calendar
 app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
-
-    if (!canvasUrl) {
-      return res.status(400).json({ error: 'Canvas URL is required' });
+    
+    if (!canvasUrl || !canvasUrl.includes('instructure.com/feeds/calendars')) {
+      return res.status(400).json({ 
+        error: 'Invalid Canvas URL. Please use the format: https://canvas.instructure.com/feeds/calendars/user_...' 
+      });
     }
 
-    const response = await axios.get(canvasUrl, {
-      headers: {
-        'Accept': 'text/calendar, text/plain, */*'
-      },
-      timeout: 10000
-    });
-
-    const icsData = response.data;
-
-    if (!icsData.includes('BEGIN:VCALENDAR')) {
-      return res.status(400).json({ 
-        error: 'Invalid calendar format. Please check your Canvas calendar URL.' 
+    let icsData;
+    try {
+      const response = await axios.get(canvasUrl, { 
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'PlanAssist/1.0'
+        }
+      });
+      icsData = response.data;
+    } catch (error) {
+      console.error('Error fetching calendar:', error.message);
+      return res.status(500).json({ 
+        error: 'Failed to fetch calendar data. Please verify your Canvas URL is correct and accessible.',
+        details: error.message 
       });
     }
 
@@ -454,7 +341,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Save tasks (ENHANCED: preserves manual overrides and handles priority)
+// Save tasks (TWO-ID SYSTEM - UPDATED)
 app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
@@ -473,7 +360,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
     // Get existing tasks with manual overrides and titles
     const existingTasks = await pool.query(
-      'SELECT id, title, user_estimate, priority_order FROM tasks WHERE user_id = $1',
+      'SELECT id, title, user_estimate, priority_order, parent_task_id, split_task_id FROM tasks WHERE user_id = $1',
       [req.user.id]
     );
 
@@ -482,7 +369,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     (existingTasks.rows || []).forEach(task => {
       existingTaskMap[task.title] = {
         userEstimate: task.user_estimate,
-        priorityOrder: task.priority_order
+        priorityOrder: task.priority_order,
+        parentTaskId: task.parent_task_id,
+        splitTaskId: task.split_task_id
       };
     });
 
@@ -497,6 +386,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       [req.user.id]
     );
     let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
+
+    // Counter for generating unique split_task_ids
+    let splitTaskCounter = 0;
 
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
@@ -519,13 +411,24 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         // New task with locked priorities - append to end
         priorityOrder = nextPriority++;
       }
+
+      // Determine parent_task_id and split_task_id (TWO-ID SYSTEM)
+      let parentTaskId = task.parent_task_id || null;
+      let splitTaskId = task.split_task_id || null;
+      
+      // If this is a new split task (has parent_task_id but no split_task_id yet)
+      if (parentTaskId && !splitTaskId) {
+        splitTaskId = ++splitTaskCounter;
+      }
       
       const result = await pool.query(
-        `INSERT INTO tasks (user_id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed`,
+        `INSERT INTO tasks (user_id, parent_task_id, split_task_id, title, description, due_date, task_type, estimated_time, user_estimate, priority_order, is_new, completed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING *`,
         [
           req.user.id,
+          parentTaskId,
+          splitTaskId,
           task.title,
           task.description,
           task.dueDate,
@@ -703,6 +606,31 @@ app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res)
   }
 });
 
+// Get partial completions
+app.get('/api/tasks/partial-completions', authenticateToken, async (req, res) => {
+  try {
+    // Get all partial completions with parent_task_id
+    const result = await pool.query(
+      `SELECT 
+         parent_task_id,
+         task_id,
+         split_task_id,
+         task_title,
+         accumulated_time,
+         last_updated
+       FROM partial_completions 
+       WHERE user_id = $1
+       ORDER BY parent_task_id, split_task_id`,
+      [req.user.id]
+    );
+
+    res.json({ partialCompletions: result.rows });
+  } catch (error) {
+    console.error('Get partial completions error:', error);
+    res.status(500).json({ error: 'Failed to get partial completions' });
+  }
+});
+
 // ============ SESSION ROUTES ============
 
 // Get completion history (for AI learning)
@@ -722,29 +650,40 @@ app.get('/api/learning', authenticateToken, async (req, res) => {
   }
 });
 
-// Helper function to extract parent task title from segment title
-const extractParentTaskTitle = (taskTitle) => {
-  // Matches patterns like "Task - Part 1", "Task - Segment 2", etc.
-  // More flexible to handle variations in spacing
-  const segmentPattern = /^(.+?)\s+-\s+(Part|Segment)\s+\d+$/i;
-  const match = taskTitle.match(segmentPattern);
-  if (match) {
-    return match[1].trim();
-  }
-  return null;
-};
+// END OF PART 1
+// Continue to server_part2.js
 
-// Helper function to check if a task is a segment
-const isTaskSegment = (taskTitle) => {
-  return /\s+-\s+(Part|Segment)\s+\d+$/i.test(taskTitle);
-};
+// OneSchool Global Study Planner - Backend API (TWO-ID SYSTEM)
+// server.js - PART 2 of 2
+// This continues from server_part1.js
 
-// Immediate task completion (called when user clicks "Mark Complete" in session)
+// Immediate task completion (TWO-ID SYSTEM - UPDATED)
 app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
   try {
     const { taskId, taskTitle, taskType, estimatedTime, actualTime } = req.body;
 
-    // Get any partial time for this task
+    console.log(`\n=== COMPLETING TASK ${taskId} ===`);
+
+    // Get the task details including parent_task_id and split_task_id
+    const taskResult = await pool.query(
+      'SELECT title, task_type, estimated_time, parent_task_id, split_task_id FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    if (taskResult.rows.length === 0) {
+      console.log('Task not found');
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0];
+    const parentTaskId = task.parent_task_id || taskId; // If no parent, this IS the parent
+    const splitTaskId = task.split_task_id;
+    const isSegment = task.parent_task_id !== null;
+
+    console.log('Task:', task.title);
+    console.log('Parent ID:', parentTaskId, '| Split ID:', splitTaskId, '| Is Segment:', isSegment);
+
+    // Get any accumulated partial time for this specific task
     const partialResult = await pool.query(
       'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
       [req.user.id, taskId]
@@ -753,26 +692,7 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
     const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
     const totalTime = actualTime + partialTime;
 
-    // Check if this is a task segment
-    const parentTaskTitle = extractParentTaskTitle(taskTitle);
-    const isSegment = parentTaskTitle !== null;
-
-    // Insert into completion_history
-    await pool.query(
-      `INSERT INTO completion_history 
-       (user_id, task_id, task_title, task_type, estimated_time, actual_time, parent_task_title, is_segment)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [
-        req.user.id,
-        taskId,
-        taskTitle,
-        taskType,
-        estimatedTime,
-        totalTime,
-        parentTaskTitle,
-        isSegment
-      ]
-    );
+    console.log('Time - Session:', actualTime, '| Partial:', partialTime, '| Total:', totalTime);
 
     // Mark task as completed
     await pool.query(
@@ -780,78 +700,106 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
       [taskId, req.user.id]
     );
 
-    // Remove from partial_completions if exists
+    // Remove this task's partial completion
     await pool.query(
       'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
       [req.user.id, taskId]
     );
 
-    // If this is a segment, check if all segments of the parent task are complete
+    // Insert individual completion record
+    await pool.query(
+      `INSERT INTO completion_history 
+       (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        req.user.id,
+        taskId,
+        parentTaskId,
+        task.title,
+        task.task_type,
+        task.estimated_time,
+        totalTime,
+        isSegment
+      ]
+    );
+
+    console.log('✓ Individual completion recorded');
+
+    // If this is a segment, check if ALL segments of the parent are now complete
     if (isSegment) {
-      console.log('Task is a segment. Parent title:', parentTaskTitle);
-      
-      // Find all segments of the same parent task
-      const segmentsResult = await pool.query(
-        `SELECT id, title, task_type, estimated_time 
-         FROM tasks 
-         WHERE user_id = $1 
-         AND title LIKE $2`,
-        [req.user.id, `${parentTaskTitle} - %`]
+      console.log('Checking if all segments of parent', parentTaskId, 'are complete...');
+
+      // Get all segments of this parent task
+      const allSegmentsResult = await pool.query(
+        'SELECT id, completed, estimated_time FROM tasks WHERE user_id = $1 AND parent_task_id = $2',
+        [req.user.id, parentTaskId]
       );
 
-      console.log('Found segments in tasks table:', segmentsResult.rows.length, segmentsResult.rows.map(r => r.title));
+      const allSegments = allSegmentsResult.rows;
+      const allComplete = allSegments.every(seg => seg.completed);
 
-      // Check if all segments are completed
-      const completedSegmentsResult = await pool.query(
-        `SELECT task_id, task_title, actual_time 
-         FROM completion_history 
-         WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true`,
-        [req.user.id, parentTaskTitle]
-      );
+      console.log(`Found ${allSegments.length} segments, ${allComplete ? 'ALL' : 'NOT ALL'} complete`);
 
-      console.log('Completed segments:', completedSegmentsResult.rows.length, '/', segmentsResult.rows.length);
-      console.log('Completed segment titles:', completedSegmentsResult.rows.map(r => r.task_title));
+      if (allComplete && allSegments.length > 0) {
+        console.log('🎉 All segments complete! Creating consolidated completion record...');
 
-      const allSegments = segmentsResult.rows;
-      const completedSegments = completedSegmentsResult.rows;
-
-      if (allSegments.length > 0 && allSegments.length === completedSegments.length) {
-        console.log('All segments complete! Creating aggregated completion for:', parentTaskTitle);
-        
-        // All segments are complete, create aggregated completion
-        const totalActualTime = completedSegments.reduce((sum, seg) => sum + seg.actual_time, 0);
-        const totalEstimatedTime = allSegments.reduce((sum, seg) => sum + seg.estimated_time, 0);
-
-        console.log('Aggregated times - Estimated:', totalEstimatedTime, 'Actual:', totalActualTime);
-
-        // Insert aggregated completion for parent task
-        await pool.query(
-          `INSERT INTO completion_history 
-           (user_id, task_title, task_type, estimated_time, actual_time, is_segment)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            req.user.id,
-            parentTaskTitle,
-            allSegments[0].task_type,
-            totalEstimatedTime,
-            totalActualTime,
-            false
-          ]
+        // Get all individual segment completions for this parent
+        const segmentCompletionsResult = await pool.query(
+          `SELECT task_title, task_type, estimated_time, actual_time 
+           FROM completion_history 
+           WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+          [req.user.id, parentTaskId]
         );
 
-        console.log('✓ Aggregated completion created successfully');
+        const segmentCompletions = segmentCompletionsResult.rows;
+        
+        // Calculate totals
+        const totalEstimatedTime = segmentCompletions.reduce((sum, seg) => sum + seg.estimated_time, 0);
+        const totalActualTime = segmentCompletions.reduce((sum, seg) => sum + seg.actual_time, 0);
+        
+        // Get the parent task title (remove segment suffix from first segment)
+        const firstSegmentTitle = segmentCompletions[0].task_title;
+        const parentTitle = firstSegmentTitle
+          .replace(/ - Part \d+$/, '')
+          .replace(/ - Segment \d+$/, '')
+          .trim();
 
-        // Optionally, delete individual segment completions to keep history clean
-        // (Commented out to preserve segment data for detailed analysis)
-        // await pool.query(
-        //   'DELETE FROM completion_history WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true',
-        //   [req.user.id, parentTaskTitle]
-        // );
-      } else {
-        console.log('Not all segments complete yet');
+        console.log('Consolidated stats:');
+        console.log('  Title:', parentTitle);
+        console.log('  Estimated:', totalEstimatedTime, '| Actual:', totalActualTime);
+
+        // Check if consolidated record already exists (shouldn't, but just in case)
+        const existingConsolidated = await pool.query(
+          `SELECT id FROM completion_history 
+           WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = false`,
+          [req.user.id, parentTaskId]
+        );
+
+        if (existingConsolidated.rows.length === 0) {
+          // Insert consolidated completion record
+          await pool.query(
+            `INSERT INTO completion_history 
+             (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+            [
+              req.user.id,
+              parentTaskId,
+              parentTaskId,
+              parentTitle,
+              segmentCompletions[0].task_type,
+              totalEstimatedTime,
+              totalActualTime
+            ]
+          );
+
+          console.log('✓ Consolidated completion record created!');
+        } else {
+          console.log('ℹ Consolidated record already exists');
+        }
       }
     }
 
+    console.log('=== COMPLETION DONE ===\n');
     res.json({ success: true });
   } catch (error) {
     console.error('Complete task error:', error);
@@ -859,10 +807,15 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
   }
 });
 
-// Save session completion (batch completion at end of session)
+// Save session completion (batch completion at end of session) (TWO-ID SYSTEM - UPDATED)
 app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
   try {
     const { completions } = req.body;
+
+    console.log('\n=== BATCH COMPLETING', completions.length, 'TASKS ===');
+
+    // Track which parent tasks we've processed
+    const processedParents = new Set();
 
     // Process each completion
     for (const completion of completions) {
@@ -872,7 +825,21 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
       const estimatedTime = completion.task.estimatedTime;
       const actualTime = completion.timeSpent;
 
-      // Get any partial time for this task
+      // Get task details including parent_task_id and split_task_id
+      const taskResult = await pool.query(
+        'SELECT parent_task_id, split_task_id FROM tasks WHERE id = $1 AND user_id = $2',
+        [taskId, req.user.id]
+      );
+
+      const parentTaskId = taskResult.rows.length > 0 
+        ? (taskResult.rows[0].parent_task_id || taskId)
+        : taskId;
+      const splitTaskId = taskResult.rows.length > 0 
+        ? taskResult.rows[0].split_task_id 
+        : null;
+      const isSegment = taskResult.rows.length > 0 && taskResult.rows[0].parent_task_id !== null;
+
+      // Get any partial time
       const partialResult = await pool.query(
         'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
         [req.user.id, taskId]
@@ -881,25 +848,12 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
       const partialTime = partialResult.rows.length > 0 ? partialResult.rows[0].accumulated_time : 0;
       const totalTime = actualTime + partialTime;
 
-      // Check if this is a task segment
-      const parentTaskTitle = extractParentTaskTitle(taskTitle);
-      const isSegment = parentTaskTitle !== null;
-
-      // Insert into completion_history
+      // Insert individual completion
       await pool.query(
         `INSERT INTO completion_history 
-         (user_id, task_id, task_title, task_type, estimated_time, actual_time, parent_task_title, is_segment)
+         (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [
-          req.user.id,
-          taskId,
-          taskTitle,
-          taskType,
-          estimatedTime,
-          totalTime,
-          parentTaskTitle,
-          isSegment
-        ]
+        [req.user.id, taskId, parentTaskId, taskTitle, taskType, estimatedTime, totalTime, isSegment]
       );
 
       // Mark task as completed
@@ -908,70 +862,73 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
         [taskId, req.user.id]
       );
 
-      // Remove from partial_completions if exists
+      // Remove from partial completions
       await pool.query(
         'DELETE FROM partial_completions WHERE user_id = $1 AND task_id = $2',
         [req.user.id, taskId]
       );
 
-      // If this is a segment, check if all segments of the parent task are complete
-      if (isSegment) {
-        const segmentsResult = await pool.query(
-          `SELECT id, title, task_type, estimated_time 
-           FROM tasks 
-           WHERE user_id = $1 
-           AND title LIKE $2`,
-          [req.user.id, `${parentTaskTitle} - %`]
+      console.log('✓ Completed:', taskTitle.substring(0, 50), `(${totalTime} min)`);
+
+      // Check if we need to create consolidated record for this parent
+      if (isSegment && !processedParents.has(parentTaskId)) {
+        // Get all segments of this parent
+        const allSegmentsResult = await pool.query(
+          'SELECT id, completed FROM tasks WHERE user_id = $1 AND parent_task_id = $2',
+          [req.user.id, parentTaskId]
         );
 
-        const completedSegmentsResult = await pool.query(
-          `SELECT task_id, task_title, actual_time 
-           FROM completion_history 
-           WHERE user_id = $1 AND parent_task_title = $2 AND is_segment = true`,
-          [req.user.id, parentTaskTitle]
-        );
+        const allComplete = allSegmentsResult.rows.every(seg => seg.completed);
 
-        const allSegments = segmentsResult.rows;
-        const completedSegments = completedSegmentsResult.rows;
+        if (allComplete && allSegmentsResult.rows.length > 0) {
+          // Get all segment completions
+          const segmentCompletionsResult = await pool.query(
+            `SELECT task_title, task_type, estimated_time, actual_time 
+             FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+            [req.user.id, parentTaskId]
+          );
 
-        if (allSegments.length > 0 && allSegments.length === completedSegments.length) {
-          const totalActualTime = completedSegments.reduce((sum, seg) => sum + seg.actual_time, 0);
-          const totalEstimatedTime = allSegments.reduce((sum, seg) => sum + seg.estimated_time, 0);
+          const segments = segmentCompletionsResult.rows;
+          const totalEst = segments.reduce((sum, s) => sum + s.estimated_time, 0);
+          const totalAct = segments.reduce((sum, s) => sum + s.actual_time, 0);
+          
+          const parentTitle = segments[0].task_title
+            .replace(/ - Part \d+$/, '')
+            .replace(/ - Segment \d+$/, '')
+            .trim();
 
+          // Insert consolidated record
           await pool.query(
             `INSERT INTO completion_history 
-             (user_id, task_title, task_type, estimated_time, actual_time, is_segment)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [
-              req.user.id,
-              parentTaskTitle,
-              allSegments[0].task_type,
-              totalEstimatedTime,
-              totalActualTime,
-              false
-            ]
+             (user_id, task_id, parent_task_id, task_title, task_type, estimated_time, actual_time, is_segment)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false)`,
+            [req.user.id, parentTaskId, parentTaskId, parentTitle, segments[0].task_type, totalEst, totalAct]
           );
+
+          console.log('  🎉 Consolidated', segments.length, 'segments into one record');
+          processedParents.add(parentTaskId);
         }
       }
     }
 
+    console.log('=== BATCH COMPLETE DONE ===\n');
     res.json({ success: true });
   } catch (error) {
-    console.error('Save session error:', error);
-    res.status(500).json({ error: 'Failed to save session' });
+    console.error('Session complete error:', error);
+    res.status(500).json({ error: 'Failed to complete session' });
   }
 });
 
-// Save session state (for resume capability)
+// Save session state (for resume capability) (TWO-ID SYSTEM - UPDATED)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime, partialTaskTitle, partialTaskSubtitle } = req.body;
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime, partialTaskTitle } = req.body;
 
-    console.log('\n=== SAVE STATE REQUEST (HIERARCHICAL) ===');
+    console.log('=== SAVE STATE REQUEST ===');
     console.log('Session ID:', sessionId);
     console.log('Partial Task ID:', partialTaskId);
     console.log('Partial Task Title:', partialTaskTitle);
-    console.log('Partial Task Subtitle:', partialTaskSubtitle);
     console.log('Partial Task Time:', partialTaskTime);
     console.log('Completed Task IDs:', completedTaskIds);
 
@@ -980,74 +937,75 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 
     // If there's a partial task with time spent, save or update its partial completion time
     if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
-      console.log('\n--- Processing Partial Completion ---');
       console.log('Attempting to save partial completion for task ID:', partialTaskId);
       
-      // Get the task from database with hierarchical IDs
+      // Get the task from database including parent_task_id and split_task_id
       const taskResult = await pool.query(
-        `SELECT title, subtitle, completed, parent_task_id, split1_task_id, split2_task_id 
-         FROM tasks 
-         WHERE id = $1 AND user_id = $2`,
+        'SELECT title, completed, parent_task_id, split_task_id FROM tasks WHERE id = $1 AND user_id = $2',
         [partialTaskId, req.user.id]
       );
 
-      if (taskResult.rows.length === 0) {
-        console.log('⚠ Task not found in database, skipping partial save');
-      } else {
+      let taskTitle = partialTaskTitle || 'Unknown Task';
+      let parentTaskId = partialTaskId; // Default to current task ID
+      let splitTaskId = null;
+      let shouldSave = true;
+
+      if (taskResult.rows.length > 0) {
         const task = taskResult.rows[0];
+        taskTitle = task.title;
+        
+        // Determine parent_task_id: use task's parent_task_id if it exists, otherwise use task's own ID
+        parentTaskId = task.parent_task_id || partialTaskId;
+        splitTaskId = task.split_task_id;
         
         if (task.completed) {
           console.log('⚠ Task is already marked as completed, skipping save');
+          shouldSave = false;
         } else {
-          const taskTitle = task.title;
-          const taskSubtitle = task.subtitle || null;
-          const parentTaskId = task.parent_task_id;
-          const split1TaskId = task.split1_task_id;
-          const split2TaskId = task.split2_task_id;
-          
-          console.log('✓ Found task in database:', taskTitle, taskSubtitle ? `(${taskSubtitle})` : '');
-          console.log('  Hierarchical IDs: parent=%s, split1=%s, split2=%s', 
-                     parentTaskId || 'null', split1TaskId || 'null', split2TaskId || 'null');
-          
-          // Find matching partial completion using hierarchical ID ladder
-          const existingPartial = await findMatchingPartialCompletion(
-            req.user.id, partialTaskId, parentTaskId, split1TaskId, split2TaskId
-          );
+          console.log('✓ Found task:', taskTitle);
+          console.log('  Parent ID:', parentTaskId, '| Split ID:', splitTaskId);
+        }
+      } else {
+        console.log('⚠ Task not found in database, using provided title:', taskTitle);
+      }
 
-          if (existingPartial) {
-            const previousTime = existingPartial.accumulated_time;
-            console.log('→ Found existing partial completion:', previousTime, 'minutes');
-            
-            // Update existing partial completion (add new time to accumulated time)
-            const result = await pool.query(
-              `UPDATE partial_completions 
-               SET accumulated_time = accumulated_time + $1,
-                   last_updated = CURRENT_TIMESTAMP
-               WHERE id = $2
-               RETURNING accumulated_time`,
-              [partialTaskTime, existingPartial.id]
-            );
-            
-            console.log('✓ Updated partial completion. Total accumulated:', result.rows[0].accumulated_time, 'minutes');
-          } else {
-            // Insert new partial completion with hierarchical IDs
-            console.log('→ No existing match found, creating new partial completion');
-            const result = await pool.query(
-              `INSERT INTO partial_completions 
-               (user_id, task_id, parent_task_id, split1_task_id, split2_task_id, 
-                task_title, task_subtitle, accumulated_time, last_updated)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
-               RETURNING accumulated_time`,
-              [req.user.id, partialTaskId, parentTaskId, split1TaskId, split2TaskId,
-               taskTitle, taskSubtitle, partialTaskTime]
-            );
-            
-            console.log('✓ Created new partial completion:', result.rows[0].accumulated_time, 'minutes');
-          }
+      if (shouldSave) {
+        // Check if partial completion already exists for THIS SPECIFIC TASK
+        const existingPartial = await pool.query(
+          'SELECT accumulated_time FROM partial_completions WHERE user_id = $1 AND task_id = $2',
+          [req.user.id, partialTaskId]
+        );
+
+        if (existingPartial.rows.length > 0) {
+          // Update existing partial completion
+          const result = await pool.query(
+            `UPDATE partial_completions 
+             SET accumulated_time = accumulated_time + $1,
+                 task_title = $2,
+                 parent_task_id = $3,
+                 split_task_id = $4,
+                 last_updated = CURRENT_TIMESTAMP
+             WHERE user_id = $5 AND task_id = $6
+             RETURNING accumulated_time`,
+            [partialTaskTime, taskTitle, parentTaskId, splitTaskId, req.user.id, partialTaskId]
+          );
+          
+          console.log('✓ Updated partial completion. Accumulated:', result.rows[0].accumulated_time, 'min');
+        } else {
+          // Insert new partial completion
+          const result = await pool.query(
+            `INSERT INTO partial_completions 
+             (user_id, task_id, parent_task_id, split_task_id, task_title, accumulated_time, last_updated)
+             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+             RETURNING accumulated_time`,
+            [req.user.id, partialTaskId, parentTaskId, splitTaskId, taskTitle, partialTaskTime]
+          );
+          
+          console.log('✓ Created partial completion:', result.rows[0].accumulated_time, 'min');
         }
       }
     } else {
-      console.log('\nℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
+      console.log('ℹ No partial task to save (partialTaskId:', partialTaskId, ', time:', partialTaskTime, ')');
     }
 
     // Insert new session state
@@ -1059,7 +1017,7 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
     );
 
     console.log('✓ Session state saved successfully');
-    console.log('=================================\n');
+    console.log('=========================\n');
     res.json({ success: true });
   } catch (error) {
     console.error('❌ Save session state error:', error);
@@ -1080,34 +1038,22 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
     if (result.rows.length > 0) {
       const state = result.rows[0];
 
-      // Get all partial completions for this user with hierarchical IDs
+      // Get all partial completions for this user (grouped by parent_task_id)
       const partialResult = await pool.query(
-        `SELECT task_id, parent_task_id, split1_task_id, split2_task_id, 
-                task_title, task_subtitle, accumulated_time 
-         FROM partial_completions 
-         WHERE user_id = $1`,
+        'SELECT task_id, parent_task_id, accumulated_time FROM partial_completions WHERE user_id = $1',
         [req.user.id]
       );
 
-      // Build a map that allows lookup by task_id OR hierarchical match
+      // Group by parent_task_id for display
       const partialTaskTimes = {};
-      const partialRecords = [];
-      
       partialResult.rows.forEach(row => {
-        // Store the full record for hierarchical matching
-        partialRecords.push({
-          taskId: row.task_id,
-          parentTaskId: row.parent_task_id,
-          split1TaskId: row.split1_task_id,
-          split2TaskId: row.split2_task_id,
-          time: row.accumulated_time
-        });
-        
-        // Also index by task_id for direct lookups
-        partialTaskTimes[row.task_id] = row.accumulated_time;
+        const parentId = row.parent_task_id;
+        if (partialTaskTimes[parentId]) {
+          partialTaskTimes[parentId] += row.accumulated_time;
+        } else {
+          partialTaskTimes[parentId] = row.accumulated_time;
+        }
       });
-      
-      console.log('Loaded', partialRecords.length, 'partial completion records');
       
       res.json({
         sessionId: state.session_id,
@@ -1118,7 +1064,6 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
         taskStartTime: state.task_start_time,
         completedTaskIds: state.completed_task_ids || [],
         partialTaskTimes: partialTaskTimes,
-        partialRecords: partialRecords,  // Send full records for frontend hierarchical matching
         savedAt: state.saved_at
       });
     } else {
@@ -1171,7 +1116,7 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     res.json({ 
       status: 'ok', 
-      message: 'OneSchool Global Study Planner API',
+      message: 'OneSchool Global Study Planner API (TWO-ID SYSTEM)',
       database: 'connected',
       timestamp: new Date().toISOString()
     });
@@ -1188,4 +1133,7 @@ app.get('/health', async (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log('TWO-ID SYSTEM ACTIVE');
 });
+
+// END OF PART 2
