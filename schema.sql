@@ -1,6 +1,9 @@
--- OneSchool Global Study Planner - Database Schema (FIXED v3)
--- CRITICAL FIX: Removed foreign key constraint on partial_completions.task_id
--- This allows partial completions to be saved even when task doesn't exist in tasks table
+-- PlanAssist - FIXED Database Schema with Proper Two-ID System
+-- This schema ensures ALL tasks have parent_task_id set correctly
+
+-- ============================================================================
+-- CORE TABLES
+-- ============================================================================
 
 -- Users table (unchanged)
 CREATE TABLE IF NOT EXISTS users (
@@ -17,7 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Tasks table (unchanged)
+-- Tasks table - FIXED: parent_task_id should never be NULL after creation
 CREATE TABLE IF NOT EXISTS tasks (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -30,6 +33,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority_order INTEGER,
     is_new BOOLEAN DEFAULT FALSE,
     completed BOOLEAN DEFAULT FALSE,
+    -- TWO-ID SYSTEM:
+    parent_task_id INTEGER,           -- Self-referential for base tasks, references original for splits
+    split_task_id INTEGER,            -- NULL for base tasks, 1,2,3... for segments
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -43,30 +49,30 @@ CREATE TABLE IF NOT EXISTS schedules (
     UNIQUE(user_id, day, period)
 );
 
--- FIXED: Partial completions table - NO foreign key on task_id!
+-- Partial completions table - mirrors task IDs exactly
 CREATE TABLE IF NOT EXISTS partial_completions (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    task_id INTEGER NOT NULL,  -- ← CHANGED: No REFERENCES constraint!
+    task_id INTEGER NOT NULL,              -- Specific segment being worked on
+    parent_task_id INTEGER NOT NULL,       -- REQUIRED: matches task's parent_task_id
+    split_task_id INTEGER,                 -- Optional: matches task's split_task_id
     task_title VARCHAR(500) NOT NULL,
     accumulated_time INTEGER NOT NULL DEFAULT 0,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, task_id)
 );
 
-DROP TRIGGER IF EXISTS update_partial_completions_updated_at ON partial_completions;
-
--- Completion history (for AI learning)
+-- Completion history (for AI learning and consolidation)
 CREATE TABLE IF NOT EXISTS completion_history (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     task_id INTEGER,
+    parent_task_id INTEGER NOT NULL,       -- REQUIRED: for grouping segments
     task_title VARCHAR(500),
     task_type VARCHAR(50),
     estimated_time INTEGER,
     actual_time INTEGER,
-    parent_task_title VARCHAR(500),
-    is_segment BOOLEAN DEFAULT FALSE,
+    is_segment BOOLEAN DEFAULT FALSE,      -- TRUE for individual segments, FALSE for consolidated
     completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -95,22 +101,33 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for performance
+-- ============================================================================
+-- INDEXES FOR PERFORMANCE
+-- ============================================================================
+
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority_order ON tasks(priority_order);
 CREATE INDEX IF NOT EXISTS idx_tasks_is_new ON tasks(is_new);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_split_task_id ON tasks(split_task_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_user_id ON schedules(user_id);
 CREATE INDEX IF NOT EXISTS idx_partial_completions_user_id ON partial_completions(user_id);
 CREATE INDEX IF NOT EXISTS idx_partial_completions_task_id ON partial_completions(task_id);
+CREATE INDEX IF NOT EXISTS idx_partial_completions_parent_task_id ON partial_completions(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_completion_history_user_id ON completion_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_completion_history_parent_task_id ON completion_history(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_completion_history_type ON completion_history(task_type);
-CREATE INDEX IF NOT EXISTS idx_completion_history_parent_title ON completion_history(parent_task_title);
+CREATE INDEX IF NOT EXISTS idx_completion_history_is_segment ON completion_history(is_segment);
 CREATE INDEX IF NOT EXISTS idx_session_state_user_id ON session_state(user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at);
+
+-- ============================================================================
+-- TRIGGERS
+-- ============================================================================
 
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -121,7 +138,7 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
--- Trigger to auto-update updated_at
+-- Trigger to auto-update updated_at on users
 DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -131,86 +148,158 @@ DROP TRIGGER IF EXISTS update_partial_completions_updated_at ON partial_completi
 CREATE TRIGGER update_partial_completions_updated_at BEFORE UPDATE ON partial_completions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Comments for documentation
-COMMENT ON TABLE users IS 'OneSchool Global student accounts';
-COMMENT ON TABLE tasks IS 'Student tasks from Canvas calendar';
-COMMENT ON TABLE schedules IS 'Weekly period schedule (Study vs Lesson)';
-COMMENT ON TABLE partial_completions IS 'Tracks accumulated time for partially completed tasks. NO foreign key on task_id to allow orphaned entries.';
-COMMENT ON TABLE completion_history IS 'Task completion data for AI learning, includes segment tracking';
-COMMENT ON TABLE session_state IS 'Saved study session state for resume capability';
-COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests';
-COMMENT ON COLUMN partial_completions.task_id IS 'Task ID (no foreign key constraint - allows saving even if task deleted)';
+-- ============================================================================
+-- MIGRATION SCRIPT - Run this on existing databases
+-- ============================================================================
 
+-- Step 1: Ensure all columns exist (safe to run multiple times)
+DO $$ 
+BEGIN
+    -- Add parent_task_id to tasks if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'tasks' AND column_name = 'parent_task_id') THEN
+        ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER;
+    END IF;
+    
+    -- Add split_task_id to tasks if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'tasks' AND column_name = 'split_task_id') THEN
+        ALTER TABLE tasks ADD COLUMN split_task_id INTEGER;
+    END IF;
+    
+    -- Add parent_task_id to partial_completions if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'partial_completions' AND column_name = 'parent_task_id') THEN
+        ALTER TABLE partial_completions ADD COLUMN parent_task_id INTEGER;
+    END IF;
+    
+    -- Add split_task_id to partial_completions if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'partial_completions' AND column_name = 'split_task_id') THEN
+        ALTER TABLE partial_completions ADD COLUMN split_task_id INTEGER;
+    END IF;
+    
+    -- Add parent_task_id to completion_history if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'completion_history' AND column_name = 'parent_task_id') THEN
+        ALTER TABLE completion_history ADD COLUMN parent_task_id INTEGER;
+    END IF;
+    
+    -- Add is_segment to completion_history if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'completion_history' AND column_name = 'is_segment') THEN
+        ALTER TABLE completion_history ADD COLUMN is_segment BOOLEAN DEFAULT FALSE;
+    END IF;
+END $$;
 
--- Migration Script: Add Two-ID System to Existing Database
--- Run this in your Supabase SQL Editor
+-- Step 2: Fix existing tasks - set parent_task_id = id for base tasks (NULL parent)
+UPDATE tasks
+SET parent_task_id = id
+WHERE parent_task_id IS NULL;
 
--- Step 1: Add new columns to tasks table
-ALTER TABLE tasks 
-ADD COLUMN IF NOT EXISTS parent_task_id INTEGER,
-ADD COLUMN IF NOT EXISTS split_task_id INTEGER;
+-- Step 3: Fix existing partial_completions - set parent_task_id from tasks table
+UPDATE partial_completions pc
+SET parent_task_id = t.parent_task_id,
+    split_task_id = t.split_task_id
+FROM tasks t
+WHERE pc.task_id = t.id
+  AND pc.user_id = t.user_id
+  AND pc.parent_task_id IS NULL;
 
--- Step 2: Add new columns to partial_completions table
-ALTER TABLE partial_completions
-ADD COLUMN IF NOT EXISTS parent_task_id INTEGER,
-ADD COLUMN IF NOT EXISTS split_task_id INTEGER;
-
--- Step 3: Add new column to completion_history table
-ALTER TABLE completion_history
-ADD COLUMN IF NOT EXISTS parent_task_id INTEGER;
-
--- Step 4: Create indexes for new columns
-CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_split_task_id ON tasks(split_task_id);
-CREATE INDEX IF NOT EXISTS idx_partial_completions_parent_task_id ON partial_completions(parent_task_id);
-CREATE INDEX IF NOT EXISTS idx_completion_history_parent_task_id ON completion_history(parent_task_id);
-
--- Step 5: Initialize parent_task_id for existing tasks (all NULL means they're base tasks)
--- This is already done by default since we added columns with no default value
-
--- Step 6: Update existing partial_completions to have parent_task_id
--- For now, we'll set parent_task_id equal to task_id for existing entries (they're all base tasks)
+-- Step 4: For any orphaned partial_completions (task doesn't exist), set parent to task_id
 UPDATE partial_completions
 SET parent_task_id = task_id
 WHERE parent_task_id IS NULL;
 
--- Step 7: Make parent_task_id NOT NULL in partial_completions now that it's populated
+-- Step 5: Make parent_task_id NOT NULL in partial_completions (now that it's populated)
 ALTER TABLE partial_completions
 ALTER COLUMN parent_task_id SET NOT NULL;
 
--- Step 8: Update existing completion_history entries
--- Set parent_task_id equal to task_id for all existing entries (they're all base tasks)
+-- Step 6: Fix existing completion_history entries
+UPDATE completion_history ch
+SET parent_task_id = t.parent_task_id
+FROM tasks t
+WHERE ch.task_id = t.id
+  AND ch.user_id = t.user_id
+  AND ch.parent_task_id IS NULL;
+
+-- For orphaned completion_history, set parent to task_id
 UPDATE completion_history
 SET parent_task_id = task_id
 WHERE parent_task_id IS NULL;
 
--- Verify the migration
-SELECT 'Tasks table structure:' as info;
-SELECT column_name, data_type, is_nullable 
-FROM information_schema.columns 
-WHERE table_name = 'tasks' 
-ORDER BY ordinal_position;
+-- Make parent_task_id NOT NULL in completion_history
+ALTER TABLE completion_history
+ALTER COLUMN parent_task_id SET NOT NULL;
 
-SELECT 'Partial completions table structure:' as info;
-SELECT column_name, data_type, is_nullable 
-FROM information_schema.columns 
-WHERE table_name = 'partial_completions' 
-ORDER BY ordinal_position;
+-- ============================================================================
+-- VERIFICATION QUERIES
+-- ============================================================================
 
-SELECT 'Completion history table structure:' as info;
-SELECT column_name, data_type, is_nullable 
-FROM information_schema.columns 
-WHERE table_name = 'completion_history' 
-ORDER BY ordinal_position;
+-- Verify tasks table structure
+SELECT 
+    'Tasks with NULL parent_task_id (should be 0):' as check_type,
+    COUNT(*) as count
+FROM tasks
+WHERE parent_task_id IS NULL;
 
--- Test query: Show any tasks with parent relationships
+-- Verify base vs split tasks
+SELECT 
+    'Task type distribution:' as check_type,
+    CASE 
+        WHEN parent_task_id = id THEN 'Base Task'
+        WHEN split_task_id IS NOT NULL THEN 'Split Segment'
+        ELSE 'Unknown'
+    END as task_type,
+    COUNT(*) as count
+FROM tasks
+GROUP BY task_type;
+
+-- Verify partial_completions
+SELECT 
+    'Partial completions with NULL parent_task_id (should be 0):' as check_type,
+    COUNT(*) as count
+FROM partial_completions
+WHERE parent_task_id IS NULL;
+
+-- Verify completion_history
+SELECT 
+    'Completion history with NULL parent_task_id (should be 0):' as check_type,
+    COUNT(*) as count
+FROM completion_history
+WHERE parent_task_id IS NULL;
+
+-- Show example of task relationships
 SELECT 
     id,
     parent_task_id,
     split_task_id,
-    LEFT(title, 50) as title_preview,
-    completed
+    LEFT(title, 60) as title_preview,
+    completed,
+    CASE 
+        WHEN parent_task_id = id THEN 'Base'
+        WHEN split_task_id IS NOT NULL THEN 'Segment ' || split_task_id
+        ELSE 'Unknown'
+    END as task_type
 FROM tasks
-WHERE parent_task_id IS NOT NULL
 ORDER BY parent_task_id, split_task_id
-LIMIT 10;
+LIMIT 20;
+
+-- ============================================================================
+-- COMMENTS FOR DOCUMENTATION
+-- ============================================================================
+
+COMMENT ON TABLE tasks IS 'Student tasks from Canvas calendar. All tasks have parent_task_id set (self-referential for base tasks).';
+COMMENT ON COLUMN tasks.parent_task_id IS 'REQUIRED: Self-referential (=id) for base tasks, references original task for segments';
+COMMENT ON COLUMN tasks.split_task_id IS 'NULL for base tasks, 1,2,3... for segments of a split task';
+
+COMMENT ON TABLE partial_completions IS 'Tracks accumulated time for partially completed tasks. IDs mirror the tasks table exactly.';
+COMMENT ON COLUMN partial_completions.parent_task_id IS 'REQUIRED: Always matches the task.parent_task_id for grouping';
+COMMENT ON COLUMN partial_completions.split_task_id IS 'Optional: Matches the task.split_task_id';
+
+COMMENT ON TABLE completion_history IS 'Task completion data for AI learning. Segments are consolidated when all parts complete.';
+COMMENT ON COLUMN completion_history.parent_task_id IS 'REQUIRED: Used to group and consolidate segment completions';
+COMMENT ON COLUMN completion_history.is_segment IS 'TRUE for individual segment records, FALSE for consolidated parent record';
+
+COMMENT ON TABLE session_state IS 'Saved study session state for resume capability';
+COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests';
