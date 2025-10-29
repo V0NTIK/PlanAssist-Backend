@@ -399,8 +399,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     );
     let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
 
-    // Counter for generating unique split_task_ids
-    let splitTaskCounter = 0;
+    // Counter for generating unique split_task_ids PER PARENT (TWO-ID FIX)
+    const splitCountersByParent = {};
 
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
@@ -424,13 +424,18 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         priorityOrder = nextPriority++;
       }
 
-      // Determine parent_task_id and split_task_id (TWO-ID SYSTEM)
+      // Determine parent_task_id and split_task_id (TWO-ID SYSTEM - FIXED)
       let parentTaskId = task.parent_task_id || null;
       let splitTaskId = task.split_task_id || null;
       
-      // If this is a new split task (has parent_task_id but no split_task_id yet)
+      // If this is a split task with parent but no split ID yet, assign one
       if (parentTaskId && !splitTaskId) {
-        splitTaskId = ++splitTaskCounter;
+        // Initialize counter for this parent if not exists
+        if (!splitCountersByParent[parentTaskId]) {
+          splitCountersByParent[parentTaskId] = 0;
+        }
+        // Assign next split ID for this parent
+        splitTaskId = ++splitCountersByParent[parentTaskId];
       }
       
       const result = await pool.query(
@@ -452,7 +457,19 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           task.completed || false
         ]
       );
-      insertedTasks.push(result.rows[0]);
+      
+      const insertedTask = result.rows[0];
+      
+      // CRITICAL FIX: If this is a new base task (no parent set), set parent_task_id = id
+      if (!parentTaskId) {
+        await pool.query(
+          'UPDATE tasks SET parent_task_id = id WHERE id = $1',
+          [insertedTask.id]
+        );
+        insertedTask.parent_task_id = insertedTask.id;
+      }
+      
+      insertedTasks.push(insertedTask);
     }
 
     res.json({ success: true, tasks: insertedTasks });
@@ -804,7 +821,14 @@ app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
             ]
           );
 
-          console.log('✓ Consolidated completion record created!');
+          // CRITICAL FIX: Delete individual segment records now that we have consolidated
+          await pool.query(
+            `DELETE FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+            [req.user.id, parentTaskId]
+          );
+
+          console.log('✓ Consolidated completion record created and segment records removed!');
         } else {
           console.log('ℹ Consolidated record already exists');
         }
@@ -918,7 +942,14 @@ app.post('/api/sessions/complete', authenticateToken, async (req, res) => {
             [req.user.id, parentTaskId, parentTaskId, parentTitle, segments[0].task_type, totalEst, totalAct]
           );
 
-          console.log('  🎉 Consolidated', segments.length, 'segments into one record');
+          // CRITICAL FIX: Delete individual segment records now that we have consolidated
+          await pool.query(
+            `DELETE FROM completion_history 
+             WHERE user_id = $1 AND parent_task_id = $2 AND is_segment = true`,
+            [req.user.id, parentTaskId]
+          );
+
+          console.log('  🎉 Consolidated', segments.length, 'segments into one record and removed segment entries');
           processedParents.add(parentTaskId);
         }
       }
