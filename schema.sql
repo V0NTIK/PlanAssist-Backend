@@ -253,7 +253,12 @@ SELECT
     END as task_type,
     COUNT(*) as count
 FROM tasks
-GROUP BY task_type;
+GROUP BY 
+    CASE 
+        WHEN parent_task_id = id THEN 'Base Task'
+        WHEN split_task_id IS NOT NULL THEN 'Split Segment'
+        ELSE 'Unknown'
+    END;
 
 -- Verify partial_completions
 SELECT 
