@@ -138,15 +138,24 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+-- Function to update last_updated timestamp (for partial_completions)
+CREATE OR REPLACE FUNCTION update_last_updated_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.last_updated = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
 -- Trigger to auto-update updated_at on users
 DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Trigger for partial_completions last_updated
+-- Trigger for partial_completions last_updated (FIXED - uses different function)
 DROP TRIGGER IF EXISTS update_partial_completions_updated_at ON partial_completions;
 CREATE TRIGGER update_partial_completions_updated_at BEFORE UPDATE ON partial_completions
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    FOR EACH ROW EXECUTE FUNCTION update_last_updated_column();
 
 -- ============================================================================
 -- MIGRATION SCRIPT - Run this on existing databases
