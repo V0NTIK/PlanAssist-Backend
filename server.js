@@ -259,23 +259,35 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
     
-    if (!canvasUrl || !canvasUrl.includes('instructure.com/feeds/calendars')) {
+    // Accept both instructure.com and oneschoolglobal.com Canvas URLs
+    const isValidCanvasUrl = canvasUrl && 
+      (canvasUrl.includes('instructure.com/feeds/calendars') || 
+       canvasUrl.includes('oneschoolglobal.com/feeds/calendars'));
+    
+    if (!isValidCanvasUrl) {
       return res.status(400).json({ 
-        error: 'Invalid Canvas URL. Please use the format: https://canvas.instructure.com/feeds/calendars/user_...' 
+        error: 'Invalid Canvas URL. Please use the format: https://canvas.oneschoolglobal.com/feeds/calendars/user_...' 
       });
     }
 
     let icsData;
     try {
+      console.log('Fetching calendar from:', canvasUrl);
       const response = await axios.get(canvasUrl, { 
         timeout: 15000,
         headers: {
           'User-Agent': 'PlanAssist/1.0'
         }
       });
+      console.log('Calendar fetch successful, response status:', response.status);
       icsData = response.data;
     } catch (error) {
       console.error('Error fetching calendar:', error.message);
+      console.error('Error details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        url: canvasUrl
+      });
       return res.status(500).json({ 
         error: 'Failed to fetch calendar data. Please verify your Canvas URL is correct and accessible.',
         details: error.message 
