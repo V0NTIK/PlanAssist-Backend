@@ -1020,14 +1020,13 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
         );
 
         if (existingPartial.rows.length > 0) {
-          // Update existing partial completion
+          // Update existing partial completion (trigger will update last_updated)
           const result = await pool.query(
             `UPDATE partial_completions 
              SET accumulated_time = accumulated_time + $1,
                  task_title = $2,
                  parent_task_id = $3,
-                 split_task_id = $4,
-                 last_updated = CURRENT_TIMESTAMP
+                 split_task_id = $4
              WHERE user_id = $5 AND task_id = $6
              RETURNING accumulated_time`,
             [partialTaskTime, taskTitle, parentTaskId, splitTaskId, req.user.id, partialTaskId]
@@ -1035,11 +1034,11 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
           
           console.log('✓ Updated partial completion. Accumulated:', result.rows[0].accumulated_time, 'min');
         } else {
-          // Insert new partial completion
+          // Insert new partial completion (last_updated defaults to CURRENT_TIMESTAMP)
           const result = await pool.query(
             `INSERT INTO partial_completions 
-             (user_id, task_id, parent_task_id, split_task_id, task_title, accumulated_time, last_updated)
-             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+             (user_id, task_id, parent_task_id, split_task_id, task_title, accumulated_time)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING accumulated_time`,
             [req.user.id, partialTaskId, parentTaskId, splitTaskId, taskTitle, partialTaskTime]
           );
