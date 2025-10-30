@@ -473,7 +473,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               description: event.description || '',
               url: url || '', // Use empty string if no URL
               deadline: eventDate,
-              estimatedTime
+              estimated_time: estimatedTime // FIXED: Use database column name
             });
             
             processedCount++;
@@ -524,14 +524,13 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
         class,
         description,
         url,
-        deadline as due_date,
+        deadline,
         estimated_time,
-        user_estimated_time as user_estimate,
+        user_estimated_time,
         accumulated_time,
         completed,
         priority_order,
-        is_new,
-        'general' as task_type
+        is_new
        FROM tasks 
        WHERE user_id = $1 AND completed = false
        ORDER BY priority_order ASC NULLS LAST, deadline ASC`,
@@ -621,9 +620,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
            class,
            description,
            url,
-           deadline as due_date,
+           deadline,
            estimated_time,
-           user_estimated_time as user_estimate,
+           user_estimated_time,
            accumulated_time,
            completed,
            priority_order,
@@ -698,9 +697,9 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
            class,
            description,
            url,
-           deadline as due_date,
+           deadline,
            estimated_time,
-           user_estimated_time as user_estimate,
+           user_estimated_time,
            accumulated_time,
            completed,
            priority_order,
@@ -742,7 +741,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
 // Update task estimate (user override)
 app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
   try {
-    const { estimatedTime } = req.body;
+    const { userEstimate } = req.body;
     const result = await pool.query(
       `UPDATE tasks 
        SET user_estimated_time = $1 
@@ -755,15 +754,14 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
          class,
          description,
          url,
-         deadline as due_date,
+         deadline,
          estimated_time,
-         user_estimated_time as user_estimate,
+         user_estimated_time,
          accumulated_time,
          completed,
          priority_order,
-         is_new,
-         'general' as task_type`,
-      [estimatedTime, req.params.id, req.user.id]
+         is_new`,
+      [userEstimate, req.params.id, req.user.id]
     );
     
     if (result.rows.length === 0) {
@@ -926,9 +924,9 @@ app.post('/api/tasks/:id/partial', authenticateToken, async (req, res) => {
          class,
          description,
          url,
-         deadline as due_date,
+         deadline,
          estimated_time,
-         user_estimated_time as user_estimate,
+         user_estimated_time,
          accumulated_time,
          completed,
          priority_order,
