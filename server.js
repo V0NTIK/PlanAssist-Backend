@@ -89,11 +89,21 @@ const convertToAssignmentUrl = (calendarUrl) => {
   // Input format: https://canvas.oneschoolglobal.com/calendar?include_contexts=course_[NUM1]&month=10&year=2025#assignment_[NUM2]
   // Output format: https://canvas.oneschoolglobal.com/courses/[NUM1]/assignments/[NUM2]
   
-  const courseMatch = calendarUrl.match(/course_(\d+)/);
-  const assignmentMatch = calendarUrl.match(/assignment_(\d+)/);
+  // Handle undefined, null, or non-string values
+  if (!calendarUrl || typeof calendarUrl !== 'string') {
+    console.log('⚠️  Invalid calendar URL:', calendarUrl);
+    return '';
+  }
   
-  if (courseMatch && assignmentMatch) {
-    return `https://canvas.oneschoolglobal.com/courses/${courseMatch[1]}/assignments/${assignmentMatch[1]}`;
+  try {
+    const courseMatch = calendarUrl.match(/course_(\d+)/);
+    const assignmentMatch = calendarUrl.match(/assignment_(\d+)/);
+    
+    if (courseMatch && assignmentMatch) {
+      return `https://canvas.oneschoolglobal.com/courses/${courseMatch[1]}/assignments/${assignmentMatch[1]}`;
+    }
+  } catch (error) {
+    console.error('Error converting URL:', error.message);
   }
   
   return calendarUrl; // Return original if parsing fails
@@ -366,11 +376,16 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
     
+    console.log('\n=== CALENDAR FETCH REQUEST ===');
+    console.log('User ID:', req.user.id);
+    console.log('Canvas URL:', canvasUrl);
+    
     const isValidCanvasUrl = canvasUrl && 
       (canvasUrl.includes('instructure.com/feeds/calendars') || 
        canvasUrl.includes('oneschoolglobal.com/feeds/calendars'));
     
     if (!isValidCanvasUrl) {
+      console.log('❌ Invalid Canvas URL format');
       return res.status(400).json({ 
         error: 'Invalid Canvas URL. Please use the format: https://canvas.oneschoolglobal.com/feeds/calendars/user_...' 
       });
@@ -385,16 +400,25 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
           'User-Agent': 'PlanAssist/2.0'
         }
       });
+      console.log('✓ Calendar fetch successful, response status:', response.status);
       icsData = response.data;
     } catch (error) {
-      console.error('Error fetching calendar:', error.message);
+      console.error('❌ Error fetching calendar:', error.message);
+      console.error('Error details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        url: canvasUrl
+      });
       return res.status(500).json({ 
         error: 'Failed to fetch calendar data. Please verify your Canvas URL is correct.',
         details: error.message 
       });
     }
 
+    console.log('Parsing ICS data...');
     const events = await ical.async.parseICS(icsData);
+    console.log(`✓ Parsed ${Object.keys(events).length} total events`);
+    
     const tasks = [];
     
     // Calculate one month window from today
@@ -404,6 +428,10 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     oneMonthFromNow.setMonth(oneMonthFromNow.getMonth() + 1);
 
     console.log('\n=== PROCESSING CANVAS EVENTS ===');
+    console.log(`Date range: ${today.toISOString()} to ${oneMonthFromNow.toISOString()}`);
+    
+    let processedCount = 0;
+    let skippedCount = 0;
     
     for (const event of Object.values(events)) {
       if (event.type === 'VEVENT' && event.summary) {
@@ -411,32 +439,61 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         
         // Only include tasks within the next month
         if (eventDate >= today && eventDate <= oneMonthFromNow) {
-          const title = extractTitle(event.summary);
-          const taskClass = extractClass(event.summary);
-          const url = convertToAssignmentUrl(event.url || '');
-          
-          console.log(`\nProcessing: ${event.summary}`);
-          console.log(`  Title: ${title}`);
-          console.log(`  Class: ${taskClass}`);
-          console.log(`  URL: ${url}`);
-          
-          // Calculate AI estimate
-          const estimatedTime = await estimateTaskTime({ title, class: taskClass, url }, req.user.id);
-          
-          tasks.push({
-            title,
-            segment: null, // Base tasks start with no segment
-            class: taskClass,
-            description: event.description || '',
-            url,
-            deadline: eventDate,
-            estimatedTime
-          });
+          try {
+            const title = extractTitle(event.summary);
+            const taskClass = extractClass(event.summary);
+            
+            // Handle URL - ICS might have it in different formats
+            let eventUrl = '';
+            if (event.url) {
+              if (typeof event.url === 'string') {
+                eventUrl = event.url;
+              } else if (event.url.val) {
+                eventUrl = event.url.val; // Some ICS parsers wrap URL in an object
+              }
+            }
+            
+            const url = convertToAssignmentUrl(eventUrl);
+            
+            console.log(`\n[${processedCount + 1}] Processing: ${event.summary}`);
+            console.log(`    Title: ${title}`);
+            console.log(`    Class: ${taskClass}`);
+            console.log(`    Raw URL: ${eventUrl || 'NONE'}`);
+            console.log(`    Converted URL: ${url || 'NONE'}`);
+            
+            // Skip tasks without valid URLs (except Homeroom which we allow)
+            if (!url && !taskClass.includes('Homeroom')) {
+              console.log('    ⚠️  Skipping - no valid URL');
+              skippedCount++;
+              continue;
+            }
+            
+            // Calculate AI estimate
+            const estimatedTime = await estimateTaskTime({ title, class: taskClass, url }, req.user.id);
+            
+            tasks.push({
+              title,
+              segment: null, // Base tasks start with no segment
+              class: taskClass,
+              description: event.description || '',
+              url: url || '', // Use empty string if no URL
+              deadline: eventDate,
+              estimatedTime
+            });
+            
+            processedCount++;
+          } catch (eventError) {
+            console.error(`    ❌ Error processing event:`, eventError.message);
+            skippedCount++;
+          }
         }
       }
     }
 
-    console.log(`\n=== PROCESSED ${tasks.length} TASKS ===\n`);
+    console.log(`\n=== PROCESSING COMPLETE ===`);
+    console.log(`✓ Successfully processed: ${processedCount} tasks`);
+    console.log(`⚠️  Skipped: ${skippedCount} events`);
+    console.log(`Total tasks to import: ${tasks.length}\n`);
 
     // Update user's Canvas URL
     await pool.query(
@@ -446,8 +503,12 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 
     res.json({ tasks });
   } catch (error) {
-    console.error('Fetch calendar error:', error);
-    res.status(500).json({ error: 'Failed to fetch calendar' });
+    console.error('❌ Fetch calendar error:', error);
+    console.error('Stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Failed to fetch calendar',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 
