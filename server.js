@@ -1067,24 +1067,6 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
   }
 });
 
-// Update task partial time (accumulated_time)
-app.patch('/api/tasks/:taskId/partial', authenticateToken, async (req, res) => {
-  try {
-    const { taskId } = req.params;
-    const { accumulatedTime } = req.body;
-    
-    await pool.query(
-      'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
-      [accumulatedTime, taskId, req.user.id]
-    );
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Update partial time error:', error);
-    res.status(500).json({ error: 'Failed to update partial time' });
-  }
-});
-
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
