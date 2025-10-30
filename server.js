@@ -869,211 +869,22 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// SESSION ROUTES
+// SESSION AND COMPLETION ROUTES
 // ============================================================================
 
-// Complete task during session (with time tracking)
-app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
+// Save session state
+app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
-    const { taskId, actualTime } = req.body;
-
-    console.log(`\n=== COMPLETING TASK ${taskId} ===`);
-
-    // Get task details
-    const taskResult = await pool.query(
-      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
-      [taskId, req.user.id]
-    );
-
-    if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-
-    const task = taskResult.rows[0];
-    const totalTime = actualTime + task.accumulated_time;
-
-    console.log(`Task: ${task.title}`);
-    console.log(`Segment: ${task.segment || 'None'}`);
-    console.log(`Time - Session: ${actualTime} | Accumulated: ${task.accumulated_time} | Total: ${totalTime}`);
-
-    // Skip Homeroom tasks
-    if (!task.class.includes('Homeroom')) {
-      // Check if consolidation needed
-      const existingResult = await pool.query(
-        'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
-        [req.user.id, task.url]
-      );
-
-      if (existingResult.rows.length > 0) {
-        // Consolidate
-        const existing = existingResult.rows[0];
-        const newActualTime = existing.actual_time + totalTime;
-        const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
-
-        await pool.query(
-          'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
-          [newActualTime, newEstimatedTime, existing.id]
-        );
-        
-        console.log(`✓ Consolidated with existing entry (ID: ${existing.id})`);
-      } else {
-        // Add new entry
-        await pool.query(
-          `INSERT INTO tasks_completed 
-           (user_id, title, class, description, url, deadline, estimated_time, actual_time)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            req.user.id,
-            task.title,
-            task.class,
-            task.description,
-            task.url,
-            task.deadline,
-            task.user_estimated_time || task.estimated_time,
-            totalTime
-          ]
-        );
-        
-        console.log('✓ Created new tasks_completed entry');
-      }
-    }
-
-    // Delete task from tasks table
-    await pool.query(
-      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
-      [taskId, req.user.id]
-    );
-
-    console.log('=== TASK COMPLETION DONE ===\n');
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Session complete task error:', error);
-    res.status(500).json({ error: 'Failed to complete task' });
-  }
-});
-
-// Batch complete multiple tasks (end of session)
-app.post('/api/sessions/batch-complete', authenticateToken, async (req, res) => {
-  try {
-    const { completedTasks } = req.body;
-
-    if (!Array.isArray(completedTasks)) {
-      return res.status(400).json({ error: 'completedTasks must be an array' });
-    }
-
-    console.log('\n=== BATCH COMPLETING TASKS ===');
-    console.log(`Total tasks: ${completedTasks.length}`);
-
-    for (const { taskId, timeSpent } of completedTasks) {
-      // Use the individual completion endpoint logic
-      await pool.query('BEGIN');
-      
-      try {
-        const taskResult = await pool.query(
-          'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
-          [taskId, req.user.id]
-        );
-
-        if (taskResult.rows.length > 0) {
-          const task = taskResult.rows[0];
-          const totalTime = timeSpent + task.accumulated_time;
-
-          if (!task.class.includes('Homeroom')) {
-            const existingResult = await pool.query(
-              'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
-              [req.user.id, task.url]
-            );
-
-            if (existingResult.rows.length > 0) {
-              const existing = existingResult.rows[0];
-              const newActualTime = existing.actual_time + totalTime;
-              const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
-
-              await pool.query(
-                'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
-                [newActualTime, newEstimatedTime, existing.id]
-              );
-            } else {
-              await pool.query(
-                `INSERT INTO tasks_completed 
-                 (user_id, title, class, description, url, deadline, estimated_time, actual_time)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [
-                  req.user.id,
-                  task.title,
-                  task.class,
-                  task.description,
-                  task.url,
-                  task.deadline,
-                  task.user_estimated_time || task.estimated_time,
-                  totalTime
-                ]
-              );
-            }
-          }
-
-          await pool.query(
-            'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
-            [taskId, req.user.id]
-          );
-        }
-
-        await pool.query('COMMIT');
-      } catch (error) {
-        await pool.query('ROLLBACK');
-        console.error(`Error completing task ${taskId}:`, error);
-      }
-    }
-
-    console.log('=== BATCH COMPLETE DONE ===\n');
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Batch complete error:', error);
-    res.status(500).json({ error: 'Failed to batch complete tasks' });
-  }
-});
-
-// Save session state (for resume)
-app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
-  try {
-    const { day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
-
-    console.log('=== SAVE STATE REQUEST ===');
-    console.log('Partial Task ID:', partialTaskId);
-    console.log('Partial Task Time:', partialTaskTime);
-
-    // Delete existing session state
+    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds } = req.body;
+    
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
-
-    // Update accumulated time for partial task
-    if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
-      const taskResult = await pool.query(
-        'SELECT accumulated_time FROM tasks WHERE id = $1 AND user_id = $2',
-        [partialTaskId, req.user.id]
-      );
-
-      if (taskResult.rows.length > 0) {
-        const currentAccumulated = taskResult.rows[0].accumulated_time || 0;
-        const newAccumulated = currentAccumulated + partialTaskTime;
-
-        await pool.query(
-          'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
-          [newAccumulated, partialTaskId, req.user.id]
-        );
-
-        console.log(`✓ Updated accumulated time: ${currentAccumulated} + ${partialTaskTime} = ${newAccumulated}`);
-      }
-    }
-
-    // Insert new session state
+    
     await pool.query(
-      `INSERT INTO session_state 
-       (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds || []]
+      `INSERT INTO session_state (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids, saved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
+      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds]
     );
-
-    console.log('✓ Session state saved successfully\n');
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Save session state error:', error);
@@ -1085,53 +896,99 @@ app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
 app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM session_state WHERE user_id = $1',
+      `SELECT * FROM session_state WHERE user_id = $1`,
       [req.user.id]
     );
-
+    
     if (result.rows.length > 0) {
       const state = result.rows[0];
-
-      // Get accumulated times for all tasks
-      const tasksResult = await pool.query(
-        'SELECT id, accumulated_time FROM tasks WHERE user_id = $1',
-        [req.user.id]
-      );
-
-      const partialTaskTimes = {};
-      tasksResult.rows.forEach(row => {
-        if (row.accumulated_time > 0) {
-          partialTaskTimes[row.id] = row.accumulated_time;
-        }
-      });
-      
       res.json({
+        sessionId: `${state.day}-${state.period}`,
         day: state.day,
         period: state.period,
         remainingTime: state.remaining_time,
         currentTaskIndex: state.current_task_index,
         taskStartTime: state.task_start_time,
         completedTaskIds: state.completed_task_ids || [],
-        partialTaskTimes: partialTaskTimes,
         savedAt: state.saved_at
       });
     } else {
-      res.json({ savedState: null });
+      res.json({});
     }
   } catch (error) {
     console.error('Get session state error:', error);
-    res.status(500).json({ error: 'Failed to get session state' });
+    res.json({});
   }
 });
 
-// Clear saved session state
+// Delete saved session state
 app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
     res.json({ success: true });
   } catch (error) {
-    console.error('Clear session state error:', error);
-    res.status(500).json({ error: 'Failed to clear session state' });
+    console.error('Delete session state error:', error);
+    res.status(500).json({ error: 'Failed to delete session state' });
+  }
+});
+
+// Complete a task
+app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { timeSpent } = req.body;
+    
+    const taskResult = await pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    const task = taskResult.rows[0];
+    
+    await pool.query(
+      `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline, estimated_time, actual_time, completed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)`,
+      [
+        task.id,
+        req.user.id,
+        task.title,
+        task.class,
+        task.description,
+        task.url,
+        task.deadline,
+        task.user_estimated_time || task.estimated_time,
+        timeSpent
+      ]
+    );
+    
+    await pool.query('DELETE FROM tasks WHERE id = $1 AND user_id = $2', [taskId, req.user.id]);
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Update task partial time (accumulated_time)
+app.patch('/api/tasks/:taskId/partial', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { accumulatedTime } = req.body;
+    
+    await pool.query(
+      'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      [accumulatedTime, taskId, req.user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update partial time error:', error);
+    res.status(500).json({ error: 'Failed to update partial time' });
   }
 });
 
