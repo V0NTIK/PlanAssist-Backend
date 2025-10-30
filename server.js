@@ -1136,6 +1136,27 @@ app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// LEARNING/ANALYTICS ROUTE
+// ============================================================================
+
+// Get completion history for learning analytics
+app.get('/api/learning', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT title as task_title, class as task_type, estimated_time, actual_time, completed_at
+       FROM tasks_completed
+       WHERE user_id = $1
+       ORDER BY completed_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows || []);
+  } catch (error) {
+    console.error('Get learning data error:', error);
+    res.json([]);
+  }
+});
+
+// ============================================================================
 // FEEDBACK ROUTE
 // ============================================================================
 
