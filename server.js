@@ -800,12 +800,12 @@ app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
   }
 });
 
-// Manual task completion (checkbox)
+// Manual task completion (checkbox) - Just deletes the task
 app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
     const taskId = req.params.id;
 
-    // Get task details
+    // Verify task exists
     const taskResult = await pool.query(
       'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
@@ -815,47 +815,7 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    const task = taskResult.rows[0];
-
-    // Skip Homeroom tasks
-    if (!task.class.includes('Homeroom')) {
-      // Check if consolidation needed
-      const existingResult = await pool.query(
-        'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
-        [req.user.id, task.url]
-      );
-
-      if (existingResult.rows.length > 0) {
-        // Consolidate
-        const existing = existingResult.rows[0];
-        const newActualTime = existing.actual_time + task.accumulated_time;
-        const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
-
-        await pool.query(
-          'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
-          [newActualTime, newEstimatedTime, existing.id]
-        );
-      } else {
-        // Add new entry
-        await pool.query(
-          `INSERT INTO tasks_completed 
-           (user_id, title, class, description, url, deadline, estimated_time, actual_time)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            req.user.id,
-            task.title,
-            task.class,
-            task.description,
-            task.url,
-            task.deadline,
-            task.user_estimated_time || task.estimated_time,
-            task.accumulated_time
-          ]
-        );
-      }
-    }
-
-    // Delete task from tasks table
+    // Simply delete the task - no record keeping for manual completions
     await pool.query(
       'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
