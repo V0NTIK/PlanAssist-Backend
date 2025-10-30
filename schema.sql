@@ -245,3 +245,18 @@ SELECT
     END as status
 FROM session_state ss
 LEFT JOIN tasks t ON ss.current_task_index = t.id AND ss.user_id = t.user_id;
+
+
+
+-- Run this SQL to add the notes table
+CREATE TABLE IF NOT EXISTS notes (
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (task_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_task_id ON notes(task_id);
+CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
