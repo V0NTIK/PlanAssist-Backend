@@ -1203,6 +1203,71 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// ============================================================================
+// NOTES AND WORKSPACE ROUTES
+// ============================================================================
+
+// Get notes for a task
+app.get('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    const result = await pool.query(
+      'SELECT notes FROM notes WHERE task_id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    
+    if (result.rows.length > 0) {
+      res.json({ notes: result.rows[0].notes });
+    } else {
+      res.json({ notes: '' });
+    }
+  } catch (error) {
+    console.error('Get notes error:', error);
+    res.status(500).json({ error: 'Failed to get notes' });
+  }
+});
+
+// Save notes for a task
+app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { notes } = req.body;
+    
+    // Upsert notes
+    await pool.query(
+      `INSERT INTO notes (task_id, user_id, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (task_id, user_id)
+       DO UPDATE SET notes = $3, updated_at = CURRENT_TIMESTAMP`,
+      [taskId, req.user.id, notes]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save notes error:', error);
+    res.status(500).json({ error: 'Failed to save notes' });
+  }
+});
+
+// Update task partial time (accumulated_time)
+app.patch('/api/tasks/:taskId/partial', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { accumulatedTime } = req.body;
+    
+    await pool.query(
+      'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      [accumulatedTime, taskId, req.user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update partial time error:', error);
+    res.status(500).json({ error: 'Failed to update partial time' });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
