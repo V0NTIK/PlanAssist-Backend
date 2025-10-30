@@ -1,6 +1,5 @@
 // PlanAssist - COMPLETELY REDESIGNED Backend API
 // server.js - New title/segment system with advanced AI estimation
-// FIXED: Added column aliasing for frontend compatibility
 
 const express = require('express');
 const cors = require('cors');
@@ -101,124 +100,114 @@ const convertToAssignmentUrl = (calendarUrl) => {
     const assignmentMatch = calendarUrl.match(/assignment_(\d+)/);
     
     if (courseMatch && assignmentMatch) {
-      const courseId = courseMatch[1];
-      const assignmentId = assignmentMatch[1];
-      return `https://canvas.oneschoolglobal.com/courses/${courseId}/assignments/${assignmentId}`;
+      return `https://canvas.oneschoolglobal.com/courses/${courseMatch[1]}/assignments/${assignmentMatch[1]}`;
     }
-    
-    console.log('⚠️  Could not extract course/assignment IDs from:', calendarUrl);
-    return '';
   } catch (error) {
-    console.error('Error converting URL:', error);
-    return '';
+    console.error('Error converting URL:', error.message);
   }
+  
+  return calendarUrl; // Return original if parsing fails
 };
 
-// Detect task type from title
-const detectTaskType = (title) => {
-  const lower = title.toLowerCase();
-  if (lower.includes('homework') || lower.includes('hw')) return 'homework';
-  if (lower.includes('lab')) return 'lab';
-  if (lower.includes('read')) return 'reading';
-  if (lower.includes('essay') || lower.includes('writing')) return 'essay';
-  if (lower.includes('project')) return 'project';
-  if (lower.includes('quiz') || lower.includes('test') || lower.includes('exam')) return 'test-prep';
-  return 'general';
-};
+// ============================================================================
+// NEW AI TASK TIME ESTIMATION ALGORITHM
+// ============================================================================
 
-// Advanced AI time estimation
 const estimateTaskTime = async (task, userId) => {
   const { title, class: taskClass, url } = task;
-  const lower = title.toLowerCase();
   
-  console.log(`--- ESTIMATING TIME FOR: "${title}" ---`);
+  console.log(`\n=== ESTIMATING TIME FOR: "${title}" ===`);
+  console.log(`Class: ${taskClass}`);
+  console.log(`URL: ${url}`);
   
-  // STEP 1: Not a Homeroom task (always 0 minutes)
-  if (lower.includes('homeroom')) {
-    console.log('✗ STEP 1: Not a Homeroom task (need 3+)');
+  // STEP 1: Check for Homeroom tasks
+  if (taskClass.includes('Homeroom')) {
+    console.log('✓ STEP 1: Homeroom task detected → 0 minutes');
     return 0;
   }
-  console.log('✓ STEP 1: Not a Homeroom task');
+  console.log('✗ STEP 1: Not a Homeroom task');
   
-  // STEP 2: Only 0 global completions (need 3+)
+  // STEP 2: Check for 3+ completions of this exact URL (global)
   try {
     const globalResult = await pool.query(
-      `SELECT COUNT(*) as count, AVG(actual_time) as avg_time
-       FROM tasks_completed
+      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
+       FROM tasks_completed 
        WHERE url = $1`,
       [url]
     );
     
-    const globalCount = parseInt(globalResult.rows[0]?.count || 0);
-    const globalAvg = globalResult.rows[0]?.avg_time;
-    
-    console.log(`✗ STEP 2: Only ${globalCount} global completions (need 3+)`);
-    
-    if (globalCount >= 3 && globalAvg) {
-      console.log(`✓ STEP 2: Using global average: ${Math.round(globalAvg)} minutes`);
-      return Math.round(globalAvg);
+    if (globalResult.rows[0] && globalResult.rows[0].count >= 3) {
+      const estimate = globalResult.rows[0].avg_time;
+      console.log(`✓ STEP 2: Found ${globalResult.rows[0].count} global completions → ${estimate} minutes`);
+      return estimate;
     }
+    console.log(`✗ STEP 2: Only ${globalResult.rows[0]?.count || 0} global completions (need 3+)`);
   } catch (error) {
-    console.error('Error checking global completions:', error);
+    console.error('Error in Step 2:', error.message);
   }
   
-  // STEP 3: Only 0 user completions (need 2+)
+  // STEP 3: Check for 2+ completions with matching title prefix (user-specific + same class)
   try {
+    // Extract first 50% of words from title (round up)
+    const words = title.split(' ');
+    const halfWords = Math.ceil(words.length * 0.5);
+    const titlePrefix = words.slice(0, halfWords).join(' ');
+    
+    console.log(`  Title prefix (first 50%): "${titlePrefix}"`);
+    
     const userResult = await pool.query(
-      `SELECT COUNT(*) as count, AVG(actual_time) as avg_time
-       FROM tasks_completed
-       WHERE user_id = $1 AND url = $2`,
-      [userId, url]
+      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
+       FROM tasks_completed 
+       WHERE user_id = $1 
+       AND class = $2
+       AND title LIKE $3`,
+      [userId, taskClass, `${titlePrefix}%`]
     );
     
-    const userCount = parseInt(userResult.rows[0]?.count || 0);
-    const userAvg = userResult.rows[0]?.avg_time;
-    
-    console.log(`✗ STEP 3: Only ${userCount} user completions (need 2+)`);
-    
-    if (userCount >= 2 && userAvg) {
-      console.log(`✓ STEP 3: Using user average: ${Math.round(userAvg)} minutes`);
-      return Math.round(userAvg);
+    if (userResult.rows[0] && userResult.rows[0].count >= 2) {
+      const estimate = userResult.rows[0].avg_time;
+      console.log(`✓ STEP 3: Found ${userResult.rows[0].count} user completions with matching prefix → ${estimate} minutes`);
+      return estimate;
     }
+    console.log(`✗ STEP 3: Only ${userResult.rows[0]?.count || 0} user completions (need 2+)`);
   } catch (error) {
-    console.error('Error checking user completions:', error);
+    console.error('Error in Step 3:', error.message);
   }
   
-  // STEP 4: No major project keywords found
-  const projectKeywords = ['project', 'summative', 'assessment'];
-  const hasProjectKeyword = projectKeywords.some(kw => lower.includes(kw));
-  if (!hasProjectKeyword) {
-    console.log('✗ STEP 4: No major project keywords found');
-  } else {
-    console.log('✓ STEP 4: Major project detected → 60 minutes');
-    return 60;
+  // STEP 4: Check for major project keywords
+  const projectKeywords = ['Project', 'Essay', 'Lab', 'Exam', 'Test', 'Assessment', 'Summative'];
+  for (const keyword of projectKeywords) {
+    if (title.includes(keyword)) {
+      console.log(`✓ STEP 4: Found keyword "${keyword}" → 60 minutes`);
+      return 60;
+    }
   }
+  console.log('✗ STEP 4: No major project keywords found');
   
-  // STEP 5: Not an OSGAccelerate Share task
-  if (!lower.includes('[osg accelerate]')) {
-    console.log('✗ STEP 5: Not an OSGAccelerate Share task');
-  } else {
-    console.log('✓ STEP 5: OSGAccelerate Share → 5 minutes');
+  // STEP 5: Check for OSGAccelerate Share tasks
+  if (title.includes('Share') && (taskClass.includes('OSGAccelerate') || taskClass.includes('OSG Accelerate'))) {
+    console.log('✓ STEP 5: OSGAccelerate Share task → 5 minutes');
     return 5;
   }
+  console.log('✗ STEP 5: Not an OSGAccelerate Share task');
   
-  // STEP 6: No medium-length keywords found
-  const mediumKeywords = ['lab', 'formative'];
-  const hasMediumKeyword = mediumKeywords.some(kw => lower.includes(kw));
-  if (!hasMediumKeyword) {
-    console.log('✗ STEP 6: No medium-length keywords found');
-  } else {
-    console.log('✓ STEP 6: Medium-length task detected → 30 minutes');
-    return 30;
+  // STEP 6: Check for medium-length task keywords
+  const mediumKeywords = ['Discussion', 'Chapters', 'Gizmos', 'IXL', 'Quiz', 'Worksheet'];
+  for (const keyword of mediumKeywords) {
+    if (title.includes(keyword)) {
+      console.log(`✓ STEP 6: Found keyword "${keyword}" → 30 minutes`);
+      return 30;
+    }
   }
+  console.log('✗ STEP 6: No medium-length keywords found');
   
-  // STEP 7: Using default → 20 minutes
+  // STEP 7: Default estimate
   console.log('✓ STEP 7: Using default → 20 minutes');
   return 20;
 };
 
 // ============================================================================
-// AUTHENTICATION ROUTES
+// AUTH ROUTES
 // ============================================================================
 
 // Register
@@ -226,17 +215,21 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
     if (!isValidOneSchoolEmail(email)) {
-      return res.status(400).json({ error: 'Must use OneSchool Global email (@na.oneschoolglobal.com)' });
+      return res.status(400).json({ error: 'Email must be in format: first.last##@na.oneschoolglobal.com' });
     }
 
     const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (existingUser.rows.length > 0) {
-      return res.status(400).json({ error: 'Email already registered' });
+      return res.status(400).json({ error: 'User already exists' });
     }
 
-    const name = extractNameFromEmail(email);
     const hashedPassword = await bcrypt.hash(password, 10);
+    const name = extractNameFromEmail(email);
 
     const result = await pool.query(
       'INSERT INTO users (email, password, name, is_new_user) VALUES ($1, $2, $3, $4) RETURNING id, email, name, is_new_user',
@@ -244,20 +237,23 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     const user = result.rows[0];
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
+    res.json({ 
+      token, 
+      user: { 
+        id: user.id, 
+        email: user.email, 
         name: user.name,
         isNewUser: user.is_new_user
-      }
+      } 
     });
   } catch (error) {
     console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+    res.status(500).json({ 
+      error: 'Registration failed', 
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined 
+    });
   }
 });
 
@@ -267,30 +263,30 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!isValidOneSchoolEmail(email)) {
-      return res.status(400).json({ error: 'Must use OneSchool Global email (@na.oneschoolglobal.com)' });
+      return res.status(400).json({ error: 'Invalid email format' });
     }
 
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(400).json({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(400).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
+    res.json({ 
+      token, 
+      user: { 
+        id: user.id, 
+        email: user.email, 
         name: user.name,
         isNewUser: user.is_new_user
-      }
+      } 
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -299,16 +295,22 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ============================================================================
-// USER SETUP ROUTES
+// ACCOUNT SETUP ROUTES
 // ============================================================================
 
-// Get user setup
+// Get account setup
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const userResult = await pool.query(
+    const result = await pool.query(
       'SELECT grade, canvas_url, present_periods FROM users WHERE id = $1',
       [req.user.id]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
 
     const scheduleResult = await pool.query(
       'SELECT day, period, type FROM schedules WHERE user_id = $1',
@@ -322,18 +324,18 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
     });
 
     res.json({
-      grade: userResult.rows[0]?.grade || '',
-      canvasUrl: userResult.rows[0]?.canvas_url || '',
-      presentPeriods: userResult.rows[0]?.present_periods || '2-6',
+      grade: user.grade || '',
+      canvasUrl: user.canvas_url || '',
+      presentPeriods: user.present_periods || '2-6',
       schedule
     });
   } catch (error) {
-    console.error('Get setup error:', error);
-    res.status(500).json({ error: 'Failed to get setup' });
+    console.error('Get account setup error:', error);
+    res.status(500).json({ error: 'Failed to get account setup' });
   }
 });
 
-// Save user setup
+// Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const { grade, canvasUrl, presentPeriods, schedule } = req.body;
@@ -345,52 +347,55 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
 
     await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
 
-    if (schedule) {
-      for (const day in schedule) {
-        for (const period in schedule[day]) {
-          await pool.query(
+    const insertPromises = [];
+    for (const [day, periods] of Object.entries(schedule)) {
+      for (const [period, type] of Object.entries(periods)) {
+        insertPromises.push(
+          pool.query(
             'INSERT INTO schedules (user_id, day, period, type) VALUES ($1, $2, $3, $4)',
-            [req.user.id, day, parseInt(period), schedule[day][period]]
-          );
-        }
+            [req.user.id, day, parseInt(period), type]
+          )
+        );
       }
     }
+    await Promise.all(insertPromises);
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Save setup error:', error);
-    res.status(500).json({ error: 'Failed to save setup' });
+    console.error('Save account setup error:', error);
+    res.status(500).json({ error: 'Failed to save account setup' });
   }
 });
 
 // ============================================================================
-// CALENDAR IMPORT ROUTES
+// CANVAS CALENDAR IMPORT
 // ============================================================================
 
-// Fetch Canvas calendar
+// Fetch Canvas calendar and import tasks
 app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
   try {
     const { canvasUrl } = req.body;
-
-    if (!canvasUrl) {
-      return res.status(400).json({ error: 'Canvas URL is required' });
-    }
-
-    // Validate URL format
-    if (!canvasUrl.includes('canvas.oneschoolglobal.com/feeds/calendars/')) {
+    
+    console.log('\n=== CALENDAR FETCH REQUEST ===');
+    console.log('User ID:', req.user.id);
+    console.log('Canvas URL:', canvasUrl);
+    
+    const isValidCanvasUrl = canvasUrl && 
+      (canvasUrl.includes('instructure.com/feeds/calendars') || 
+       canvasUrl.includes('oneschoolglobal.com/feeds/calendars'));
+    
+    if (!isValidCanvasUrl) {
+      console.log('❌ Invalid Canvas URL format');
       return res.status(400).json({ 
-        error: 'Invalid Canvas URL format. Please use the calendar feed URL from Canvas.' 
+        error: 'Invalid Canvas URL. Please use the format: https://canvas.oneschoolglobal.com/feeds/calendars/user_...' 
       });
     }
 
-    console.log('\n=== FETCHING CANVAS CALENDAR ===');
-    console.log('URL:', canvasUrl);
-    console.log('User:', req.user.id);
-
     let icsData;
     try {
-      const response = await axios.get(canvasUrl, {
-        timeout: 30000,
+      console.log('Fetching calendar from:', canvasUrl);
+      const response = await axios.get(canvasUrl, { 
+        timeout: 15000,
         headers: {
           'User-Agent': 'PlanAssist/2.0'
         }
@@ -473,7 +478,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               description: event.description || '',
               url: url || '', // Use empty string if no URL
               deadline: eventDate,
-              estimated_time: estimatedTime // FIXED: Use database column name
+              estimatedTime
             });
             
             processedCount++;
@@ -512,26 +517,10 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // Get tasks (all incomplete tasks)
-// FIXED: Added column aliasing for frontend compatibility
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT 
-        id,
-        user_id,
-        title,
-        segment,
-        class,
-        description,
-        url,
-        deadline,
-        estimated_time,
-        user_estimated_time,
-        accumulated_time,
-        completed,
-        priority_order,
-        is_new
-       FROM tasks 
+      `SELECT * FROM tasks 
        WHERE user_id = $1 AND completed = false
        ORDER BY priority_order ASC NULLS LAST, deadline ASC`,
       [req.user.id]
@@ -612,22 +601,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         `INSERT INTO tasks 
          (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING 
-           id,
-           user_id,
-           title,
-           segment,
-           class,
-           description,
-           url,
-           deadline,
-           estimated_time,
-           user_estimated_time,
-           accumulated_time,
-           completed,
-           priority_order,
-           is_new,
-           'general' as task_type`,
+         RETURNING *`,
         [
           req.user.id,
           task.title,
@@ -689,22 +663,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
         `INSERT INTO tasks 
          (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING 
-           id,
-           user_id,
-           title,
-           segment,
-           class,
-           description,
-           url,
-           deadline,
-           estimated_time,
-           user_estimated_time,
-           accumulated_time,
-           completed,
-           priority_order,
-           is_new,
-           'general' as task_type`,
+         RETURNING *`,
         [
           req.user.id,
           originalTask.title, // Keep same title
@@ -742,55 +701,37 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
 app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
   try {
     const { userEstimate } = req.body;
-    const result = await pool.query(
-      `UPDATE tasks 
-       SET user_estimated_time = $1 
-       WHERE id = $2 AND user_id = $3
-       RETURNING 
-         id,
-         user_id,
-         title,
-         segment,
-         class,
-         description,
-         url,
-         deadline,
-         estimated_time,
-         user_estimated_time,
-         accumulated_time,
-         completed,
-         priority_order,
-         is_new`,
-      [userEstimate, req.params.id, req.user.id]
+    const taskId = req.params.id;
+
+    await pool.query(
+      'UPDATE tasks SET user_estimated_time = $1 WHERE id = $2 AND user_id = $3',
+      [userEstimate, taskId, req.user.id]
     );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
-    }
-    
-    res.json(result.rows[0]);
+
+    res.json({ success: true });
   } catch (error) {
-    console.error('Update estimate error:', error);
+    console.error('Update task estimate error:', error);
     res.status(500).json({ error: 'Failed to update estimate' });
   }
 });
 
-// Update tasks priority order
+// Reorder tasks
 app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
   try {
-    const { taskIds } = req.body;
-    
-    if (!Array.isArray(taskIds)) {
-      return res.status(400).json({ error: 'taskIds must be an array' });
+    const { taskOrder } = req.body;
+
+    if (!Array.isArray(taskOrder)) {
+      return res.status(400).json({ error: 'taskOrder must be an array' });
     }
 
-    for (let i = 0; i < taskIds.length; i++) {
-      await pool.query(
+    const updatePromises = taskOrder.map((taskId, index) =>
+      pool.query(
         'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3',
-        [i + 1, taskIds[i], req.user.id]
-      );
-    }
+        [index + 1, taskId, req.user.id]
+      )
+    );
 
+    await Promise.all(updatePromises);
     res.json({ success: true });
   } catch (error) {
     console.error('Reorder tasks error:', error);
@@ -798,27 +739,73 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete task
-app.delete('/api/tasks/:id', authenticateToken, async (req, res) => {
+// Toggle priority lock
+app.patch('/api/user/priority-lock', authenticateToken, async (req, res) => {
   try {
+    const { locked } = req.body;
+
     await pool.query(
-      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
+      'UPDATE users SET priority_locked = $1 WHERE id = $2',
+      [locked, req.user.id]
     );
-    res.json({ success: true });
+
+    if (!locked) {
+      await pool.query(
+        'UPDATE tasks SET priority_order = NULL, is_new = FALSE WHERE user_id = $1',
+        [req.user.id]
+      );
+    }
+
+    res.json({ success: true, locked });
   } catch (error) {
-    console.error('Delete task error:', error);
-    res.status(500).json({ error: 'Failed to delete task' });
+    console.error('Toggle priority lock error:', error);
+    res.status(500).json({ error: 'Failed to toggle priority lock' });
   }
 });
 
-// Mark task complete and move to tasks_completed
-app.post('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
+// Get priority lock status
+app.get('/api/user/priority-lock', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT priority_locked FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    const locked = result.rows[0]?.priority_locked || false;
+    res.json({ locked });
+  } catch (error) {
+    console.error('Get priority lock error:', error);
+    res.status(500).json({ error: 'Failed to get priority lock status' });
+  }
+});
+
+// Clear new task flags
+app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
+  try {
+    const { taskIds } = req.body;
+
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return res.json({ success: true });
+    }
+
+    await pool.query(
+      'UPDATE tasks SET is_new = FALSE WHERE id = ANY($1::int[]) AND user_id = $2',
+      [taskIds, req.user.id]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Clear new flags error:', error);
+    res.status(500).json({ error: 'Failed to clear new flags' });
+  }
+});
+
+// Manual task completion (checkbox)
+app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
     const taskId = req.params.id;
-    const { actualTime } = req.body;
 
-    // Get the task
+    // Get task details
     const taskResult = await pool.query(
       'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
@@ -829,75 +816,50 @@ app.post('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
     }
 
     const task = taskResult.rows[0];
-    const totalTime = task.accumulated_time + actualTime;
 
-    // Insert into tasks_completed
-    await pool.query(
-      `INSERT INTO tasks_completed 
-       (id, user_id, title, class, description, url, deadline, estimated_time, actual_time)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        task.id,
-        req.user.id,
-        task.title,
-        task.class,
-        task.description,
-        task.url,
-        task.deadline,
-        task.user_estimated_time || task.estimated_time,
-        totalTime
-      ]
-    );
-
-    // Delete from tasks
-    await pool.query(
-      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
-      [taskId, req.user.id]
-    );
-
-    // Check if there are other segments with the same title+url
-    const otherSegments = await pool.query(
-      'SELECT COUNT(*) as count FROM tasks WHERE user_id = $1 AND title = $2 AND url = $3',
-      [req.user.id, task.title, task.url]
-    );
-
-    // If no other segments exist, consolidate completed segments in tasks_completed
-    if (parseInt(otherSegments.rows[0].count) === 0) {
-      const completedSegments = await pool.query(
-        'SELECT * FROM tasks_completed WHERE user_id = $1 AND title = $2 AND url = $3',
-        [req.user.id, task.title, task.url]
+    // Skip Homeroom tasks
+    if (!task.class.includes('Homeroom')) {
+      // Check if consolidation needed
+      const existingResult = await pool.query(
+        'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
+        [req.user.id, task.url]
       );
 
-      if (completedSegments.rows.length > 1) {
-        // Consolidate: sum actual_time, keep first estimate
-        const totalActual = completedSegments.rows.reduce((sum, s) => sum + s.actual_time, 0);
-        const firstSegment = completedSegments.rows[0];
+      if (existingResult.rows.length > 0) {
+        // Consolidate
+        const existing = existingResult.rows[0];
+        const newActualTime = existing.actual_time + task.accumulated_time;
+        const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
 
-        // Delete all segments
         await pool.query(
-          'DELETE FROM tasks_completed WHERE user_id = $1 AND title = $2 AND url = $3',
-          [req.user.id, task.title, task.url]
+          'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
+          [newActualTime, newEstimatedTime, existing.id]
         );
-
-        // Insert consolidated record
+      } else {
+        // Add new entry
         await pool.query(
           `INSERT INTO tasks_completed 
-           (id, user_id, title, class, description, url, deadline, estimated_time, actual_time)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+           (user_id, title, class, description, url, deadline, estimated_time, actual_time)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
           [
-            firstSegment.id,
             req.user.id,
             task.title,
             task.class,
             task.description,
             task.url,
             task.deadline,
-            firstSegment.estimated_time,
-            totalActual
+            task.user_estimated_time || task.estimated_time,
+            task.accumulated_time
           ]
         );
       }
     }
+
+    // Delete task from tasks table
+    await pool.query(
+      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
 
     res.json({ success: true });
   } catch (error) {
@@ -906,89 +868,212 @@ app.post('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   }
 });
 
-// Save partial completion (accumulated time)
-app.post('/api/tasks/:id/partial', authenticateToken, async (req, res) => {
-  try {
-    const taskId = req.params.id;
-    const { timeSpent } = req.body;
+// ============================================================================
+// SESSION ROUTES
+// ============================================================================
 
-    const result = await pool.query(
-      `UPDATE tasks 
-       SET accumulated_time = accumulated_time + $1
-       WHERE id = $2 AND user_id = $3
-       RETURNING 
-         id,
-         user_id,
-         title,
-         segment,
-         class,
-         description,
-         url,
-         deadline,
-         estimated_time,
-         user_estimated_time,
-         accumulated_time,
-         completed,
-         priority_order,
-         is_new,
-         'general' as task_type`,
-      [timeSpent, taskId, req.user.id]
+// Complete task during session (with time tracking)
+app.post('/api/sessions/complete-task', authenticateToken, async (req, res) => {
+  try {
+    const { taskId, actualTime } = req.body;
+
+    console.log(`\n=== COMPLETING TASK ${taskId} ===`);
+
+    // Get task details
+    const taskResult = await pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
 
-    if (result.rows.length === 0) {
+    if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error('Partial completion error:', error);
-    res.status(500).json({ error: 'Failed to save partial completion' });
-  }
-});
+    const task = taskResult.rows[0];
+    const totalTime = actualTime + task.accumulated_time;
 
-// Get global estimate for a task
-app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res) => {
-  try {
-    const title = decodeURIComponent(req.params.title);
-    
-    const result = await pool.query(
-      `SELECT AVG(actual_time) as estimate, COUNT(*) as count
-       FROM tasks_completed
-       WHERE title = $1`,
-      [title]
+    console.log(`Task: ${task.title}`);
+    console.log(`Segment: ${task.segment || 'None'}`);
+    console.log(`Time - Session: ${actualTime} | Accumulated: ${task.accumulated_time} | Total: ${totalTime}`);
+
+    // Skip Homeroom tasks
+    if (!task.class.includes('Homeroom')) {
+      // Check if consolidation needed
+      const existingResult = await pool.query(
+        'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
+        [req.user.id, task.url]
+      );
+
+      if (existingResult.rows.length > 0) {
+        // Consolidate
+        const existing = existingResult.rows[0];
+        const newActualTime = existing.actual_time + totalTime;
+        const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
+
+        await pool.query(
+          'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
+          [newActualTime, newEstimatedTime, existing.id]
+        );
+        
+        console.log(`✓ Consolidated with existing entry (ID: ${existing.id})`);
+      } else {
+        // Add new entry
+        await pool.query(
+          `INSERT INTO tasks_completed 
+           (user_id, title, class, description, url, deadline, estimated_time, actual_time)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            req.user.id,
+            task.title,
+            task.class,
+            task.description,
+            task.url,
+            task.deadline,
+            task.user_estimated_time || task.estimated_time,
+            totalTime
+          ]
+        );
+        
+        console.log('✓ Created new tasks_completed entry');
+      }
+    }
+
+    // Delete task from tasks table
+    await pool.query(
+      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
 
-    if (result.rows[0] && parseInt(result.rows[0].count) >= 3) {
-      res.json({ estimate: Math.round(result.rows[0].estimate) });
-    } else {
-      res.json({ estimate: null });
-    }
+    console.log('=== TASK COMPLETION DONE ===\n');
+    res.json({ success: true });
   } catch (error) {
-    console.error('Global estimate error:', error);
-    res.json({ estimate: null });
+    console.error('Session complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
   }
 });
 
-// ============================================================================
-// SESSION MANAGEMENT ROUTES
-// ============================================================================
+// Batch complete multiple tasks (end of session)
+app.post('/api/sessions/batch-complete', authenticateToken, async (req, res) => {
+  try {
+    const { completedTasks } = req.body;
 
-// Save session state
+    if (!Array.isArray(completedTasks)) {
+      return res.status(400).json({ error: 'completedTasks must be an array' });
+    }
+
+    console.log('\n=== BATCH COMPLETING TASKS ===');
+    console.log(`Total tasks: ${completedTasks.length}`);
+
+    for (const { taskId, timeSpent } of completedTasks) {
+      // Use the individual completion endpoint logic
+      await pool.query('BEGIN');
+      
+      try {
+        const taskResult = await pool.query(
+          'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+          [taskId, req.user.id]
+        );
+
+        if (taskResult.rows.length > 0) {
+          const task = taskResult.rows[0];
+          const totalTime = timeSpent + task.accumulated_time;
+
+          if (!task.class.includes('Homeroom')) {
+            const existingResult = await pool.query(
+              'SELECT * FROM tasks_completed WHERE user_id = $1 AND url = $2',
+              [req.user.id, task.url]
+            );
+
+            if (existingResult.rows.length > 0) {
+              const existing = existingResult.rows[0];
+              const newActualTime = existing.actual_time + totalTime;
+              const newEstimatedTime = existing.estimated_time + (task.user_estimated_time || task.estimated_time);
+
+              await pool.query(
+                'UPDATE tasks_completed SET actual_time = $1, estimated_time = $2 WHERE id = $3',
+                [newActualTime, newEstimatedTime, existing.id]
+              );
+            } else {
+              await pool.query(
+                `INSERT INTO tasks_completed 
+                 (user_id, title, class, description, url, deadline, estimated_time, actual_time)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [
+                  req.user.id,
+                  task.title,
+                  task.class,
+                  task.description,
+                  task.url,
+                  task.deadline,
+                  task.user_estimated_time || task.estimated_time,
+                  totalTime
+                ]
+              );
+            }
+          }
+
+          await pool.query(
+            'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
+            [taskId, req.user.id]
+          );
+        }
+
+        await pool.query('COMMIT');
+      } catch (error) {
+        await pool.query('ROLLBACK');
+        console.error(`Error completing task ${taskId}:`, error);
+      }
+    }
+
+    console.log('=== BATCH COMPLETE DONE ===\n');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Batch complete error:', error);
+    res.status(500).json({ error: 'Failed to batch complete tasks' });
+  }
+});
+
+// Save session state (for resume)
 app.post('/api/sessions/save-state', authenticateToken, async (req, res) => {
   try {
-    const { day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds } = req.body;
+    const { day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskId, partialTaskTime } = req.body;
 
-    // Delete existing session state for this user
+    console.log('=== SAVE STATE REQUEST ===');
+    console.log('Partial Task ID:', partialTaskId);
+    console.log('Partial Task Time:', partialTaskTime);
+
+    // Delete existing session state
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+
+    // Update accumulated time for partial task
+    if (partialTaskId && partialTaskTime && partialTaskTime > 0) {
+      const taskResult = await pool.query(
+        'SELECT accumulated_time FROM tasks WHERE id = $1 AND user_id = $2',
+        [partialTaskId, req.user.id]
+      );
+
+      if (taskResult.rows.length > 0) {
+        const currentAccumulated = taskResult.rows[0].accumulated_time || 0;
+        const newAccumulated = currentAccumulated + partialTaskTime;
+
+        await pool.query(
+          'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+          [newAccumulated, partialTaskId, req.user.id]
+        );
+
+        console.log(`✓ Updated accumulated time: ${currentAccumulated} + ${partialTaskTime} = ${newAccumulated}`);
+      }
+    }
 
     // Insert new session state
     await pool.query(
       `INSERT INTO session_state 
        (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds]
+      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds || []]
     );
 
+    console.log('✓ Session state saved successfully\n');
     res.json({ success: true });
   } catch (error) {
     console.error('Save session state error:', error);
@@ -1004,94 +1089,49 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
-    if (result.rows.length === 0) {
-      return res.json({});
-    }
+    if (result.rows.length > 0) {
+      const state = result.rows[0];
 
-    const state = result.rows[0];
-    res.json({
-      sessionId: state.id,
-      day: state.day,
-      period: state.period,
-      remainingTime: state.remaining_time,
-      currentTaskIndex: state.current_task_index,
-      taskStartTime: state.task_start_time,
-      completedTaskIds: state.completed_task_ids,
-      savedAt: state.saved_at
-    });
+      // Get accumulated times for all tasks
+      const tasksResult = await pool.query(
+        'SELECT id, accumulated_time FROM tasks WHERE user_id = $1',
+        [req.user.id]
+      );
+
+      const partialTaskTimes = {};
+      tasksResult.rows.forEach(row => {
+        if (row.accumulated_time > 0) {
+          partialTaskTimes[row.id] = row.accumulated_time;
+        }
+      });
+      
+      res.json({
+        day: state.day,
+        period: state.period,
+        remainingTime: state.remaining_time,
+        currentTaskIndex: state.current_task_index,
+        taskStartTime: state.task_start_time,
+        completedTaskIds: state.completed_task_ids || [],
+        partialTaskTimes: partialTaskTimes,
+        savedAt: state.saved_at
+      });
+    } else {
+      res.json({ savedState: null });
+    }
   } catch (error) {
     console.error('Get session state error:', error);
-    res.json({});
+    res.status(500).json({ error: 'Failed to get session state' });
   }
 });
 
-// Delete saved session state
+// Clear saved session state
 app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
     res.json({ success: true });
   } catch (error) {
-    console.error('Delete session state error:', error);
-    res.status(500).json({ error: 'Failed to delete session state' });
-  }
-});
-
-// ============================================================================
-// LEARNING/ANALYTICS ROUTES
-// ============================================================================
-
-// Get completion history
-app.get('/api/learning', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT 
-        title as task_title,
-        class as task_type,
-        estimated_time,
-        actual_time,
-        completed_at
-       FROM tasks_completed 
-       WHERE user_id = $1 
-       ORDER BY completed_at DESC`,
-      [req.user.id]
-    );
-    res.json(result.rows || []);
-  } catch (error) {
-    console.error('Get learning error:', error);
-    res.json([]);
-  }
-});
-
-// ============================================================================
-// USER SETTINGS ROUTES
-// ============================================================================
-
-// Get priority lock status
-app.get('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT priority_locked FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    res.json({ locked: result.rows[0]?.priority_locked || false });
-  } catch (error) {
-    console.error('Get priority lock error:', error);
-    res.json({ locked: false });
-  }
-});
-
-// Set priority lock status
-app.post('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const { locked } = req.body;
-    await pool.query(
-      'UPDATE users SET priority_locked = $1 WHERE id = $2',
-      [locked, req.user.id]
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Set priority lock error:', error);
-    res.status(500).json({ error: 'Failed to set priority lock' });
+    console.error('Clear session state error:', error);
+    res.status(500).json({ error: 'Failed to clear session state' });
   }
 });
 
@@ -1102,16 +1142,20 @@ app.post('/api/user/priority-lock', authenticateToken, async (req, res) => {
 app.post('/api/feedback', authenticateToken, async (req, res) => {
   try {
     const { feedback, userEmail, userName } = req.body;
-    
+
+    if (!feedback || feedback.trim().length === 0) {
+      return res.status(400).json({ error: 'Feedback cannot be empty' });
+    }
+
     await pool.query(
       'INSERT INTO feedback (user_id, user_email, user_name, feedback_text) VALUES ($1, $2, $3, $4)',
       [req.user.id, userEmail, userName, feedback]
     );
-    
-    res.json({ success: true });
+
+    res.json({ success: true, message: 'Feedback submitted successfully' });
   } catch (error) {
     console.error('Feedback error:', error);
-    res.status(500).json({ error: 'Failed to save feedback' });
+    res.status(500).json({ error: 'Failed to submit feedback' });
   }
 });
 
@@ -1119,15 +1163,31 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
 // HEALTH CHECK
 // ============================================================================
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ 
+      status: 'ok', 
+      message: 'PlanAssist API v2.0 - Title/Segment System',
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({ 
+      status: 'error', 
+      message: 'Database connection failed',
+      error: error.message 
+    });
+  }
 });
 
-// ============================================================================
-// START SERVER
-// ============================================================================
-
+// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 PlanAssist API running on port ${PORT}`);
-  console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`\n==============================================`);
+  console.log(`  PlanAssist API v2.0 - REDESIGNED`);
+  console.log(`  Server running on port ${PORT}`);
+  console.log(`  Title/Segment System Active`);
+  console.log(`  Advanced AI Estimation Enabled`);
+  console.log(`==============================================\n`);
 });
