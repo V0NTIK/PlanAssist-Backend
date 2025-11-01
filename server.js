@@ -437,8 +437,16 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       if (event.type === 'VEVENT' && event.summary) {
         const eventDate = new Date(event.start || event.end || new Date());
         
+        // Normalize date to avoid timezone issues - create date from components only
+        const normalizedDate = new Date(
+          eventDate.getFullYear(),
+          eventDate.getMonth(),
+          eventDate.getDate(),
+          0, 0, 0, 0
+        );
+        
         // Only include tasks within the next month
-        if (eventDate >= today && eventDate <= oneMonthFromNow) {
+        if (normalizedDate >= today && normalizedDate <= oneMonthFromNow) {
           try {
             const title = extractTitle(event.summary);
             const taskClass = extractClass(event.summary);
@@ -477,7 +485,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               class: taskClass,
               description: event.description || '',
               url: url || '', // Use empty string if no URL
-              deadline: eventDate,
+              deadline: normalizedDate,
               estimatedTime
             });
             
