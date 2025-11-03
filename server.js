@@ -1127,43 +1127,191 @@ app.get('/api/proxy-canvas', async (req, res) => {
     // Fetch the Canvas page
     const response = await axios.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
         'DNT': '1',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none'
       },
       maxRedirects: 5,
       validateStatus: function (status) {
-        return status >= 200 && status < 400; // Accept redirects
+        return status >= 200 && status < 400;
       }
     });
     
     let html = response.data;
     
-    // Fix relative URLs to absolute URLs
-    html = html.replace(/href="\//g, 'href="https://canvas.oneschoolglobal.com/');
-    html = html.replace(/src="\//g, 'src="https://canvas.oneschoolglobal.com/');
-    html = html.replace(/action="\//g, 'action="https://canvas.oneschoolglobal.com/');
+    // More aggressive URL fixing with multiple patterns
+    // Fix href attributes
+    html = html.replace(/href=["']\/(?!\/)/g, 'href="https://canvas.oneschoolglobal.com/');
+    html = html.replace(/href=["']\/\//g, 'href="https://');
     
-    // Inject base tag to help with relative URLs
-    html = html.replace('<head>', '<head><base href="https://canvas.oneschoolglobal.com/">');
+    // Fix src attributes
+    html = html.replace(/src=["']\/(?!\/)/g, 'src="https://canvas.oneschoolglobal.com/');
+    html = html.replace(/src=["']\/\//g, 'src="https://');
     
-    // Set headers to allow iframe embedding
-    res.setHeader('Content-Type', 'text/html');
-    res.setHeader('X-Frame-Options', 'ALLOWALL'); // Remove the restriction
-    res.setHeader('Content-Security-Policy', 'frame-ancestors *'); // Allow all parents
+    // Fix action attributes
+    html = html.replace(/action=["']\/(?!\/)/g, 'action="https://canvas.oneschoolglobal.com/');
+    
+    // Fix CSS url() references
+    html = html.replace(/url\(["']?\/(?!\/)/g, 'url("https://canvas.oneschoolglobal.com/');
+    html = html.replace(/url\(["']?\/\//g, 'url("https://');
+    
+    // Fix data attributes
+    html = html.replace(/data-src=["']\/(?!\/)/g, 'data-src="https://canvas.oneschoolglobal.com/');
+    html = html.replace(/data-url=["']\/(?!\/)/g, 'data-url="https://canvas.oneschoolglobal.com/');
+    
+    // Fix srcset attributes
+    html = html.replace(/srcset=["']\/(?!\/)/g, 'srcset="https://canvas.oneschoolglobal.com/');
+    
+    // Inject a more comprehensive base tag and CSP override
+    const headInjection = `<head>
+    <base href="https://canvas.oneschoolglobal.com/">
+    <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline';">
+    <style>
+      /* Ensure page renders properly */
+      html, body { 
+        margin: 0; 
+        padding: 0; 
+        width: 100%; 
+        height: 100%;
+        overflow: auto;
+      }
+    </style>`;
+    
+    html = html.replace('<head>', headInjection);
+    
+    // Set headers to allow iframe embedding and prevent CORB issues
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('X-Frame-Options', 'ALLOWALL');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
     
     res.send(html);
     
   } catch (error) {
     console.error('Canvas proxy error:', error.message);
-    res.status(500).json({ 
-      error: 'Failed to fetch Canvas page',
-      details: error.message 
+    
+    // Send a user-friendly error page
+    const errorHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Canvas Loading Error</title>
+        <style>
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #f5f5f5;
+          }
+          .error-box {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            max-width: 500px;
+            text-align: center;
+          }
+          .error-title {
+            color: #e53e3e;
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+          }
+          .error-message {
+            color: #4a5568;
+            margin-bottom: 1.5rem;
+          }
+          .error-button {
+            background: #805ad5;
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            text-decoration: none;
+            display: inline-block;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="error-box">
+          <div class="error-title">Failed to Load Canvas</div>
+          <div class="error-message">
+            ${error.message || 'An error occurred while loading the Canvas page.'}
+          </div>
+          <a href="${req.query.url}" target="_blank" class="error-button">
+            Open in New Tab Instead
+          </a>
+        </div>
+      </body>
+      </html>
+    `;
+    
+    res.status(500).setHeader('Content-Type', 'text/html').send(errorHtml);
+  }
+});
+
+// ============================================================================
+// CANVAS RESOURCE PROXY - For CSS, JS, Images
+// ============================================================================
+
+app.get('/api/proxy-resource', async (req, res) => {
+  try {
+    const { url, token } = req.query;
+    
+    if (!url || !token) {
+      return res.status(400).json({ error: 'URL and token required' });
+    }
+    
+    // Verify token
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    
+    // Only allow Canvas resources
+    if (!url.includes('canvas.oneschoolglobal.com') && !url.includes('instructure.com')) {
+      return res.status(403).json({ error: 'Only Canvas resources allowed' });
+    }
+    
+    console.log('📦 Proxying Canvas resource:', url);
+    
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://canvas.oneschoolglobal.com/'
+      },
+      maxRedirects: 5
     });
+    
+    // Forward the content type
+    const contentType = response.headers['content-type'] || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    
+    res.send(response.data);
+    
+  } catch (error) {
+    console.error('Resource proxy error:', error.message);
+    res.status(500).send('Failed to fetch resource');
   }
 });
 
