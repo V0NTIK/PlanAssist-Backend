@@ -1094,6 +1094,68 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// CANVAS IFRAME PROXY - Bypass X-Frame-Options
+// ============================================================================
+
+app.get('/api/proxy-canvas', authenticateToken, async (req, res) => {
+  try {
+    const { url } = req.query;
+    
+    if (!url) {
+      return res.status(400).json({ error: 'URL parameter is required' });
+    }
+    
+    // Validate it's a Canvas URL for security
+    if (!url.includes('canvas.oneschoolglobal.com')) {
+      return res.status(403).json({ error: 'Only Canvas URLs are allowed' });
+    }
+    
+    console.log('🔄 Proxying Canvas URL:', url);
+    
+    // Fetch the Canvas page
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+      },
+      maxRedirects: 5,
+      validateStatus: function (status) {
+        return status >= 200 && status < 400; // Accept redirects
+      }
+    });
+    
+    let html = response.data;
+    
+    // Fix relative URLs to absolute URLs
+    html = html.replace(/href="\//g, 'href="https://canvas.oneschoolglobal.com/');
+    html = html.replace(/src="\//g, 'src="https://canvas.oneschoolglobal.com/');
+    html = html.replace(/action="\//g, 'action="https://canvas.oneschoolglobal.com/');
+    
+    // Inject base tag to help with relative URLs
+    html = html.replace('<head>', '<head><base href="https://canvas.oneschoolglobal.com/">');
+    
+    // Set headers to allow iframe embedding
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('X-Frame-Options', 'ALLOWALL'); // Remove the restriction
+    res.setHeader('Content-Security-Policy', 'frame-ancestors *'); // Allow all parents
+    
+    res.send(html);
+    
+  } catch (error) {
+    console.error('Canvas proxy error:', error.message);
+    res.status(500).json({ 
+      error: 'Failed to fetch Canvas page',
+      details: error.message 
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
@@ -1101,5 +1163,6 @@ app.listen(PORT, () => {
   console.log(`  Server running on port ${PORT}`);
   console.log(`  Title/Segment System Active`);
   console.log(`  Advanced AI Estimation Enabled`);
+  console.log(`  Canvas Proxy Enabled`);
   console.log(`==============================================\n`);
 });
