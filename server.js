@@ -1148,28 +1148,44 @@ app.get('/api/proxy-canvas', async (req, res) => {
     
     let html = response.data;
     
-    // More aggressive URL fixing with multiple patterns
-    // Fix href attributes
-    html = html.replace(/href=["']\/(?!\/)/g, 'href="https://canvas.oneschoolglobal.com/');
-    html = html.replace(/href=["']\/\//g, 'href="https://');
+    // COMPREHENSIVE URL FIXING - Multiple passes to catch all patterns
     
-    // Fix src attributes
-    html = html.replace(/src=["']\/(?!\/)/g, 'src="https://canvas.oneschoolglobal.com/');
-    html = html.replace(/src=["']\/\//g, 'src="https://');
+    // Pass 1: Fix relative URLs in href attributes (including those with query params)
+    html = html.replace(/href=(["'])\/(?!\/)(.*?)\1/gi, 'href=$1https://canvas.oneschoolglobal.com/$2$1');
+    html = html.replace(/href=(["'])\/\/(.*?)\1/gi, 'href=$1https://$2$1');
     
-    // Fix action attributes
-    html = html.replace(/action=["']\/(?!\/)/g, 'action="https://canvas.oneschoolglobal.com/');
+    // Pass 2: Fix relative URLs in src attributes (including those with query params)
+    html = html.replace(/src=(["'])\/(?!\/)(.*?)\1/gi, 'src=$1https://canvas.oneschoolglobal.com/$2$1');
+    html = html.replace(/src=(["'])\/\/(.*?)\1/gi, 'src=$1https://$2$1');
     
-    // Fix CSS url() references
-    html = html.replace(/url\(["']?\/(?!\/)/g, 'url("https://canvas.oneschoolglobal.com/');
-    html = html.replace(/url\(["']?\/\//g, 'url("https://');
+    // Pass 3: Fix action attributes
+    html = html.replace(/action=(["'])\/(?!\/)(.*?)\1/gi, 'action=$1https://canvas.oneschoolglobal.com/$2$1');
     
-    // Fix data attributes
-    html = html.replace(/data-src=["']\/(?!\/)/g, 'data-src="https://canvas.oneschoolglobal.com/');
-    html = html.replace(/data-url=["']\/(?!\/)/g, 'data-url="https://canvas.oneschoolglobal.com/');
+    // Pass 4: Fix CSS url() references (including those with query params)
+    html = html.replace(/url\((["']?)\/(?!\/)(.*?)\1\)/gi, 'url($1https://canvas.oneschoolglobal.com/$2$1)');
+    html = html.replace(/url\((["']?)\/\/(.*?)\1\)/gi, 'url($1https://$2$1)');
     
-    // Fix srcset attributes
-    html = html.replace(/srcset=["']\/(?!\/)/g, 'srcset="https://canvas.oneschoolglobal.com/');
+    // Pass 5: Fix data attributes
+    html = html.replace(/data-src=(["'])\/(?!\/)(.*?)\1/gi, 'data-src=$1https://canvas.oneschoolglobal.com/$2$1');
+    html = html.replace(/data-url=(["'])\/(?!\/)(.*?)\1/gi, 'data-url=$1https://canvas.oneschoolglobal.com/$2$1');
+    html = html.replace(/data-href=(["'])\/(?!\/)(.*?)\1/gi, 'data-href=$1https://canvas.oneschoolglobal.com/$2$1');
+    
+    // Pass 6: Fix srcset attributes
+    html = html.replace(/srcset=(["'])\/(?!\/)(.*?)\1/gi, 'srcset=$1https://canvas.oneschoolglobal.com/$2$1');
+    
+    // Pass 7: Fix inline style background images
+    html = html.replace(/background-image:\s*url\((["']?)\/(?!\/)(.*?)\1\)/gi, 'background-image: url($1https://canvas.oneschoolglobal.com/$2$1)');
+    html = html.replace(/background:\s*url\((["']?)\/(?!\/)(.*?)\1\)/gi, 'background: url($1https://canvas.oneschoolglobal.com/$2$1)');
+    
+    // Pass 8: Fix any remaining relative paths in common attributes (catches edge cases)
+    html = html.replace(/(href|src|action|data-src|data-url)=(["'])(?!https?:\/\/|\/\/|#|data:)([^"']*)\2/gi, 
+      (match, attr, quote, path) => {
+        if (path.startsWith('/')) {
+          return `${attr}=${quote}https://canvas.oneschoolglobal.com${path}${quote}`;
+        }
+        return match;
+      }
+    );
     
     // Inject a more comprehensive base tag and CSP override
     const headInjection = `<head>
