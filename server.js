@@ -1187,7 +1187,7 @@ app.get('/api/proxy-canvas', async (req, res) => {
       }
     );
     
-    // Inject a more comprehensive base tag and CSP override
+    // Inject a more comprehensive base tag, CSP override, AND URL interceptor
     const headInjection = `<head>
     <base href="https://canvas.oneschoolglobal.com/">
     <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline';">
@@ -1200,7 +1200,129 @@ app.get('/api/proxy-canvas', async (req, res) => {
         height: 100%;
         overflow: auto;
       }
-    </style>`;
+    </style>
+    <script>
+      // URL Interceptor - Fix all relative URLs dynamically
+      (function() {
+        const CANVAS_BASE = 'https://canvas.oneschoolglobal.com';
+        
+        // Function to fix relative URLs
+        function fixUrl(url) {
+          if (!url || typeof url !== 'string') return url;
+          if (url.startsWith('http://') || url.startsWith('https://')) return url;
+          if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('#')) return url;
+          if (url.startsWith('//')) return 'https:' + url;
+          if (url.startsWith('/')) return CANVAS_BASE + url;
+          return url;
+        }
+        
+        // Override document.createElement to fix src/href on creation
+        const originalCreateElement = document.createElement.bind(document);
+        document.createElement = function(tagName) {
+          const element = originalCreateElement(tagName);
+          
+          if (tagName.toLowerCase() === 'link' || tagName.toLowerCase() === 'a') {
+            const originalSetAttribute = element.setAttribute.bind(element);
+            element.setAttribute = function(name, value) {
+              if (name.toLowerCase() === 'href') {
+                value = fixUrl(value);
+              }
+              return originalSetAttribute(name, value);
+            };
+            
+            Object.defineProperty(element, 'href', {
+              get: function() { return this.getAttribute('href'); },
+              set: function(value) { this.setAttribute('href', fixUrl(value)); }
+            });
+          }
+          
+          if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'img') {
+            const originalSetAttribute = element.setAttribute.bind(element);
+            element.setAttribute = function(name, value) {
+              if (name.toLowerCase() === 'src') {
+                value = fixUrl(value);
+              }
+              return originalSetAttribute(name, value);
+            };
+            
+            Object.defineProperty(element, 'src', {
+              get: function() { return this.getAttribute('src'); },
+              set: function(value) { this.setAttribute('src', fixUrl(value)); }
+            });
+          }
+          
+          return element;
+        };
+        
+        // Monitor and fix any dynamically added elements
+        const observer = new MutationObserver(function(mutations) {
+          mutations.forEach(function(mutation) {
+            mutation.addedNodes.forEach(function(node) {
+              if (node.nodeType === 1) { // Element node
+                // Fix link tags
+                if (node.tagName === 'LINK' && node.href) {
+                  const fixed = fixUrl(node.getAttribute('href'));
+                  if (fixed !== node.getAttribute('href')) {
+                    console.log('Fixed link href:', node.getAttribute('href'), '->', fixed);
+                    node.setAttribute('href', fixed);
+                  }
+                }
+                // Fix script tags
+                if (node.tagName === 'SCRIPT' && node.src) {
+                  const fixed = fixUrl(node.getAttribute('src'));
+                  if (fixed !== node.getAttribute('src')) {
+                    console.log('Fixed script src:', node.getAttribute('src'), '->', fixed);
+                    node.setAttribute('src', fixed);
+                  }
+                }
+                // Fix img tags
+                if (node.tagName === 'IMG' && node.src) {
+                  const fixed = fixUrl(node.getAttribute('src'));
+                  if (fixed !== node.getAttribute('src')) {
+                    node.setAttribute('src', fixed);
+                  }
+                }
+                
+                // Check child elements
+                if (node.querySelectorAll) {
+                  node.querySelectorAll('link[href], script[src], img[src]').forEach(function(el) {
+                    if (el.tagName === 'LINK' && el.href) {
+                      const fixed = fixUrl(el.getAttribute('href'));
+                      if (fixed !== el.getAttribute('href')) {
+                        el.setAttribute('href', fixed);
+                      }
+                    }
+                    if (el.tagName === 'SCRIPT' && el.src) {
+                      const fixed = fixUrl(el.getAttribute('src'));
+                      if (fixed !== el.getAttribute('src')) {
+                        el.setAttribute('src', fixed);
+                      }
+                    }
+                    if (el.tagName === 'IMG' && el.src) {
+                      const fixed = fixUrl(el.getAttribute('src'));
+                      if (fixed !== el.getAttribute('src')) {
+                        el.setAttribute('src', fixed);
+                      }
+                    }
+                  });
+                }
+              }
+            });
+          });
+        });
+        
+        // Start observing
+        if (document.body) {
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+        } else {
+          document.addEventListener('DOMContentLoaded', function() {
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+          });
+        }
+        
+        console.log('Canvas URL Interceptor active');
+      })();
+    </script>`;
     
     html = html.replace('<head>', headInjection);
     
