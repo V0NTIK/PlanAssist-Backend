@@ -1098,12 +1098,23 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // CANVAS IFRAME PROXY - Bypass X-Frame-Options
 // ============================================================================
 
-app.get('/api/proxy-canvas', authenticateToken, async (req, res) => {
+app.get('/api/proxy-canvas', async (req, res) => {
   try {
-    const { url } = req.query;
+    const { url, token } = req.query;
     
     if (!url) {
       return res.status(400).json({ error: 'URL parameter is required' });
+    }
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token parameter is required' });
+    }
+    
+    // Verify the token
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      return res.status(403).json({ error: 'Invalid token' });
     }
     
     // Validate it's a Canvas URL for security
