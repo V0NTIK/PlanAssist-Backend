@@ -954,6 +954,10 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     
     await pool.query('DELETE FROM tasks WHERE id = $1 AND user_id = $2', [taskId, req.user.id]);
     
+    // Update leaderboard and completion feed (async, don't await)
+    updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
+    addToCompletionFeed(req.user.id, task.title, task.class).catch(err => console.error('Feed update failed:', err));
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Complete task error:', error);
@@ -1093,6 +1097,181 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to save notes' });
   }
 });
+
+// ============================================================================
+// HUB FEATURES - Completion Feed & Leaderboard
+// ============================================================================
+
+// Get recent completion feed (last 50 completions from opted-in users)
+app.get('/api/completion-feed', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at
+       FROM completion_feed cf
+       JOIN users u ON cf.user_id = u.id
+       WHERE u.show_in_feed = true
+       AND cf.completed_at > NOW() - INTERVAL '7 days'
+       ORDER BY cf.completed_at DESC
+       LIMIT 50`
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get completion feed error:', error);
+    res.status(500).json({ error: 'Failed to get completion feed' });
+  }
+});
+
+// Get weekly leaderboard by grade
+app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
+  try {
+    const { grade } = req.params;
+    
+    // Get current week start (Monday)
+    const weekStart = await pool.query(
+      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
+    );
+    const currentWeekStart = weekStart.rows[0].week_start;
+    
+    // Get top 10 for this grade this week
+    const result = await pool.query(
+      `SELECT user_name, grade, tasks_completed, updated_at
+       FROM weekly_leaderboard
+       WHERE grade = $1 AND week_start = $2
+       ORDER BY tasks_completed DESC, updated_at ASC
+       LIMIT 10`,
+      [grade, currentWeekStart]
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get leaderboard error:', error);
+    res.status(500).json({ error: 'Failed to get leaderboard' });
+  }
+});
+
+// Get user's current position in leaderboard
+app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) => {
+  try {
+    const { grade } = req.params;
+    const userId = req.user.id;
+    
+    // Get current week start
+    const weekStart = await pool.query(
+      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
+    );
+    const currentWeekStart = weekStart.rows[0].week_start;
+    
+    // Get user's position
+    const result = await pool.query(
+      `WITH ranked_users AS (
+        SELECT user_id, user_name, tasks_completed,
+               ROW_NUMBER() OVER (ORDER BY tasks_completed DESC, updated_at ASC) as position
+        FROM weekly_leaderboard
+        WHERE grade = $1 AND week_start = $2
+      )
+      SELECT position, user_name, tasks_completed
+      FROM ranked_users
+      WHERE user_id = $3`,
+      [grade, currentWeekStart, userId]
+    );
+    
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.json({ position: null, tasks_completed: 0 });
+    }
+  } catch (error) {
+    console.error('Get leaderboard position error:', error);
+    res.status(500).json({ error: 'Failed to get position' });
+  }
+});
+
+// Update user feed preference
+app.put('/api/user/feed-preference', authenticateToken, async (req, res) => {
+  try {
+    const { showInFeed } = req.body;
+    
+    await pool.query(
+      'UPDATE users SET show_in_feed = $1 WHERE id = $2',
+      [showInFeed, req.user.id]
+    );
+    
+    res.json({ success: true, showInFeed });
+  } catch (error) {
+    console.error('Update feed preference error:', error);
+    res.status(500).json({ error: 'Failed to update preference' });
+  }
+});
+
+// Helper function to update leaderboard when task is completed
+async function updateLeaderboardOnCompletion(userId) {
+  try {
+    // Get user info
+    const userResult = await pool.query(
+      'SELECT name, grade, show_in_feed FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length === 0) return;
+    
+    const user = userResult.rows[0];
+    
+    // Get current week start
+    const weekStart = await pool.query(
+      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
+    );
+    const currentWeekStart = weekStart.rows[0].week_start;
+    
+    // Update or insert weekly leaderboard entry
+    await pool.query(
+      `INSERT INTO weekly_leaderboard (user_id, user_name, grade, tasks_completed, week_start, updated_at)
+       VALUES ($1, $2, $3, 1, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id, week_start)
+       DO UPDATE SET 
+         tasks_completed = weekly_leaderboard.tasks_completed + 1,
+         updated_at = CURRENT_TIMESTAMP`,
+      [userId, user.name, user.grade, currentWeekStart]
+    );
+  } catch (error) {
+    console.error('Update leaderboard error:', error);
+  }
+}
+
+// Helper function to add to completion feed
+async function addToCompletionFeed(userId, taskTitle, taskClass) {
+  try {
+    // Get user info
+    const userResult = await pool.query(
+      'SELECT name, grade, show_in_feed FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length === 0 || !userResult.rows[0].show_in_feed) return;
+    
+    const user = userResult.rows[0];
+    
+    // Add to completion feed
+    await pool.query(
+      `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+      [userId, user.name, user.grade, taskTitle, taskClass]
+    );
+    
+    // Keep only last 1000 entries to prevent table bloat
+    await pool.query(
+      `DELETE FROM completion_feed
+       WHERE id IN (
+         SELECT id FROM completion_feed
+         ORDER BY completed_at DESC
+         OFFSET 1000
+       )`
+    );
+  } catch (error) {
+    console.error('Add to completion feed error:', error);
+  }
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
