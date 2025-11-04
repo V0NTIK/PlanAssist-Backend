@@ -260,3 +260,56 @@ CREATE TABLE IF NOT EXISTS notes (
 
 CREATE INDEX IF NOT EXISTS idx_notes_task_id ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
+
+
+-- ============================================================================
+-- PlanAssist Hub Features - Database Migration
+-- Adds: Completion Feed, Leaderboard, User Feed Preferences
+-- ============================================================================
+
+-- Add show_in_feed column to users table (defaults to true = opted in)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS show_in_feed BOOLEAN DEFAULT true;
+
+-- Completion Feed Table
+-- Stores recent task completions for the live feed
+CREATE TABLE IF NOT EXISTS completion_feed (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_name VARCHAR(255) NOT NULL,
+    user_grade VARCHAR(10),
+    task_title VARCHAR(500) NOT NULL,
+    task_class VARCHAR(200) NOT NULL,
+    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for completion feed
+CREATE INDEX IF NOT EXISTS idx_completion_feed_completed_at ON completion_feed(completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_completion_feed_user_id ON completion_feed(user_id);
+
+-- Weekly Leaderboard Table
+-- Stores weekly task completion counts by grade
+CREATE TABLE IF NOT EXISTS weekly_leaderboard (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_name VARCHAR(255) NOT NULL,
+    grade VARCHAR(10) NOT NULL,
+    tasks_completed INTEGER DEFAULT 0,
+    week_start DATE NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, week_start)
+);
+
+-- Indexes for weekly leaderboard
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_week_start ON weekly_leaderboard(week_start DESC);
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_grade ON weekly_leaderboard(grade);
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_tasks_completed ON weekly_leaderboard(tasks_completed DESC);
+
+-- Comments for documentation
+COMMENT ON TABLE completion_feed IS 'Live feed of recent task completions across all users (respecting privacy settings)';
+COMMENT ON TABLE weekly_leaderboard IS 'Weekly task completion counts by grade, resets each Monday';
+COMMENT ON COLUMN users.show_in_feed IS 'User preference: show completions in public feed (default true)';
+
+-- Verification queries
+SELECT 'Completion Feed Table Created' as status;
+SELECT 'Weekly Leaderboard Table Created' as status;
+SELECT 'Users table updated with show_in_feed column' as status;
