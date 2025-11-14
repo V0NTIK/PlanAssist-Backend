@@ -20,7 +20,6 @@ CREATE TABLE IF NOT EXISTS users (
     grade VARCHAR(10),
     canvas_url TEXT,
     present_periods VARCHAR(10) DEFAULT '2-6',
-    priority_locked BOOLEAN DEFAULT FALSE,
     is_new_user BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
