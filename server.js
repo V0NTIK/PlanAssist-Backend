@@ -568,13 +568,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Tasks must be an array' });
     }
 
-    // Get user's priority lock setting
-    const userResult = await pool.query(
-      'SELECT priority_locked FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    const priorityLocked = userResult.rows[0]?.priority_locked || false;
-
+    // Note: Priority mode is always on now (no more locked/unlocked modes)
+    // All new tasks will be marked as "new" and go to sidebar for prioritization
+    
     // Get existing tasks to preserve user overrides
     const existingTasks = await pool.query(
       'SELECT title, segment, user_estimated_time, priority_order, accumulated_time FROM tasks WHERE user_id = $1',
@@ -614,13 +610,12 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       const existing = existingTaskMap[key];
       const isNew = newTaskKeys.has(key);
       
-      // Determine priority order
+      // Determine priority order (always using priority mode now)
       let priorityOrder = null;
       if (existing?.priorityOrder !== undefined) {
         priorityOrder = existing.priorityOrder;
-      } else if (!priorityLocked) {
-        priorityOrder = null; // Sort by deadline
       } else if (isNew) {
+        // New tasks get next priority and will show in sidebar
         priorityOrder = nextPriority++;
       }
 
@@ -641,7 +636,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           existing?.userEstimatedTime || null,
           existing?.accumulatedTime || 0,
           priorityOrder,
-          priorityLocked && isNew,
+          isNew, // Mark as new if it's a newly imported task
           false
         ]
       );
