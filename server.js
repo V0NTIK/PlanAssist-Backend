@@ -697,8 +697,8 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
           Math.floor(originalTask.estimated_time / segments.length), // Divide estimate
           originalTask.user_estimated_time ? Math.floor(originalTask.user_estimated_time / segments.length) : null,
           0, // Reset accumulated time
-          null, // Let priority sort naturally
-          false,
+          null, // Let priority sort naturally - will be set when user adds from sidebar
+          true, // Mark as NEW so it appears in sidebar for prioritization
           false
         ]
       );
