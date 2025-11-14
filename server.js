@@ -767,45 +767,6 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
 });
 
 // Toggle priority lock
-app.patch('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const { locked } = req.body;
-
-    await pool.query(
-      'UPDATE users SET priority_locked = $1 WHERE id = $2',
-      [locked, req.user.id]
-    );
-
-    if (!locked) {
-      await pool.query(
-        'UPDATE tasks SET priority_order = NULL, is_new = FALSE WHERE user_id = $1',
-        [req.user.id]
-      );
-    }
-
-    res.json({ success: true, locked });
-  } catch (error) {
-    console.error('Toggle priority lock error:', error);
-    res.status(500).json({ error: 'Failed to toggle priority lock' });
-  }
-});
-
-// Get priority lock status
-app.get('/api/user/priority-lock', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT priority_locked FROM users WHERE id = $1',
-      [req.user.id]
-    );
-
-    const locked = result.rows[0]?.priority_locked || false;
-    res.json({ locked });
-  } catch (error) {
-    console.error('Get priority lock error:', error);
-    res.status(500).json({ error: 'Failed to get priority lock status' });
-  }
-});
-
 // Clear new task flags
 app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
   try {
