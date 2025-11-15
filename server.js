@@ -68,6 +68,12 @@ const isValidOneSchoolEmail = (email) => {
   return email.endsWith('@na.oneschoolglobal.com');
 };
 
+// Validate grade (must be 7-12)
+const isValidGrade = (grade) => {
+  const validGrades = ['7', '8', '9', '10', '11', '12'];
+  return validGrades.includes(String(grade));
+};
+
 // Extract title from Canvas SUMMARY (removes class in brackets)
 const extractTitle = (summary) => {
   // Remove everything from the last opening bracket onwards
@@ -340,6 +346,11 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const { grade, canvasUrl, presentPeriods, schedule } = req.body;
 
+    // Validate grade before saving
+    if (!isValidGrade(grade)) {
+      return res.status(400).json({ error: 'Grade must be one of: 7, 8, 9, 10, 11, or 12' });
+    }
+
     await pool.query(
       'UPDATE users SET grade = $1, canvas_url = $2, present_periods = $3, is_new_user = false WHERE id = $4',
       [grade, canvasUrl, presentPeriods, req.user.id]
@@ -600,6 +611,23 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     );
     let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
 
+    // NOTES PRESERVATION: Save existing notes before deleting tasks
+    // Match by user_id + title + segment + url to handle split tasks correctly
+    const existingNotes = await pool.query(
+      `SELECT n.notes, t.title, t.segment, t.url
+       FROM notes n
+       JOIN tasks t ON n.task_id = t.id
+       WHERE n.user_id = $1 AND t.completed = false`,
+      [req.user.id]
+    );
+    
+    // Create a map: "title|||segment|||url" -> notes
+    const notesMap = {};
+    existingNotes.rows.forEach(row => {
+      const key = `${row.title}|||${row.segment || 'NULL'}|||${row.url}`;
+      notesMap[key] = row.notes;
+    });
+
     // Clear existing incomplete tasks
     await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
 
@@ -642,6 +670,16 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       );
       
       insertedTasks.push(result.rows[0]);
+      
+      // NOTES RESTORATION: Restore notes for this task if they existed
+      const noteKey = `${task.title}|||${task.segment || 'NULL'}|||${task.url}`;
+      if (notesMap[noteKey]) {
+        await pool.query(
+          `INSERT INTO notes (task_id, user_id, notes, created_at, updated_at)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+          [result.rows[0].id, req.user.id, notesMap[noteKey]]
+        );
+      }
     }
 
     res.json({ success: true, tasks: insertedTasks });
