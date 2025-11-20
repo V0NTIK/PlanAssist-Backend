@@ -559,7 +559,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM tasks 
-       WHERE user_id = $1 AND completed = false
+       WHERE user_id = $1 AND completed = false AND deleted = false
        ORDER BY priority_order ASC NULLS LAST, deadline ASC`,
       [req.user.id]
     );
@@ -579,110 +579,107 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Tasks must be an array' });
     }
 
-    // Note: Priority mode is always on now (no more locked/unlocked modes)
-    // All new tasks will be marked as "new" and go to sidebar for prioritization
-    
-    // Get existing tasks to preserve user overrides
-    const existingTasks = await pool.query(
-      'SELECT title, segment, user_estimated_time, priority_order, accumulated_time FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
+    console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from ICS ===`);
 
-    // Create map of existing tasks by title+segment
-    const existingTaskMap = {};
-    (existingTasks.rows || []).forEach(task => {
-      const key = `${task.title}|||${task.segment || 'NULL'}`;
-      existingTaskMap[key] = {
-        userEstimatedTime: task.user_estimated_time,
-        priorityOrder: task.priority_order,
-        accumulatedTime: task.accumulated_time
-      };
-    });
-
-    // Identify new tasks
-    const existingKeys = new Set(Object.keys(existingTaskMap));
-    const incomingKeys = new Set(tasks.map(t => `${t.title}|||${t.segment || 'NULL'}`));
-    const newTaskKeys = new Set([...incomingKeys].filter(k => !existingKeys.has(k)));
-
-    // Get max priority for appending new tasks
-    const maxPriorityResult = await pool.query(
-      'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
-
-    // NOTES PRESERVATION: Save existing notes before deleting tasks
-    // Match by user_id + title + segment + url to handle split tasks correctly
-    const existingNotes = await pool.query(
-      `SELECT n.notes, t.title, t.segment, t.url
-       FROM notes n
-       JOIN tasks t ON n.task_id = t.id
-       WHERE n.user_id = $1 AND t.completed = false`,
-      [req.user.id]
-    );
-    
-    // Create a map: "title|||segment|||url" -> notes
-    const notesMap = {};
-    existingNotes.rows.forEach(row => {
-      const key = `${row.title}|||${row.segment || 'NULL'}|||${row.url}`;
-      notesMap[key] = row.notes;
-    });
-
-    // Clear existing incomplete tasks
-    await pool.query('DELETE FROM tasks WHERE user_id = $1 AND completed = false', [req.user.id]);
-
-    // Insert new tasks
+    // Track what we do for logging
+    let updatedCount = 0;
+    let newCount = 0;
     const insertedTasks = [];
-    for (const task of tasks) {
-      const key = `${task.title}|||${task.segment || 'NULL'}`;
-      const existing = existingTaskMap[key];
-      const isNew = newTaskKeys.has(key);
-      
-      // Determine priority order (always using priority mode now)
-      let priorityOrder = null;
-      if (existing?.priorityOrder !== undefined) {
-        priorityOrder = existing.priorityOrder;
-      } else if (isNew) {
-        // New tasks get next priority and will show in sidebar
-        priorityOrder = nextPriority++;
-      }
 
-      const result = await pool.query(
-        `INSERT INTO tasks 
-         (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING *`,
-        [
-          req.user.id,
-          task.title,
-          task.segment || null,
-          task.class,
-          task.description || '',
-          task.url,
-          task.deadline,
-          task.estimatedTime,
-          existing?.userEstimatedTime || null,
-          existing?.accumulatedTime || 0,
-          priorityOrder,
-          isNew, // Mark as new if it's a newly imported task
-          false
-        ]
+    for (const incomingTask of tasks) {
+      // Check if this URL already exists in the database (including deleted tasks)
+      const existingTasksResult = await pool.query(
+        'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+        [req.user.id, incomingTask.url]
       );
-      
-      insertedTasks.push(result.rows[0]);
-      
-      // NOTES RESTORATION: Restore notes for this task if they existed
-      const noteKey = `${task.title}|||${task.segment || 'NULL'}|||${task.url}`;
-      if (notesMap[noteKey]) {
-        await pool.query(
-          `INSERT INTO notes (task_id, user_id, notes, created_at, updated_at)
-           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-          [result.rows[0].id, req.user.id, notesMap[noteKey]]
+
+      if (existingTasksResult.rows.length > 0) {
+        // URL EXISTS - Update existing task(s) with Canvas data, preserve user modifications
+        console.log(`\n[UPDATE] Found ${existingTasksResult.rows.length} existing task(s) with URL: ${incomingTask.url}`);
+        
+        for (const existingTask of existingTasksResult.rows) {
+          // Update only Canvas-controlled fields, preserve user work
+          await pool.query(
+            `UPDATE tasks SET 
+              title = $1,
+              description = $2,
+              estimated_time = $3,
+              completed = $4,
+              class = $5,
+              url = $6,
+              deadline = $7
+             WHERE id = $8 AND user_id = $9`,
+            [
+              incomingTask.title,
+              incomingTask.description || '',
+              incomingTask.estimatedTime,
+              false, // Always false during sync
+              incomingTask.class,
+              incomingTask.url,
+              incomingTask.deadline,
+              existingTask.id,
+              req.user.id
+            ]
+          );
+          
+          console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
+          console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
+          updatedCount++;
+        }
+
+        // Fetch the updated tasks to return
+        const updatedTasksResult = await pool.query(
+          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+          [req.user.id, incomingTask.url]
         );
+        insertedTasks.push(...updatedTasksResult.rows);
+
+      } else {
+        // URL DOESN'T EXIST - Import as new task
+        console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
+        
+        // Get max priority for appending new tasks
+        const maxPriorityResult = await pool.query(
+          'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
+          [req.user.id]
+        );
+        const nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
+
+        const result = await pool.query(
+          `INSERT INTO tasks 
+           (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           RETURNING *`,
+          [
+            req.user.id,
+            incomingTask.title,
+            null, // New tasks start with no segment
+            incomingTask.class,
+            incomingTask.description || '',
+            incomingTask.url,
+            incomingTask.deadline,
+            incomingTask.estimatedTime,
+            null, // No user override yet
+            0, // No accumulated time yet
+            nextPriority, // Append to end
+            true, // Mark as new
+            false, // Not completed
+            false // Not deleted
+          ]
+        );
+        
+        insertedTasks.push(result.rows[0]);
+        newCount++;
+        console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
       }
     }
 
-    res.json({ success: true, tasks: insertedTasks });
+    console.log(`\n=== SYNC COMPLETE ===`);
+    console.log(`Updated: ${updatedCount} existing tasks`);
+    console.log(`Added: ${newCount} new tasks`);
+    console.log(`Total returned: ${insertedTasks.length} tasks\n`);
+
+    res.json({ success: true, tasks: insertedTasks, stats: { updated: updatedCount, new: newCount } });
   } catch (error) {
     console.error('Save tasks error:', error);
     res.status(500).json({ error: 'Failed to save tasks' });
@@ -784,9 +781,10 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'taskOrder must be an array' });
     }
 
+    // Update priority orders, but only for non-deleted tasks
     const updatePromises = taskOrder.map((taskId, index) =>
       pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3',
+        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false',
         [index + 1, taskId, req.user.id]
       )
     );
@@ -821,7 +819,7 @@ app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
   }
 });
 
-// Manual task completion (checkbox) - Just deletes the task
+// Manual task completion (checkbox) - Marks as deleted to preserve URL history
 app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
     const taskId = req.params.id;
@@ -836,9 +834,10 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // Simply delete the task - no record keeping for manual completions
+    // Mark task as deleted and clear priority_order
+    // This preserves the URL in the database so it won't be re-imported during sync
     await pool.query(
-      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -853,10 +852,89 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
 // SESSION AND COMPLETION ROUTES
 // ============================================================================
 
+// Helper function to validate and clean session state
+async function cleanupSessionState(userId) {
+  try {
+    const sessionResult = await pool.query(
+      'SELECT * FROM session_state WHERE user_id = $1',
+      [userId]
+    );
+    
+    if (sessionResult.rows.length === 0) {
+      return null; // No session to clean
+    }
+    
+    const session = sessionResult.rows[0];
+    let needsCleanup = false;
+    let cleanedCompletedIds = [];
+    
+    // Check if current_task_index is valid (exists and not deleted)
+    const currentTaskResult = await pool.query(
+      'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
+      [session.current_task_index, userId]
+    );
+    
+    if (currentTaskResult.rows.length === 0 || currentTaskResult.rows[0].deleted) {
+      console.log(`⚠️  Session state cleanup: current_task_index ${session.current_task_index} is invalid or deleted`);
+      needsCleanup = true;
+    }
+    
+    // Check completed_task_ids array - remove any deleted or non-existent tasks
+    if (session.completed_task_ids && session.completed_task_ids.length > 0) {
+      for (const taskId of session.completed_task_ids) {
+        const taskResult = await pool.query(
+          'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
+          [taskId, userId]
+        );
+        
+        if (taskResult.rows.length > 0 && !taskResult.rows[0].deleted) {
+          cleanedCompletedIds.push(taskId);
+        } else {
+          console.log(`⚠️  Session state cleanup: removing invalid/deleted task ${taskId} from completed_task_ids`);
+          needsCleanup = true;
+        }
+      }
+    }
+    
+    // If current task is invalid, clear the entire session
+    if (currentTaskResult.rows.length === 0 || currentTaskResult.rows[0].deleted) {
+      console.log(`🗑️  Clearing invalid session state for user ${userId}`);
+      await pool.query('DELETE FROM session_state WHERE user_id = $1', [userId]);
+      return null;
+    }
+    
+    // If only completed_task_ids need cleaning, update them
+    if (needsCleanup && cleanedCompletedIds.length !== session.completed_task_ids.length) {
+      console.log(`🧹 Cleaning completed_task_ids for user ${userId}: ${session.completed_task_ids.length} -> ${cleanedCompletedIds.length}`);
+      await pool.query(
+        'UPDATE session_state SET completed_task_ids = $1 WHERE user_id = $2',
+        [cleanedCompletedIds, userId]
+      );
+      session.completed_task_ids = cleanedCompletedIds;
+    }
+    
+    return session;
+  } catch (error) {
+    console.error('Session state cleanup error:', error);
+    return null;
+  }
+}
+
 // Save session state
 app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds } = req.body;
+    
+    // Validate current task exists and isn't deleted before saving
+    const taskResult = await pool.query(
+      'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
+      [currentTaskIndex, req.user.id]
+    );
+    
+    if (taskResult.rows.length === 0 || taskResult.rows[0].deleted) {
+      console.log(`⚠️  Cannot save session: task ${currentTaskIndex} is invalid or deleted`);
+      return res.status(400).json({ error: 'Cannot save session with invalid or deleted task' });
+    }
     
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
     
@@ -876,22 +954,19 @@ app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
 // Get saved session state
 app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM session_state WHERE user_id = $1`,
-      [req.user.id]
-    );
+    // Clean up session state first
+    const cleanedSession = await cleanupSessionState(req.user.id);
     
-    if (result.rows.length > 0) {
-      const state = result.rows[0];
+    if (cleanedSession) {
       res.json({
-        sessionId: `${state.day}-${state.period}`,
-        day: state.day,
-        period: state.period,
-        remainingTime: state.remaining_time,
-        currentTaskIndex: state.current_task_index,
-        taskStartTime: state.task_start_time,
-        completedTaskIds: state.completed_task_ids || [],
-        savedAt: state.saved_at
+        sessionId: `${cleanedSession.day}-${cleanedSession.period}`,
+        day: cleanedSession.day,
+        period: cleanedSession.period,
+        remainingTime: cleanedSession.remaining_time,
+        currentTaskIndex: cleanedSession.current_task_index,
+        taskStartTime: cleanedSession.task_start_time,
+        completedTaskIds: cleanedSession.completed_task_ids || [],
+        savedAt: cleanedSession.saved_at
       });
     } else {
       res.json({});
@@ -946,7 +1021,12 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       ]
     );
     
-    await pool.query('DELETE FROM tasks WHERE id = $1 AND user_id = $2', [taskId, req.user.id]);
+    // Mark task as deleted instead of removing from database
+    // This preserves the URL in the database so it won't be re-imported during sync
+    await pool.query(
+      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
     
     // Update leaderboard and completion feed (async, don't await)
     updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
@@ -956,6 +1036,36 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Complete task error:', error);
     res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Ignore/Delete a task (marks as deleted without moving to completed)
+// Used when user wants to permanently ignore a task from the sidebar
+app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    const taskResult = await pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    // Mark task as deleted and remove from priority order
+    // This prevents it from showing in task list and from being re-imported during sync
+    await pool.query(
+      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    
+    console.log(`✓ Task ${taskId} marked as ignored/deleted by user ${req.user.id}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Ignore task error:', error);
+    res.status(500).json({ error: 'Failed to ignore task' });
   }
 });
 
