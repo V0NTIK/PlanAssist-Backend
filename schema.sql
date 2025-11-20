@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed BOOLEAN DEFAULT FALSE,            -- When TRUE, moves to tasks_completed
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     priority_order INTEGER,                     -- Manual priority override (NULL by default)
-    is_new BOOLEAN DEFAULT FALSE                -- Marks newly imported tasks
+    is_new BOOLEAN DEFAULT FALSE,               -- Marks newly imported tasks
+    deleted BOOLEAN DEFAULT FALSE               -- Marks tasks as deleted/checked off without removing from database
 );
 
 -- Schedules table - Fixed SERIAL ID
@@ -110,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority_order ON tasks(priority_order);
 CREATE INDEX IF NOT EXISTS idx_tasks_is_new ON tasks(is_new);
 CREATE INDEX IF NOT EXISTS idx_tasks_segment ON tasks(segment);
+CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(deleted);
 
 -- Tasks Completed
 CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id ON tasks_completed(user_id);
@@ -175,6 +177,7 @@ COMMENT ON COLUMN tasks.segment IS 'NULL for base tasks. For splits: "Part 1", "
 COMMENT ON COLUMN tasks.class IS 'Extracted from brackets in Canvas SUMMARY. Example: [TAiLOR English]';
 COMMENT ON COLUMN tasks.url IS 'Direct assignment URL converted from Canvas calendar URL format';
 COMMENT ON COLUMN tasks.accumulated_time IS 'Replaces partial_completions table. Tracks time spent on incomplete tasks.';
+COMMENT ON COLUMN tasks.deleted IS 'Marks tasks as deleted/ignored by user. Prevents re-import during sync while preserving history.';
 
 COMMENT ON TABLE schedules IS 'User weekly schedule with fixed ID system';
 
