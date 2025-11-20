@@ -448,32 +448,14 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       if (event.type === 'VEVENT' && event.summary) {
         const eventDate = new Date(event.start || event.end || new Date());
         
-        // Canvas deadlines are stored as 11:59 PM EST (23:59:00-05:00)
-        // In UTC, this becomes 04:59:00 (next day) or 05:59:00 depending on DST
-        // We need to detect these early-morning UTC times and shift back to the previous day
-        
-        const utcHours = eventDate.getUTCHours();
-        const utcMinutes = eventDate.getUTCMinutes();
-        
-        // If it's between midnight and 6 AM UTC, it's likely an 11:59 PM EST deadline from previous day
-        let normalizedDate;
-        if (utcHours >= 0 && utcHours < 6) {
-          // Shift back by one day and set to 11:59 PM
-          normalizedDate = new Date(
-            eventDate.getUTCFullYear(),
-            eventDate.getUTCMonth(),
-            eventDate.getUTCDate() - 1,  // Previous day
-            23, 59, 0, 0
-          );
-        } else {
-          // Regular date - normalize to end of day (11:59 PM)
-          normalizedDate = new Date(
-            eventDate.getUTCFullYear(),
-            eventDate.getUTCMonth(),
-            eventDate.getUTCDate(),
-            23, 59, 0, 0
-          );
-        }
+        // Use the date/time from Canvas directly - Canvas exports in the user's local timezone
+        // Normalize to end of day (11:59 PM) for consistency across all assignments
+        const normalizedDate = new Date(
+          eventDate.getFullYear(),
+          eventDate.getMonth(),
+          eventDate.getDate(),
+          23, 59, 0, 0
+        );
         
         // Only include tasks within the next month
         if (normalizedDate >= today && normalizedDate <= oneMonthFromNow) {
