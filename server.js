@@ -627,9 +627,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           updatedCount++;
         }
 
-        // Fetch the updated tasks to return
+        // Fetch the updated tasks to return (only non-deleted ones)
         const updatedTasksResult = await pool.query(
-          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2 AND deleted = false',
           [req.user.id, incomingTask.url]
         );
         insertedTasks.push(...updatedTasksResult.rows);
