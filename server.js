@@ -446,19 +446,25 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     
     for (const event of Object.values(events)) {
       if (event.type === 'VEVENT' && event.summary) {
-        const eventDate = new Date(event.start || event.end || new Date());
+        const icsDate = event.start || event.end;
         
-        // Use the date/time from Canvas directly - Canvas exports in the user's local timezone
-        // Normalize to end of day (11:59 PM) for consistency across all assignments
-        const normalizedDate = new Date(
-          eventDate.getFullYear(),
-          eventDate.getMonth(),
-          eventDate.getDate(),
-          23, 59, 0, 0
-        );
+        if (!icsDate) continue;
+        
+        // Canvas exports dates in user's local timezone
+        // Create a deadline that preserves the date/time values without timezone shifts
+        // Format: YYYY-MM-DD HH:MM:SS (no timezone, PostgreSQL treats as-is)
+        const year = icsDate.getUTCFullYear();
+        const month = String(icsDate.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(icsDate.getUTCDate()).padStart(2, '0');
+        const hours = String(icsDate.getUTCHours()).padStart(2, '0');
+        const minutes = String(icsDate.getUTCMinutes()).padStart(2, '0');
+        const seconds = String(icsDate.getUTCSeconds()).padStart(2, '0');
+        
+        const deadline = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+        const deadlineDate = new Date(icsDate);
         
         // Only include tasks within the next month
-        if (normalizedDate >= today && normalizedDate <= oneMonthFromNow) {
+        if (deadlineDate >= today && deadlineDate <= oneMonthFromNow) {
           try {
             const title = extractTitle(event.summary);
             const taskClass = extractClass(event.summary);
@@ -478,6 +484,8 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
             console.log(`\n[${processedCount + 1}] Processing: ${event.summary}`);
             console.log(`    Title: ${title}`);
             console.log(`    Class: ${taskClass}`);
+            console.log(`    Deadline from ICS: ${icsDate}`);
+            console.log(`    Formatted deadline: ${deadline}`);
             console.log(`    Raw URL: ${eventUrl || 'NONE'}`);
             console.log(`    Converted URL: ${url || 'NONE'}`);
             
@@ -497,7 +505,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               class: taskClass,
               description: event.description || '',
               url: url || '', // Use empty string if no URL
-              deadline: normalizedDate,
+              deadline: deadline.toISOString(), // Store as ISO string to preserve exact moment
               estimatedTime
             });
             
