@@ -430,6 +430,9 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     const events = await ical.async.parseICS(icsData);
     console.log(`✓ Parsed ${Object.keys(events).length} total events`);
     
+    // Also keep raw ICS data for extracting exact datetime strings
+    const icsLines = icsData.split('\n');
+    
     const tasks = [];
     
     // Calculate one month window from today
@@ -446,12 +449,56 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     
     for (const event of Object.values(events)) {
       if (event.type === 'VEVENT' && event.summary) {
-        const deadline = event.start || event.end;
+        // Get parsed date for comparison
+        const parsedDate = event.start || event.end;
         
-        if (!deadline) continue;
+        if (!parsedDate) continue;
+        
+        // Extract raw datetime from ICS - find the DTSTART line for this event
+        // ICS format: DTSTART:20251122T235900 or DTSTART;VALUE=DATE:20251122
+        let rawDatetime = null;
+        const uid = event.uid;
+        
+        // Find this event's block in the raw ICS
+        let inThisEvent = false;
+        for (const line of icsLines) {
+          if (line.includes(`UID:${uid}`)) {
+            inThisEvent = true;
+          }
+          if (inThisEvent && (line.startsWith('DTSTART') || line.startsWith('DTEND'))) {
+            // Extract the datetime value
+            const match = line.match(/DT(?:START|END)(?:;[^:]*)?:(\d{8}T?\d{0,6})/);
+            if (match) {
+              rawDatetime = match[1]; // e.g., "20251122T235900"
+              break;
+            }
+          }
+          if (inThisEvent && line.startsWith('END:VEVENT')) {
+            break;
+          }
+        }
+        
+        // Parse raw datetime to our format: YYYY-MM-DD HH:MM:SS
+        let deadline;
+        if (rawDatetime) {
+          // Format: 20251122T235900 → 2025-11-22 23:59:00
+          const year = rawDatetime.substring(0, 4);
+          const month = rawDatetime.substring(4, 6);
+          const day = rawDatetime.substring(6, 8);
+          const hour = rawDatetime.includes('T') ? rawDatetime.substring(9, 11) : '00';
+          const minute = rawDatetime.includes('T') ? rawDatetime.substring(11, 13) : '00';
+          const second = rawDatetime.includes('T') ? rawDatetime.substring(13, 15) : '00';
+          
+          deadline = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+        } else {
+          // Fallback to parsed date if raw extraction failed
+          deadline = parsedDate;
+        }
+        
+        if (!parsedDate) continue;
         
         // Only include tasks within the next month
-        if (deadline >= today && deadline <= oneMonthFromNow) {
+        if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
           try {
             const title = extractTitle(event.summary);
             const taskClass = extractClass(event.summary);
