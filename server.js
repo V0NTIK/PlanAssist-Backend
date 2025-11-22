@@ -450,15 +450,15 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         
         if (!icsDate) continue;
         
-        // Canvas exports dates in user's local timezone
-        // Create a deadline that preserves the date/time values without timezone shifts
-        // Format: YYYY-MM-DD HH:MM:SS (no timezone, PostgreSQL treats as-is)
-        const year = icsDate.getUTCFullYear();
-        const month = String(icsDate.getUTCMonth() + 1).padStart(2, '0');
-        const day = String(icsDate.getUTCDate()).padStart(2, '0');
-        const hours = String(icsDate.getUTCHours()).padStart(2, '0');
-        const minutes = String(icsDate.getUTCMinutes()).padStart(2, '0');
-        const seconds = String(icsDate.getUTCSeconds()).padStart(2, '0');
+        // Canvas ICS exports dates in user's local timezone
+        // We need to extract the time components AS-IS from the Date object
+        // Important: Use local methods (not UTC) to get the actual time values from ICS
+        const year = icsDate.getFullYear();
+        const month = String(icsDate.getMonth() + 1).padStart(2, '0');
+        const day = String(icsDate.getDate()).padStart(2, '0');
+        const hours = String(icsDate.getHours()).padStart(2, '0');
+        const minutes = String(icsDate.getMinutes()).padStart(2, '0');
+        const seconds = String(icsDate.getSeconds()).padStart(2, '0');
         
         const deadline = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
         const deadlineDate = new Date(icsDate);
@@ -664,12 +664,47 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       }
     }
 
+    // === CLEANUP PAST DUE TASKS ===
+    // After sync, mark any incomplete tasks that are past their deadline as deleted
+    // This prevents old unfinished tasks from cluttering the task list
+    console.log(`\n=== CLEANING UP PAST DUE TASKS ===`);
+    
+    const cleanupResult = await pool.query(
+      `UPDATE tasks 
+       SET deleted = true 
+       WHERE user_id = $1 
+         AND completed = false 
+         AND deleted = false 
+         AND deadline < $2
+       RETURNING id, title, deadline`,
+      [req.user.id, today]
+    );
+    
+    const cleanedUpCount = cleanupResult.rows.length;
+    if (cleanedUpCount > 0) {
+      console.log(`Marked ${cleanedUpCount} past-due incomplete tasks as deleted:`);
+      cleanupResult.rows.forEach(task => {
+        console.log(`  - "${task.title}" (due: ${task.deadline})`);
+      });
+    } else {
+      console.log('No past-due tasks to clean up');
+    }
+
     console.log(`\n=== SYNC COMPLETE ===`);
     console.log(`Updated: ${updatedCount} existing tasks`);
     console.log(`Added: ${newCount} new tasks`);
+    console.log(`Cleaned up: ${cleanedUpCount} past-due tasks`);
     console.log(`Total returned: ${insertedTasks.length} tasks\n`);
 
-    res.json({ success: true, tasks: insertedTasks, stats: { updated: updatedCount, new: newCount } });
+    res.json({ 
+      success: true, 
+      tasks: insertedTasks, 
+      stats: { 
+        updated: updatedCount, 
+        new: newCount,
+        cleaned: cleanedUpCount
+      } 
+    });
   } catch (error) {
     console.error('Save tasks error:', error);
     res.status(500).json({ error: 'Failed to save tasks' });
