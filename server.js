@@ -455,7 +455,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         if (!parsedDate) continue;
         
         // Extract raw datetime from ICS - find the DTSTART line for this event
-        // ICS format: DTSTART:20251122T235900 or DTSTART;VALUE=DATE:20251122
+        // ICS format: DTSTART:20251122T235900Z or DTSTART;VALUE=DATE:20251122
         let rawDatetime = null;
         const uid = event.uid;
         
@@ -465,17 +465,17 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
           if (line.includes(`UID:${uid}`)) {
             inThisEvent = true;
           }
-          if (inThisEvent && (line.startsWith('DTSTART') || line.startsWith('DTEND'))) {
+          if (inThisEvent && line.startsWith('DTSTART')) {
             console.log(`    Found datetime line: ${line.trim()}`);
             // Extract the datetime value
             // Handles formats like:
-            // DTSTART:20251122T235900Z (UTC)
-            // DTSTART:20251122T235900 (local/unspecified)
+            // DTSTART:20251122T235900Z (UTC with time)
+            // DTSTART:20251122T235900 (local/unspecified with time)
             // DTSTART;VALUE=DATE:20251122 (date only)
-            // DTSTART;TZID=America/New_York:20251122T235900
-            const match = line.match(/DT(?:START|END)[^:]*:(\d{8}T?\d{0,6})(Z)?/);
+            // DTSTART;TZID=America/New_York:20251122T235900 (with timezone)
+            const match = line.match(/DTSTART[^:]*:(\d{8}(?:T\d{6})?)(Z)?/);
             if (match) {
-              rawDatetime = match[1]; // e.g., "20251122T235900"
+              rawDatetime = match[1]; // e.g., "20251122T235900" or "20251122"
               const isUTC = match[2] === 'Z'; // Check if Z suffix present
               console.log(`    Extracted raw: ${rawDatetime}${isUTC ? 'Z' : ''}`);
               
@@ -483,7 +483,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               rawDatetime = isUTC ? rawDatetime + 'Z' : rawDatetime;
               break;
             } else {
-              console.log(`    ⚠️  Could not parse datetime from line`);
+              console.log(`    ⚠️  Could not parse datetime from line: ${line.trim()}`);
             }
           }
           if (inThisEvent && line.startsWith('END:VEVENT')) {
@@ -515,29 +515,42 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
             const second = dateStr.substring(13, 15) || '00';
             
             if (isUTC) {
-              // Store in ISO format with Z to indicate UTC
+              // CRITICAL: Store in ISO format with Z to preserve UTC
               deadline = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
               console.log(`    Extracted (UTC): ${deadline}`);
             } else {
-              // Store as plain datetime
-              deadline = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
-              console.log(`    Extracted (local): ${deadline}`);
+              // Assume local timezone - but Canvas typically uses UTC
+              // Convert to ISO format but treat as local
+              deadline = `${year}-${month}-${day}T${hour}:${minute}:${second}`;
+              console.log(`    Extracted (unspecified timezone): ${deadline}`);
             }
           } else {
             // Date only - default to 11:59 PM local time
             console.log(`    Date only (no time) - defaulting to 11:59 PM`);
-            deadline = `${year}-${month}-${day} 23:59:00`;
+            deadline = `${year}-${month}-${day}T23:59:00`;
           }
         } else {
-          console.log(`    ⚠️  Could not extract raw datetime, using parsed date`);
-          // Fallback to parsed date if raw extraction failed
-          deadline = parsedDate;
+          console.log(`    ⚠️  CRITICAL: Could not extract raw datetime from ICS!`);
+          console.log(`    This should not happen - check ICS format`);
+          // Skip this task rather than using incorrect parsed date
+          continue;
         }
         
-        if (!parsedDate) continue;
+        if (!rawDatetime) continue;
+        
+        // Parse deadline for date range comparison
+        // Convert our deadline string to a Date object for comparison
+        let deadlineDate;
+        if (deadline.endsWith('Z')) {
+          // UTC format - parse directly
+          deadlineDate = new Date(deadline);
+        } else {
+          // Local format - parse as local time
+          deadlineDate = new Date(deadline);
+        }
         
         // Only include tasks within the next month
-        if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
+        if (deadlineDate >= today && deadlineDate <= oneMonthFromNow) {
           try {
             const title = extractTitle(event.summary);
             const taskClass = extractClass(event.summary);
