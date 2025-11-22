@@ -469,14 +469,18 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
             console.log(`    Found datetime line: ${line.trim()}`);
             // Extract the datetime value
             // Handles formats like:
-            // DTSTART:20251122T235900
-            // DTSTART:20251122T235900Z
-            // DTSTART;VALUE=DATE:20251122
+            // DTSTART:20251122T235900Z (UTC)
+            // DTSTART:20251122T235900 (local/unspecified)
+            // DTSTART;VALUE=DATE:20251122 (date only)
             // DTSTART;TZID=America/New_York:20251122T235900
-            const match = line.match(/DT(?:START|END)[^:]*:(\d{8}T?\d{0,6})/);
+            const match = line.match(/DT(?:START|END)[^:]*:(\d{8}T?\d{0,6})(Z)?/);
             if (match) {
               rawDatetime = match[1]; // e.g., "20251122T235900"
-              console.log(`    Extracted raw: ${rawDatetime}`);
+              const isUTC = match[2] === 'Z'; // Check if Z suffix present
+              console.log(`    Extracted raw: ${rawDatetime}${isUTC ? 'Z' : ''}`);
+              
+              // Store whether this is UTC
+              rawDatetime = isUTC ? rawDatetime + 'Z' : rawDatetime;
               break;
             } else {
               console.log(`    ⚠️  Could not parse datetime from line`);
@@ -487,28 +491,40 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
           }
         }
         
-        // Parse raw datetime to our format: YYYY-MM-DD HH:MM:SS
+        // Parse raw datetime to our format
         let deadline;
         if (rawDatetime) {
           console.log(`    Raw ICS datetime: ${rawDatetime}`);
           
+          // Check if this is UTC time (has Z suffix)
+          const isUTC = rawDatetime.endsWith('Z');
+          const dateStr = isUTC ? rawDatetime.slice(0, -1) : rawDatetime;
+          
           // Format can be:
-          // - 20251122T235900 (datetime)
+          // - 20251122T235900Z (datetime UTC)
+          // - 20251122T235900 (datetime local/unspecified)
           // - 20251122 (date only, no time)
-          const year = rawDatetime.substring(0, 4);
-          const month = rawDatetime.substring(4, 6);
-          const day = rawDatetime.substring(6, 8);
+          const year = dateStr.substring(0, 4);
+          const month = dateStr.substring(4, 6);
+          const day = dateStr.substring(6, 8);
           
           // Check if time is included (contains 'T')
-          if (rawDatetime.includes('T')) {
-            const hour = rawDatetime.substring(9, 11);
-            const minute = rawDatetime.substring(11, 13);
-            const second = rawDatetime.substring(13, 15) || '00';
+          if (dateStr.includes('T')) {
+            const hour = dateStr.substring(9, 11);
+            const minute = dateStr.substring(11, 13);
+            const second = dateStr.substring(13, 15) || '00';
             
-            console.log(`    Extracted: ${year}-${month}-${day} ${hour}:${minute}:${second}`);
-            deadline = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+            if (isUTC) {
+              // Store in ISO format with Z to indicate UTC
+              deadline = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+              console.log(`    Extracted (UTC): ${deadline}`);
+            } else {
+              // Store as plain datetime
+              deadline = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+              console.log(`    Extracted (local): ${deadline}`);
+            }
           } else {
-            // Date only - default to 11:59 PM
+            // Date only - default to 11:59 PM local time
             console.log(`    Date only (no time) - defaulting to 11:59 PM`);
             deadline = `${year}-${month}-${day} 23:59:00`;
           }
