@@ -446,25 +446,12 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     
     for (const event of Object.values(events)) {
       if (event.type === 'VEVENT' && event.summary) {
-        const icsDate = event.start || event.end;
+        const deadline = event.start || event.end;
         
-        if (!icsDate) continue;
-        
-        // Canvas ICS exports dates in user's local timezone
-        // We need to extract the time components AS-IS from the Date object
-        // Important: Use local methods (not UTC) to get the actual time values from ICS
-        const year = icsDate.getFullYear();
-        const month = String(icsDate.getMonth() + 1).padStart(2, '0');
-        const day = String(icsDate.getDate()).padStart(2, '0');
-        const hours = String(icsDate.getHours()).padStart(2, '0');
-        const minutes = String(icsDate.getMinutes()).padStart(2, '0');
-        const seconds = String(icsDate.getSeconds()).padStart(2, '0');
-        
-        const deadline = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-        const deadlineDate = new Date(icsDate);
+        if (!deadline) continue;
         
         // Only include tasks within the next month
-        if (deadlineDate >= today && deadlineDate <= oneMonthFromNow) {
+        if (deadline >= today && deadline <= oneMonthFromNow) {
           try {
             const title = extractTitle(event.summary);
             const taskClass = extractClass(event.summary);
@@ -484,8 +471,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
             console.log(`\n[${processedCount + 1}] Processing: ${event.summary}`);
             console.log(`    Title: ${title}`);
             console.log(`    Class: ${taskClass}`);
-            console.log(`    Deadline from ICS: ${icsDate}`);
-            console.log(`    Formatted deadline: ${deadline}`);
+            console.log(`    Deadline: ${deadline}`);
             console.log(`    Raw URL: ${eventUrl || 'NONE'}`);
             console.log(`    Converted URL: ${url || 'NONE'}`);
             
