@@ -505,7 +505,7 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               class: taskClass,
               description: event.description || '',
               url: url || '', // Use empty string if no URL
-              deadline: deadline.toISOString(), // Store as ISO string to preserve exact moment
+              deadline: deadline, // Already formatted as string
               estimatedTime
             });
             
@@ -668,6 +668,10 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // After sync, mark any incomplete tasks that are past their deadline as deleted
     // This prevents old unfinished tasks from cluttering the task list
     console.log(`\n=== CLEANING UP PAST DUE TASKS ===`);
+    
+    // Define today's date at midnight for comparison
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
