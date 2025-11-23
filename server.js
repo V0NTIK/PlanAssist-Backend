@@ -427,21 +427,21 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     }
 
     console.log('Parsing ICS data manually...');
-    const icsLines = icsData.split('\n');
+    const icsLines = icsData.split(/\r?\n/); // Split on both \n and \r\n
     
-    // Parse events manually (like your Google Apps Script)
+    // Parse events manually - keep original lines WITHOUT trimming
     const eventBlocks = [];
     let currentBlock = null;
     
-    for (const line of icsLines) {
-      const trimmedLine = line.trim();
+    for (let i = 0; i < icsLines.length; i++) {
+      const line = icsLines[i];
       
-      if (trimmedLine === 'BEGIN:VEVENT') {
-        currentBlock = [];
+      if (line.trim() === 'BEGIN:VEVENT') {
+        currentBlock = { startIndex: i, lines: [] };
       } else if (currentBlock) {
-        currentBlock.push(trimmedLine);
+        currentBlock.lines.push(line);
         
-        if (trimmedLine === 'END:VEVENT') {
+        if (line.trim() === 'END:VEVENT') {
           eventBlocks.push(currentBlock);
           currentBlock = null;
         }
@@ -464,42 +464,62 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     let processedCount = 0;
     let skippedCount = 0;
     
-    for (const eventLines of eventBlocks) {
+    for (const eventBlock of eventBlocks) {
+      const eventLines = eventBlock.lines;
+      
       // DEBUG: Show first few lines of this event block
       console.log('\n=== PROCESSING EVENT BLOCK ===');
-      console.log('First 5 lines:', eventLines.slice(0, 5));
+      console.log('First 5 lines:', eventLines.slice(0, 5).map(l => l.trim()));
       
-      // Extract fields from this event block
+      // Extract fields - handle continuation lines (start with space/tab)
       const getField = (fieldName) => {
-        const line = eventLines.find(l => l.startsWith(fieldName + ':') || l.startsWith(fieldName + ';'));
-        if (!line) return null;
+        let result = '';
+        let foundField = false;
         
-        // Handle multiline values (continuation lines start with space)
-        let value = line.substring(line.indexOf(':') + 1).trim();
-        
-        // In ICS, continuation lines start with a space - but we already trimmed them
-        // So we need to collect all lines that might be continuations
-        const fieldIndex = eventLines.indexOf(line);
-        for (let i = fieldIndex + 1; i < eventLines.length; i++) {
-          // Check if original line (before trim) started with space
-          if (icsLines.find(l => l.trim() === eventLines[i] && l.startsWith(' '))) {
-            value += eventLines[i];
-          } else {
+        for (let i = 0; i < eventLines.length; i++) {
+          const line = eventLines[i];
+          
+          // Check if this is the start of our field
+          if (!foundField && (line.startsWith(fieldName + ':') || line.startsWith(fieldName + ';'))) {
+            foundField = true;
+            result = line;
+          }
+          // Check if this is a continuation line (starts with space or tab)
+          else if (foundField && (line.startsWith(' ') || line.startsWith('\t'))) {
+            result += line.substring(1); // Remove the leading space/tab
+          }
+          // If we found the field and this isn't a continuation, we're done
+          else if (foundField) {
             break;
           }
         }
         
-        return value;
+        if (!foundField) return null;
+        
+        // Extract value after the colon
+        const colonIndex = result.indexOf(':');
+        if (colonIndex === -1) return null;
+        
+        return result.substring(colonIndex + 1).trim();
+      };
+      
+      const getDtstartLine = () => {
+        for (const line of eventLines) {
+          if (line.trim().startsWith('DTSTART')) {
+            return line.trim();
+          }
+        }
+        return null;
       };
       
       const summary = getField('SUMMARY');
-      const dtstartLine = eventLines.find(l => l.startsWith('DTSTART'));
+      const dtstartLine = getDtstartLine();
       const url = getField('URL');
       const description = getField('DESCRIPTION') || getField('X-ALT-DESC') || '';
       
       console.log('Extracted SUMMARY:', summary);
       console.log('Extracted DTSTART line:', dtstartLine);
-      console.log('Extracted URL:', url ? url.substring(0, 50) + '...' : 'NONE');
+      console.log('Extracted URL:', url ? url.substring(0, 80) + '...' : 'NONE');
       
       if (!summary || !dtstartLine) {
         console.log('❌ Skipping - missing summary or dtstart');
