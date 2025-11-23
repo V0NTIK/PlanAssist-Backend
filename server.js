@@ -454,131 +454,68 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         
         if (!parsedDate) continue;
         
-        // Extract raw datetime from ICS - find the DTSTART line for this event
-        // ICS format: DTSTART:20251122T235900 or DTSTART;VALUE=DATE:20251122
-        let rawDatetime = null;
+        // Extract deadline date and time from ICS (new simplified approach)
         const uid = event.uid;
+        let deadlineDate = null;
+        let deadlineTime = null;
         
-        // Find this event's block in the raw ICS
+        // Find DTSTART line between BEGIN:VEVENT and END:VEVENT for this UID
         let inThisEvent = false;
-        let allDtstarts = []; // Collect all DTSTART lines for this event
         
         for (const line of icsLines) {
           if (line.includes(`UID:${uid}`)) {
             inThisEvent = true;
           }
+          
           if (inThisEvent && line.startsWith('DTSTART')) {
-            allDtstarts.push(line.trim());
+            console.log(`    Found DTSTART: ${line.trim()}`);
+            
+            // Check if it's date-only format: DTSTART;VALUE=DATE:20251212
+            if (line.includes('VALUE=DATE')) {
+              const match = line.match(/DTSTART[^:]*:(\d{8})/);
+              if (match) {
+                const dateStr = match[1]; // e.g., "20251212"
+                const year = dateStr.substring(0, 4);
+                const month = dateStr.substring(4, 6);
+                const day = dateStr.substring(6, 8);
+                
+                deadlineDate = `${year}-${month}-${day}`;
+                deadlineTime = null;
+                console.log(`    Date-only: deadline_date=${deadlineDate}, deadline_time=null`);
+                break;
+              }
+            } 
+            // Check if it's datetime format: DTSTART:20251212T105900Z
+            else {
+              const match = line.match(/DTSTART[^:]*:(\d{8})T(\d{6})Z?/);
+              if (match) {
+                const dateStr = match[1]; // e.g., "20251212"
+                const timeStr = match[2]; // e.g., "105900"
+                
+                const year = dateStr.substring(0, 4);
+                const month = dateStr.substring(4, 6);
+                const day = dateStr.substring(6, 8);
+                
+                const hour = timeStr.substring(0, 2);
+                const minute = timeStr.substring(2, 4);
+                const second = timeStr.substring(4, 6);
+                
+                deadlineDate = `${year}-${month}-${day}`;
+                deadlineTime = `${hour}:${minute}:${second}`;
+                console.log(`    Datetime: deadline_date=${deadlineDate}, deadline_time=${deadlineTime} (UTC)`);
+                break;
+              }
+            }
           }
+          
           if (inThisEvent && line.startsWith('END:VEVENT')) {
             break;
           }
         }
         
-        console.log(`    Found ${allDtstarts.length} DTSTART line(s) for this event`);
-        
-        // Process all DTSTART lines, preferring datetime formats over date-only
-        for (const line of allDtstarts) {
-          // Skip date-only formats if we already have a datetime
-          if (line.includes('VALUE=DATE')) {
-            console.log(`    Skipping date-only format: ${line}`);
-            if (!rawDatetime) {
-              // Only use date-only if we have nothing else
-              console.log(`      (but will use as fallback if no datetime found)`);
-            }
-            continue;
-          }
-          
-          console.log(`    Processing datetime line: ${line}`);
-          console.log(`    DEBUG: Line bytes (first 50):`, line.substring(0, 50).split('').map(c => c.charCodeAt(0).toString(16)).join(' '));
-          
-          // First try to match full datetime with time
-          let match = line.match(/DTSTART[^:]*:(\d{8}T\d{6})(Z)?/);
-          let matchType = 'datetime';
-          
-          if (!match) {
-            console.log(`    DEBUG: No datetime match`);
-            continue; // Skip this line
-          }
-          
-          if (match) {
-            rawDatetime = match[1]; // e.g., "20251122T235900"
-            const isUTC = match[2] === 'Z'; // Check if Z suffix present
-            console.log(`    DEBUG: Match type: ${matchType}`);
-            console.log(`    DEBUG: Extracted raw: "${rawDatetime}"`);
-            console.log(`    DEBUG: Has T: ${rawDatetime.includes('T')}, isUTC: ${isUTC}`);
-            console.log(`    Extracted raw: ${rawDatetime}${isUTC ? 'Z' : ''}`);
-            
-            // Store whether this is UTC
-            rawDatetime = isUTC ? rawDatetime + 'Z' : rawDatetime;
-            break; // Found a good datetime, stop looking
-          }
-        }
-        
-        // If we didn't find any datetime format, fall back to date-only
-        if (!rawDatetime && allDtstarts.length > 0) {
-          console.log(`    No datetime format found, using date-only as fallback`);
-          for (const line of allDtstarts) {
-            if (line.includes('VALUE=DATE')) {
-              const match = line.match(/DTSTART[^:]*:(\d{8})/);
-              if (match) {
-                rawDatetime = match[1]; // Just the date
-                console.log(`    Using date-only: ${rawDatetime}`);
-                break;
-              }
-            }
-          }
-        }
-        
-        // Parse raw datetime to our format
-        let deadline;
-        if (rawDatetime) {
-          console.log(`    Raw ICS datetime: ${rawDatetime}`);
-          console.log(`    DEBUG: rawDatetime length: ${rawDatetime.length}`);
-          
-          // Check if this is UTC time (has Z suffix)
-          const isUTC = rawDatetime.endsWith('Z');
-          const dateStr = isUTC ? rawDatetime.slice(0, -1) : rawDatetime;
-          
-          console.log(`    DEBUG: dateStr after removing Z: "${dateStr}"`);
-          console.log(`    DEBUG: dateStr length: ${dateStr.length}`);
-          console.log(`    DEBUG: dateStr.includes('T'): ${dateStr.includes('T')}`);
-          
-          // Format can be:
-          // - 20251122T235900Z (datetime UTC)
-          // - 20251122T235900 (datetime local/unspecified)
-          // - 20251122 (date only, no time)
-          const year = dateStr.substring(0, 4);
-          const month = dateStr.substring(4, 6);
-          const day = dateStr.substring(6, 8);
-          
-          // Check if time is included (contains 'T')
-          if (dateStr.includes('T')) {
-            console.log(`    DEBUG: Has time component, extracting...`);
-            const hour = dateStr.substring(9, 11);
-            const minute = dateStr.substring(11, 13);
-            const second = dateStr.substring(13, 15) || '00';
-            
-            console.log(`    DEBUG: hour=${hour}, minute=${minute}, second=${second}`);
-            
-            if (isUTC) {
-              // Store in ISO format with Z to indicate UTC
-              deadline = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
-              console.log(`    Extracted (UTC): ${deadline}`);
-            } else {
-              // Store as plain datetime
-              deadline = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
-              console.log(`    Extracted (local): ${deadline}`);
-            }
-          } else {
-            // Date only - default to 11:59 PM local time
-            console.log(`    DEBUG: No time component (no T found), defaulting to 23:59`);
-            deadline = `${year}-${month}-${day} 23:59:00`;
-          }
-        } else {
-          console.log(`    ⚠️  Could not extract raw datetime, using parsed date`);
-          // Fallback to parsed date if raw extraction failed
-          deadline = parsedDate;
+        if (!deadlineDate) {
+          console.log(`    ⚠️  Could not extract deadline, skipping task`);
+          continue;
         }
         
         if (!parsedDate) continue;
@@ -604,7 +541,8 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
             console.log(`\n[${processedCount + 1}] Processing: ${event.summary}`);
             console.log(`    Title: ${title}`);
             console.log(`    Class: ${taskClass}`);
-            console.log(`    Deadline: ${deadline}`);
+            console.log(`    Deadline Date: ${deadlineDate}`);
+            console.log(`    Deadline Time: ${deadlineTime || 'null (will default to 23:59:00 in local time on frontend)'}`);
             console.log(`    Raw URL: ${eventUrl || 'NONE'}`);
             console.log(`    Converted URL: ${url || 'NONE'}`);
             
@@ -624,7 +562,8 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
               class: taskClass,
               description: event.description || '',
               url: url || '', // Use empty string if no URL
-              deadline: deadline, // Already formatted as string
+              deadlineDate: deadlineDate, // DATE field (YYYY-MM-DD)
+              deadlineTime: deadlineTime, // TIME field (HH:MM:SS) or null
               estimatedTime
             });
             
@@ -669,7 +608,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT * FROM tasks 
        WHERE user_id = $1 AND completed = false AND deleted = false
-       ORDER BY priority_order ASC NULLS LAST, deadline ASC`,
+       ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
     res.json(result.rows || []);
@@ -716,8 +655,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               completed = $4,
               class = $5,
               url = $6,
-              deadline = $7
-             WHERE id = $8 AND user_id = $9`,
+              deadline_date = $7,
+              deadline_time = $8
+             WHERE id = $9 AND user_id = $10`,
             [
               incomingTask.title,
               incomingTask.description || '',
@@ -725,7 +665,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               false, // Always false during sync
               incomingTask.class,
               incomingTask.url,
-              incomingTask.deadline,
+              incomingTask.deadlineDate,
+              incomingTask.deadlineTime,
               existingTask.id,
               req.user.id
             ]
@@ -756,8 +697,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
           `INSERT INTO tasks 
-           (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
            RETURNING *`,
           [
             req.user.id,
@@ -766,7 +707,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.class,
             incomingTask.description || '',
             incomingTask.url,
-            incomingTask.deadline,
+            incomingTask.deadlineDate,
+            incomingTask.deadlineTime,
             incomingTask.estimatedTime,
             null, // No user override yet
             0, // No accumulated time yet
@@ -791,6 +733,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // Define today's date at midnight for comparison
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const todayDateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
@@ -798,16 +741,16 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
        WHERE user_id = $1 
          AND completed = false 
          AND deleted = false 
-         AND deadline < $2
-       RETURNING id, title, deadline`,
-      [req.user.id, today]
+         AND deadline_date < $2
+       RETURNING id, title, deadline_date`,
+      [req.user.id, todayDateStr]
     );
     
     const cleanedUpCount = cleanupResult.rows.length;
     if (cleanedUpCount > 0) {
       console.log(`Marked ${cleanedUpCount} past-due incomplete tasks as deleted:`);
       cleanupResult.rows.forEach(task => {
-        console.log(`  - "${task.title}" (due: ${task.deadline})`);
+        console.log(`  - "${task.title}" (due: ${task.deadline_date})`);
       });
     } else {
       console.log('No past-due tasks to clean up');
@@ -1154,8 +1097,8 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     const task = taskResult.rows[0];
     
     await pool.query(
-      `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline, estimated_time, actual_time, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)`,
+      `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
       [
         task.id,
         req.user.id,
@@ -1163,7 +1106,8 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
         task.class,
         task.description,
         task.url,
-        task.deadline,
+        task.deadline_date,
+        task.deadline_time,
         task.user_estimated_time || task.estimated_time,
         timeSpent
       ]
