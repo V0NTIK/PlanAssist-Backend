@@ -426,12 +426,29 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       });
     }
 
-    console.log('Parsing ICS data...');
-    const events = await ical.async.parseICS(icsData);
-    console.log(`✓ Parsed ${Object.keys(events).length} total events`);
-    
-    // Also keep raw ICS data for extracting exact datetime strings
+    console.log('Parsing ICS data manually...');
     const icsLines = icsData.split('\n');
+    
+    // Parse events manually (like your Google Apps Script)
+    const eventBlocks = [];
+    let currentBlock = null;
+    
+    for (const line of icsLines) {
+      const trimmedLine = line.trim();
+      
+      if (trimmedLine === 'BEGIN:VEVENT') {
+        currentBlock = [];
+      } else if (currentBlock) {
+        currentBlock.push(trimmedLine);
+        
+        if (trimmedLine === 'END:VEVENT') {
+          eventBlocks.push(currentBlock);
+          currentBlock = null;
+        }
+      }
+    }
+    
+    console.log(`✓ Parsed ${eventBlocks.length} event blocks from ICS`);
     
     const tasks = [];
     
@@ -447,157 +464,135 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     let processedCount = 0;
     let skippedCount = 0;
     
-    for (const event of Object.values(events)) {
-      if (event.type === 'VEVENT' && event.summary) {
-        // Get parsed date for comparison
-        const parsedDate = event.start || event.end;
+    for (const eventLines of eventBlocks) {
+      // Extract fields from this event block
+      const getField = (fieldName) => {
+        const line = eventLines.find(l => l.startsWith(fieldName + ':') || l.startsWith(fieldName + ';'));
+        if (!line) return null;
         
-        if (!parsedDate) continue;
+        // Handle multiline values (continuation lines start with space)
+        let value = line.substring(line.indexOf(':') + 1).trim();
         
-        // Extract deadline date and time from ICS (IMPROVED - parse by event blocks)
-        const uid = event.uid;
-        let deadlineDate = null;
-        let deadlineTime = null;
-        
-        // Build a map of UID -> DTSTART by parsing event blocks
-        const eventBlocks = [];
-        let currentBlock = null;
-        
-        for (const line of icsLines) {
-          const trimmedLine = line.trim();
-          
-          if (trimmedLine === 'BEGIN:VEVENT') {
-            currentBlock = { lines: [] };
-          } else if (currentBlock) {
-            currentBlock.lines.push(trimmedLine);
-            
-            if (trimmedLine === 'END:VEVENT') {
-              eventBlocks.push(currentBlock);
-              currentBlock = null;
-            }
-          }
-        }
-        
-        // Find the event block that matches this UID
-        let matchingBlock = null;
-        for (const block of eventBlocks) {
-          const uidLine = block.lines.find(l => l.startsWith('UID:'));
-          if (uidLine && uidLine === `UID:${uid}`) {
-            matchingBlock = block;
+        // In ICS, continuation lines start with a space - but we already trimmed them
+        // So we need to collect all lines that might be continuations
+        const fieldIndex = eventLines.indexOf(line);
+        for (let i = fieldIndex + 1; i < eventLines.length; i++) {
+          // Check if original line (before trim) started with space
+          if (icsLines.find(l => l.trim() === eventLines[i] && l.startsWith(' '))) {
+            value += eventLines[i];
+          } else {
             break;
           }
         }
         
-        if (!matchingBlock) {
-          console.log(`    ⚠️  Could not find event block for UID: ${uid}`);
-          continue;
+        return value;
+      };
+      
+      const summary = getField('SUMMARY');
+      const dtstartLine = eventLines.find(l => l.startsWith('DTSTART'));
+      const url = getField('URL');
+      const description = getField('DESCRIPTION') || getField('X-ALT-DESC') || '';
+      
+      if (!summary || !dtstartLine) {
+        skippedCount++;
+        continue;
+      }
+      
+      console.log(`\n[${processedCount + 1}] Processing: ${summary}`);
+      console.log(`    Raw DTSTART line: ${dtstartLine}`);
+      
+      // Parse DTSTART
+      let deadlineDate = null;
+      let deadlineTime = null;
+      
+      // Check if it's date-only format: DTSTART;VALUE=DATE:20251124
+      if (dtstartLine.includes('VALUE=DATE')) {
+        const match = dtstartLine.match(/:(\d{8})/);
+        if (match) {
+          const dateStr = match[1]; // e.g., "20251124"
+          const year = dateStr.substring(0, 4);
+          const month = dateStr.substring(4, 6);
+          const day = dateStr.substring(6, 8);
+          
+          deadlineDate = `${year}-${month}-${day}`;
+          deadlineTime = null;
+          console.log(`    ✓ Parsed as date-only: ${deadlineDate}`);
         }
-        
-        // Extract DTSTART from the matching block
-        const dtstartLine = matchingBlock.lines.find(l => l.startsWith('DTSTART'));
-        
-        if (!dtstartLine) {
-          console.log(`    ⚠️  No DTSTART found in event block for UID: ${uid}`);
-          continue;
+      } 
+      // Check if it's datetime format: DTSTART:20251124T105900Z
+      else {
+        const match = dtstartLine.match(/:(\d{8})T(\d{6})Z?/);
+        if (match) {
+          const dateStr = match[1]; // e.g., "20251124"
+          const timeStr = match[2]; // e.g., "105900"
+          
+          const year = dateStr.substring(0, 4);
+          const month = dateStr.substring(4, 6);
+          const day = dateStr.substring(6, 8);
+          
+          const hour = timeStr.substring(0, 2);
+          const minute = timeStr.substring(2, 4);
+          const second = timeStr.substring(4, 6);
+          
+          deadlineDate = `${year}-${month}-${day}`;
+          deadlineTime = `${hour}:${minute}:${second}`;
+          console.log(`    ✓ Parsed as datetime: ${deadlineDate}T${deadlineTime}Z`);
         }
-        
-        console.log(`    Found DTSTART: ${dtstartLine}`);
-        
-        // Check if it's date-only format: DTSTART;VALUE=DATE:20251212
-        if (dtstartLine.includes('VALUE=DATE')) {
-          const match = dtstartLine.match(/DTSTART[^:]*:(\d{8})/);
-          if (match) {
-            const dateStr = match[1]; // e.g., "20251212"
-            const year = dateStr.substring(0, 4);
-            const month = dateStr.substring(4, 6);
-            const day = dateStr.substring(6, 8);
-            
-            deadlineDate = `${year}-${month}-${day}`;
-            deadlineTime = null;
-            console.log(`    Date-only: deadline_date=${deadlineDate}, deadline_time=null`);
-          }
-        } 
-        // Check if it's datetime format: DTSTART:20251212T105900Z
-        else {
-          const match = dtstartLine.match(/DTSTART[^:]*:(\d{8})T(\d{6})Z?/);
-          if (match) {
-            const dateStr = match[1]; // e.g., "20251212"
-            const timeStr = match[2]; // e.g., "105900"
-            
-            const year = dateStr.substring(0, 4);
-            const month = dateStr.substring(4, 6);
-            const day = dateStr.substring(6, 8);
-            
-            const hour = timeStr.substring(0, 2);
-            const minute = timeStr.substring(2, 4);
-            const second = timeStr.substring(4, 6);
-            
-            deadlineDate = `${year}-${month}-${day}`;
-            deadlineTime = `${hour}:${minute}:${second}`;
-            console.log(`    Datetime: deadline_date=${deadlineDate}, deadline_time=${deadlineTime} (UTC)`);
-          }
-        }
-        
-        if (!deadlineDate) {
-          console.log(`    ⚠️  Could not parse deadline from DTSTART: ${dtstartLine}`);
-          continue;
-        }
-        
-        if (!parsedDate) continue;
-        
-        // Only include tasks within the next month
-        if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
-          try {
-            const title = extractTitle(event.summary);
-            const taskClass = extractClass(event.summary);
-            
-            // Handle URL - ICS might have it in different formats
-            let eventUrl = '';
-            if (event.url) {
-              if (typeof event.url === 'string') {
-                eventUrl = event.url;
-              } else if (event.url.val) {
-                eventUrl = event.url.val; // Some ICS parsers wrap URL in an object
-              }
-            }
-            
-            const url = convertToAssignmentUrl(eventUrl);
-            
-            console.log(`\n[${processedCount + 1}] Processing: ${event.summary}`);
-            console.log(`    Title: ${title}`);
-            console.log(`    Class: ${taskClass}`);
-            console.log(`    Deadline Date: ${deadlineDate}`);
-            console.log(`    Deadline Time: ${deadlineTime || 'null (will default to 23:59:00 in local time on frontend)'}`);
-            console.log(`    Raw URL: ${eventUrl || 'NONE'}`);
-            console.log(`    Converted URL: ${url || 'NONE'}`);
-            
-            // Skip tasks without valid URLs (except Homeroom which we allow)
-            if (!url && !taskClass.includes('Homeroom')) {
-              console.log('    ⚠️  Skipping - no valid URL');
-              skippedCount++;
-              continue;
-            }
-            
-            // Calculate AI estimate
-            const estimatedTime = await estimateTaskTime({ title, class: taskClass, url }, req.user.id);
-            
-            tasks.push({
-              title,
-              segment: null, // Base tasks start with no segment
-              class: taskClass,
-              description: event.description || '',
-              url: url || '', // Use empty string if no URL
-              deadlineDate: deadlineDate, // DATE field (YYYY-MM-DD)
-              deadlineTime: deadlineTime, // TIME field (HH:MM:SS) or null
-              estimatedTime
-            });
-            
-            processedCount++;
-          } catch (eventError) {
-            console.error(`    ❌ Error processing event:`, eventError.message);
+      }
+      
+      if (!deadlineDate) {
+        console.log(`    ⚠️  Could not parse DTSTART: ${dtstartLine}`);
+        skippedCount++;
+        continue;
+      }
+      
+      // Create a Date object for filtering (use parsed date for comparison)
+      const parsedDate = deadlineTime 
+        ? new Date(`${deadlineDate}T${deadlineTime}Z`)
+        : new Date(`${deadlineDate}T00:00:00Z`);
+      
+      // Only include tasks within the next month
+      if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
+        try {
+          const title = extractTitle(summary);
+          const taskClass = extractClass(summary);
+          
+          // Convert URL
+          const convertedUrl = convertToAssignmentUrl(url || '');
+          
+          console.log(`    Title: ${title}`);
+          console.log(`    Class: ${taskClass}`);
+          console.log(`    Raw URL: ${url || 'NONE'}`);
+          console.log(`    Converted URL: ${convertedUrl || 'NONE'}`);
+          
+          // Skip tasks without valid URLs (except Homeroom which we allow)
+          if (!convertedUrl && !taskClass.includes('Homeroom')) {
+            console.log('    ⚠️  Skipping - no valid URL');
             skippedCount++;
+            continue;
           }
+          
+          // Calculate AI estimate
+          const estimatedTime = await estimateTaskTime({ title, class: taskClass, url: convertedUrl }, req.user.id);
+          
+          tasks.push({
+            title,
+            segment: null, // Base tasks start with no segment
+            class: taskClass,
+            description: description || '',
+            url: convertedUrl || '', // Use empty string if no URL
+            deadlineDate: deadlineDate, // DATE field (YYYY-MM-DD)
+            deadlineTime: deadlineTime, // TIME field (HH:MM:SS) or null
+            estimatedTime
+          });
+          
+          processedCount++;
+        } catch (eventError) {
+          console.error(`    ❌ Error processing event:`, eventError.message);
+          skippedCount++;
         }
+      } else {
+        skippedCount++;
       }
     }
 
