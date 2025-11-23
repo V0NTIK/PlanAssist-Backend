@@ -340,7 +340,7 @@ SET
     WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
       CASE 
         -- If it's not 23:59:00 (our default), keep the time
-        WHEN TIME(deadline) != '23:59:00'::time THEN TIME(deadline)
+        WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
         -- If it is 23:59:00, set to NULL (was likely a date-only assignment)
         ELSE NULL
       END
@@ -373,7 +373,7 @@ SET
   deadline_time = CASE 
     WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
       CASE 
-        WHEN TIME(deadline) != '23:59:00'::time THEN TIME(deadline)
+        WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
         ELSE NULL
       END
     ELSE NULL
