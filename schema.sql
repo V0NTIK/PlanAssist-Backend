@@ -315,3 +315,88 @@ COMMENT ON COLUMN users.show_in_feed IS 'User preference: show completions in pu
 SELECT 'Completion Feed Table Created' as status;
 SELECT 'Weekly Leaderboard Table Created' as status;
 SELECT 'Users table updated with show_in_feed column' as status;
+
+
+
+
+
+-- Migration: Split deadline into deadline_date and deadline_time
+-- This allows proper handling of date-only vs datetime assignments from Canvas
+
+-- Step 1: Add new columns
+ALTER TABLE tasks 
+ADD COLUMN IF NOT EXISTS deadline_date DATE,
+ADD COLUMN IF NOT EXISTS deadline_time TIME;
+
+-- Step 2: Migrate existing data (if any exists)
+-- Parse existing deadline column into date and time components
+UPDATE tasks
+SET 
+  deadline_date = CASE 
+    WHEN deadline IS NOT NULL THEN DATE(deadline)
+    ELSE NULL
+  END,
+  deadline_time = CASE 
+    WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
+      CASE 
+        -- If it's not 23:59:00 (our default), keep the time
+        WHEN TIME(deadline) != '23:59:00'::time THEN TIME(deadline)
+        -- If it is 23:59:00, set to NULL (was likely a date-only assignment)
+        ELSE NULL
+      END
+    ELSE NULL
+  END
+WHERE deadline IS NOT NULL;
+
+-- Step 3: Drop old deadline column
+ALTER TABLE tasks DROP COLUMN IF EXISTS deadline;
+
+-- Step 4: Add constraints
+ALTER TABLE tasks ALTER COLUMN deadline_date SET NOT NULL;
+-- deadline_time can be NULL (for date-only assignments)
+
+-- Step 5: Update indexes
+DROP INDEX IF EXISTS idx_tasks_deadline;
+CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date ON tasks(deadline_date);
+
+-- Step 6: Do the same for tasks_completed table
+ALTER TABLE tasks_completed 
+ADD COLUMN IF NOT EXISTS deadline_date DATE,
+ADD COLUMN IF NOT EXISTS deadline_time TIME;
+
+UPDATE tasks_completed
+SET 
+  deadline_date = CASE 
+    WHEN deadline IS NOT NULL THEN DATE(deadline)
+    ELSE NULL
+  END,
+  deadline_time = CASE 
+    WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
+      CASE 
+        WHEN TIME(deadline) != '23:59:00'::time THEN TIME(deadline)
+        ELSE NULL
+      END
+    ELSE NULL
+  END
+WHERE deadline IS NOT NULL;
+
+ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
+ALTER TABLE tasks_completed ALTER COLUMN deadline_date SET NOT NULL;
+
+DROP INDEX IF EXISTS idx_tasks_completed_deadline;
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_deadline_date ON tasks_completed(deadline_date);
+
+-- Verification
+SELECT 
+  'Tasks table migration complete' as status,
+  COUNT(*) as total_tasks,
+  COUNT(deadline_time) as tasks_with_time,
+  COUNT(*) - COUNT(deadline_time) as tasks_date_only
+FROM tasks;
+
+SELECT 
+  'Tasks completed table migration complete' as status,
+  COUNT(*) as total_tasks,
+  COUNT(deadline_time) as tasks_with_time,
+  COUNT(*) - COUNT(deadline_time) as tasks_date_only
+FROM tasks_completed;
