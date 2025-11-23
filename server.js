@@ -464,6 +464,23 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         // Get DTSTART - this is the key part that ical.js handles correctly
         const dtstart = vevent.getFirstPropertyValue('dtstart');
         
+        // DEBUG: For Homeroom tasks, show extra details
+        const isHomeroom = summary.includes('Homeroom');
+        if (isHomeroom) {
+          console.log('    🔍 HOMEROOM TASK - Extra debugging:');
+          const dtstartProp = vevent.getFirstProperty('dtstart');
+          if (dtstartProp) {
+            console.log('    Raw DTSTART property:', dtstartProp.toICALString());
+            console.log('    DTSTART type:', dtstartProp.type);
+            console.log('    DTSTART params:', dtstartProp.getParameter('value'));
+          }
+          console.log('    dtstart object:', dtstart);
+          console.log('    dtstart.isDate:', dtstart ? dtstart.isDate : 'N/A');
+          if (dtstart && !dtstart.isDate) {
+            console.log('    dtstart.toJSDate():', dtstart.toJSDate());
+          }
+        }
+        
         if (!dtstart) {
           console.log('    ⚠️  No DTSTART found');
           skippedCount++;
