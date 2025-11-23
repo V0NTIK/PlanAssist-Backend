@@ -465,6 +465,10 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     let skippedCount = 0;
     
     for (const eventLines of eventBlocks) {
+      // DEBUG: Show first few lines of this event block
+      console.log('\n=== PROCESSING EVENT BLOCK ===');
+      console.log('First 5 lines:', eventLines.slice(0, 5));
+      
       // Extract fields from this event block
       const getField = (fieldName) => {
         const line = eventLines.find(l => l.startsWith(fieldName + ':') || l.startsWith(fieldName + ';'));
@@ -493,7 +497,12 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       const url = getField('URL');
       const description = getField('DESCRIPTION') || getField('X-ALT-DESC') || '';
       
+      console.log('Extracted SUMMARY:', summary);
+      console.log('Extracted DTSTART line:', dtstartLine);
+      console.log('Extracted URL:', url ? url.substring(0, 50) + '...' : 'NONE');
+      
       if (!summary || !dtstartLine) {
+        console.log('❌ Skipping - missing summary or dtstart');
         skippedCount++;
         continue;
       }
