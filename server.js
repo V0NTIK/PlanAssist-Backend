@@ -454,67 +454,92 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         
         if (!parsedDate) continue;
         
-        // Extract deadline date and time from ICS (new simplified approach)
+        // Extract deadline date and time from ICS (IMPROVED - parse by event blocks)
         const uid = event.uid;
         let deadlineDate = null;
         let deadlineTime = null;
         
-        // Find DTSTART line between BEGIN:VEVENT and END:VEVENT for this UID
-        let inThisEvent = false;
+        // Build a map of UID -> DTSTART by parsing event blocks
+        const eventBlocks = [];
+        let currentBlock = null;
         
         for (const line of icsLines) {
-          if (line.includes(`UID:${uid}`)) {
-            inThisEvent = true;
-          }
+          const trimmedLine = line.trim();
           
-          if (inThisEvent && line.startsWith('DTSTART')) {
-            console.log(`    Found DTSTART: ${line.trim()}`);
+          if (trimmedLine === 'BEGIN:VEVENT') {
+            currentBlock = { lines: [] };
+          } else if (currentBlock) {
+            currentBlock.lines.push(trimmedLine);
             
-            // Check if it's date-only format: DTSTART;VALUE=DATE:20251212
-            if (line.includes('VALUE=DATE')) {
-              const match = line.match(/DTSTART[^:]*:(\d{8})/);
-              if (match) {
-                const dateStr = match[1]; // e.g., "20251212"
-                const year = dateStr.substring(0, 4);
-                const month = dateStr.substring(4, 6);
-                const day = dateStr.substring(6, 8);
-                
-                deadlineDate = `${year}-${month}-${day}`;
-                deadlineTime = null;
-                console.log(`    Date-only: deadline_date=${deadlineDate}, deadline_time=null`);
-                break;
-              }
-            } 
-            // Check if it's datetime format: DTSTART:20251212T105900Z
-            else {
-              const match = line.match(/DTSTART[^:]*:(\d{8})T(\d{6})Z?/);
-              if (match) {
-                const dateStr = match[1]; // e.g., "20251212"
-                const timeStr = match[2]; // e.g., "105900"
-                
-                const year = dateStr.substring(0, 4);
-                const month = dateStr.substring(4, 6);
-                const day = dateStr.substring(6, 8);
-                
-                const hour = timeStr.substring(0, 2);
-                const minute = timeStr.substring(2, 4);
-                const second = timeStr.substring(4, 6);
-                
-                deadlineDate = `${year}-${month}-${day}`;
-                deadlineTime = `${hour}:${minute}:${second}`;
-                console.log(`    Datetime: deadline_date=${deadlineDate}, deadline_time=${deadlineTime} (UTC)`);
-                break;
-              }
+            if (trimmedLine === 'END:VEVENT') {
+              eventBlocks.push(currentBlock);
+              currentBlock = null;
             }
           }
-          
-          if (inThisEvent && line.startsWith('END:VEVENT')) {
+        }
+        
+        // Find the event block that matches this UID
+        let matchingBlock = null;
+        for (const block of eventBlocks) {
+          const uidLine = block.lines.find(l => l.startsWith('UID:'));
+          if (uidLine && uidLine === `UID:${uid}`) {
+            matchingBlock = block;
             break;
           }
         }
         
+        if (!matchingBlock) {
+          console.log(`    ⚠️  Could not find event block for UID: ${uid}`);
+          continue;
+        }
+        
+        // Extract DTSTART from the matching block
+        const dtstartLine = matchingBlock.lines.find(l => l.startsWith('DTSTART'));
+        
+        if (!dtstartLine) {
+          console.log(`    ⚠️  No DTSTART found in event block for UID: ${uid}`);
+          continue;
+        }
+        
+        console.log(`    Found DTSTART: ${dtstartLine}`);
+        
+        // Check if it's date-only format: DTSTART;VALUE=DATE:20251212
+        if (dtstartLine.includes('VALUE=DATE')) {
+          const match = dtstartLine.match(/DTSTART[^:]*:(\d{8})/);
+          if (match) {
+            const dateStr = match[1]; // e.g., "20251212"
+            const year = dateStr.substring(0, 4);
+            const month = dateStr.substring(4, 6);
+            const day = dateStr.substring(6, 8);
+            
+            deadlineDate = `${year}-${month}-${day}`;
+            deadlineTime = null;
+            console.log(`    Date-only: deadline_date=${deadlineDate}, deadline_time=null`);
+          }
+        } 
+        // Check if it's datetime format: DTSTART:20251212T105900Z
+        else {
+          const match = dtstartLine.match(/DTSTART[^:]*:(\d{8})T(\d{6})Z?/);
+          if (match) {
+            const dateStr = match[1]; // e.g., "20251212"
+            const timeStr = match[2]; // e.g., "105900"
+            
+            const year = dateStr.substring(0, 4);
+            const month = dateStr.substring(4, 6);
+            const day = dateStr.substring(6, 8);
+            
+            const hour = timeStr.substring(0, 2);
+            const minute = timeStr.substring(2, 4);
+            const second = timeStr.substring(4, 6);
+            
+            deadlineDate = `${year}-${month}-${day}`;
+            deadlineTime = `${hour}:${minute}:${second}`;
+            console.log(`    Datetime: deadline_date=${deadlineDate}, deadline_time=${deadlineTime} (UTC)`);
+          }
+        }
+        
         if (!deadlineDate) {
-          console.log(`    ⚠️  Could not extract deadline, skipping task`);
+          console.log(`    ⚠️  Could not parse deadline from DTSTART: ${dtstartLine}`);
           continue;
         }
         
