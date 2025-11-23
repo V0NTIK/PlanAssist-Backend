@@ -7,7 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const axios = require('axios');
-const ical = require('node-ical');
+const ICAL = require('ical.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -426,29 +426,14 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
       });
     }
 
-    console.log('Parsing ICS data manually...');
-    const icsLines = icsData.split(/\r?\n/); // Split on both \n and \r\n
+    console.log('Parsing ICS data with ical.js...');
     
-    // Parse events manually - keep original lines WITHOUT trimming
-    const eventBlocks = [];
-    let currentBlock = null;
+    // Parse using ical.js (same as the working viewer)
+    const jcalData = ICAL.parse(icsData);
+    const comp = new ICAL.Component(jcalData);
+    const vevents = comp.getAllSubcomponents('vevent');
     
-    for (let i = 0; i < icsLines.length; i++) {
-      const line = icsLines[i];
-      
-      if (line.trim() === 'BEGIN:VEVENT') {
-        currentBlock = { startIndex: i, lines: [] };
-      } else if (currentBlock) {
-        currentBlock.lines.push(line);
-        
-        if (line.trim() === 'END:VEVENT') {
-          eventBlocks.push(currentBlock);
-          currentBlock = null;
-        }
-      }
-    }
-    
-    console.log(`✓ Parsed ${eventBlocks.length} event blocks from ICS`);
+    console.log(`✓ Parsed ${vevents.length} events from ICS`);
     
     const tasks = [];
     
@@ -464,130 +449,68 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
     let processedCount = 0;
     let skippedCount = 0;
     
-    for (const eventBlock of eventBlocks) {
-      const eventLines = eventBlock.lines;
-      
-      // DEBUG: Show first few lines of this event block
-      console.log('\n=== PROCESSING EVENT BLOCK ===');
-      console.log('First 5 lines:', eventLines.slice(0, 5).map(l => l.trim()));
-      
-      // Extract fields - handle continuation lines (start with space/tab)
-      const getField = (fieldName) => {
-        let result = '';
-        let foundField = false;
+    for (const vevent of vevents) {
+      try {
+        const event = new ICAL.Event(vevent);
         
-        for (let i = 0; i < eventLines.length; i++) {
-          const line = eventLines[i];
-          
-          // Check if this is the start of our field
-          if (!foundField && (line.startsWith(fieldName + ':') || line.startsWith(fieldName + ';'))) {
-            foundField = true;
-            result = line;
-          }
-          // Check if this is a continuation line (starts with space or tab)
-          else if (foundField && (line.startsWith(' ') || line.startsWith('\t'))) {
-            result += line.substring(1); // Remove the leading space/tab
-          }
-          // If we found the field and this isn't a continuation, we're done
-          else if (foundField) {
-            break;
-          }
+        const summary = event.summary;
+        if (!summary) {
+          skippedCount++;
+          continue;
         }
         
-        if (!foundField) return null;
+        console.log(`\n[${processedCount + 1}] Processing: ${summary}`);
         
-        // Extract value after the colon
-        const colonIndex = result.indexOf(':');
-        if (colonIndex === -1) return null;
+        // Get DTSTART - this is the key part that ical.js handles correctly
+        const dtstart = vevent.getFirstPropertyValue('dtstart');
         
-        return result.substring(colonIndex + 1).trim();
-      };
-      
-      const getDtstartLine = () => {
-        for (const line of eventLines) {
-          if (line.trim().startsWith('DTSTART')) {
-            return line.trim();
-          }
+        if (!dtstart) {
+          console.log('    ⚠️  No DTSTART found');
+          skippedCount++;
+          continue;
         }
-        return null;
-      };
-      
-      const summary = getField('SUMMARY');
-      const dtstartLine = getDtstartLine();
-      const url = getField('URL');
-      const description = getField('DESCRIPTION') || getField('X-ALT-DESC') || '';
-      
-      console.log('Extracted SUMMARY:', summary);
-      console.log('Extracted DTSTART line:', dtstartLine);
-      console.log('Extracted URL:', url ? url.substring(0, 80) + '...' : 'NONE');
-      
-      if (!summary || !dtstartLine) {
-        console.log('❌ Skipping - missing summary or dtstart');
-        skippedCount++;
-        continue;
-      }
-      
-      console.log(`\n[${processedCount + 1}] Processing: ${summary}`);
-      console.log(`    Raw DTSTART line: ${dtstartLine}`);
-      
-      // Parse DTSTART
-      let deadlineDate = null;
-      let deadlineTime = null;
-      
-      // Check if it's date-only format: DTSTART;VALUE=DATE:20251124
-      if (dtstartLine.includes('VALUE=DATE')) {
-        const match = dtstartLine.match(/:(\d{8})/);
-        if (match) {
-          const dateStr = match[1]; // e.g., "20251124"
-          const year = dateStr.substring(0, 4);
-          const month = dateStr.substring(4, 6);
-          const day = dateStr.substring(6, 8);
-          
-          deadlineDate = `${year}-${month}-${day}`;
+        
+        // Check if this is a date-only or datetime
+        let deadlineDate = null;
+        let deadlineTime = null;
+        
+        if (dtstart.isDate) {
+          // Date-only (no time component)
+          deadlineDate = `${dtstart.year}-${String(dtstart.month).padStart(2, '0')}-${String(dtstart.day).padStart(2, '0')}`;
           deadlineTime = null;
-          console.log(`    ✓ Parsed as date-only: ${deadlineDate}`);
-        }
-      } 
-      // Check if it's datetime format: DTSTART:20251124T105900Z
-      else {
-        const match = dtstartLine.match(/:(\d{8})T(\d{6})Z?/);
-        if (match) {
-          const dateStr = match[1]; // e.g., "20251124"
-          const timeStr = match[2]; // e.g., "105900"
+          console.log(`    ✓ Date-only: ${deadlineDate}`);
+        } else {
+          // Has time component
+          const utcTime = dtstart.toJSDate(); // Converts to JavaScript Date in UTC
           
-          const year = dateStr.substring(0, 4);
-          const month = dateStr.substring(4, 6);
-          const day = dateStr.substring(6, 8);
-          
-          const hour = timeStr.substring(0, 2);
-          const minute = timeStr.substring(2, 4);
-          const second = timeStr.substring(4, 6);
+          const year = utcTime.getUTCFullYear();
+          const month = String(utcTime.getUTCMonth() + 1).padStart(2, '0');
+          const day = String(utcTime.getUTCDate()).padStart(2, '0');
+          const hour = String(utcTime.getUTCHours()).padStart(2, '0');
+          const minute = String(utcTime.getUTCMinutes()).padStart(2, '0');
+          const second = String(utcTime.getUTCSeconds()).padStart(2, '0');
           
           deadlineDate = `${year}-${month}-${day}`;
           deadlineTime = `${hour}:${minute}:${second}`;
-          console.log(`    ✓ Parsed as datetime: ${deadlineDate}T${deadlineTime}Z`);
+          console.log(`    ✓ DateTime: ${deadlineDate}T${deadlineTime}Z`);
         }
-      }
-      
-      if (!deadlineDate) {
-        console.log(`    ⚠️  Could not parse DTSTART: ${dtstartLine}`);
-        skippedCount++;
-        continue;
-      }
-      
-      // Create a Date object for filtering (use parsed date for comparison)
-      const parsedDate = deadlineTime 
-        ? new Date(`${deadlineDate}T${deadlineTime}Z`)
-        : new Date(`${deadlineDate}T00:00:00Z`);
-      
-      // Only include tasks within the next month
-      if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
-        try {
+        
+        // Create a Date object for filtering
+        const parsedDate = deadlineTime 
+          ? new Date(`${deadlineDate}T${deadlineTime}Z`)
+          : new Date(`${deadlineDate}T00:00:00Z`);
+        
+        // Only include tasks within the next month
+        if (parsedDate >= today && parsedDate <= oneMonthFromNow) {
           const title = extractTitle(summary);
           const taskClass = extractClass(summary);
           
+          // Extract URL and description using ical.js
+          const url = vevent.getFirstPropertyValue('url') || '';
+          const description = vevent.getFirstPropertyValue('description') || '';
+          
           // Convert URL
-          const convertedUrl = convertToAssignmentUrl(url || '');
+          const convertedUrl = convertToAssignmentUrl(url);
           
           console.log(`    Title: ${title}`);
           console.log(`    Class: ${taskClass}`);
@@ -616,11 +539,11 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
           });
           
           processedCount++;
-        } catch (eventError) {
-          console.error(`    ❌ Error processing event:`, eventError.message);
+        } else {
           skippedCount++;
         }
-      } else {
+      } catch (eventError) {
+        console.error(`    ❌ Error processing event:`, eventError.message);
         skippedCount++;
       }
     }
