@@ -463,21 +463,28 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
         
         // Get DTSTART - this is the key part that ical.js handles correctly
         const dtstart = vevent.getFirstPropertyValue('dtstart');
+        const dtend = vevent.getFirstPropertyValue('dtend');
         
         // DEBUG: For Homeroom tasks, show extra details
         const isHomeroom = summary.includes('Homeroom');
         if (isHomeroom) {
           console.log('    🔍 HOMEROOM TASK - Extra debugging:');
           const dtstartProp = vevent.getFirstProperty('dtstart');
+          const dtendProp = vevent.getFirstProperty('dtend');
+          
           if (dtstartProp) {
             console.log('    Raw DTSTART property:', dtstartProp.toICALString());
             console.log('    DTSTART type:', dtstartProp.type);
-            console.log('    DTSTART params:', dtstartProp.getParameter('value'));
+            console.log('    DTSTART isDate:', dtstart ? dtstart.isDate : 'N/A');
           }
-          console.log('    dtstart object:', dtstart);
-          console.log('    dtstart.isDate:', dtstart ? dtstart.isDate : 'N/A');
-          if (dtstart && !dtstart.isDate) {
-            console.log('    dtstart.toJSDate():', dtstart.toJSDate());
+          
+          if (dtendProp) {
+            console.log('    Raw DTEND property:', dtendProp.toICALString());
+            console.log('    DTEND type:', dtendProp.type);
+            console.log('    DTEND isDate:', dtend ? dtend.isDate : 'N/A');
+            if (dtend && !dtend.isDate) {
+              console.log('    DTEND has time! Using DTEND instead of DTSTART');
+            }
           }
         }
         
@@ -487,18 +494,25 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
           continue;
         }
         
+        // Use DTEND if DTSTART is date-only but DTEND has time (Canvas quiz behavior)
+        let effectiveDtstart = dtstart;
+        if (dtstart.isDate && dtend && !dtend.isDate) {
+          console.log('    ℹ️  Using DTEND instead of DTSTART (quiz due time)');
+          effectiveDtstart = dtend;
+        }
+        
         // Check if this is a date-only or datetime
         let deadlineDate = null;
         let deadlineTime = null;
         
-        if (dtstart.isDate) {
+        if (effectiveDtstart.isDate) {
           // Date-only (no time component)
-          deadlineDate = `${dtstart.year}-${String(dtstart.month).padStart(2, '0')}-${String(dtstart.day).padStart(2, '0')}`;
+          deadlineDate = `${effectiveDtstart.year}-${String(effectiveDtstart.month).padStart(2, '0')}-${String(effectiveDtstart.day).padStart(2, '0')}`;
           deadlineTime = null;
           console.log(`    ✓ Date-only: ${deadlineDate}`);
         } else {
           // Has time component
-          const utcTime = dtstart.toJSDate(); // Converts to JavaScript Date in UTC
+          const utcTime = effectiveDtstart.toJSDate(); // Converts to JavaScript Date in UTC
           
           const year = utcTime.getUTCFullYear();
           const month = String(utcTime.getUTCMonth() + 1).padStart(2, '0');
