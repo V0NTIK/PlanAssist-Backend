@@ -32,8 +32,17 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-key';
+// JWT Secret - ENFORCE in production
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('❌ FATAL ERROR: JWT_SECRET environment variable is required in production');
+    process.exit(1);
+  } else {
+    console.warn('⚠️  WARNING: Using default JWT_SECRET for development. Set JWT_SECRET env variable for production!');
+    JWT_SECRET = 'dev-only-insecure-secret-change-for-production';
+  }
+}
 
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
@@ -812,8 +821,8 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
       
       const result = await pool.query(
         `INSERT INTO tasks 
-         (user_id, title, segment, class, description, url, deadline, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING *`,
         [
           req.user.id,
@@ -822,7 +831,8 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
           originalTask.class,
           originalTask.description,
           originalTask.url,
-          originalTask.deadline,
+          originalTask.deadline_date,
+          originalTask.deadline_time,
           Math.floor(originalTask.estimated_time / segments.length), // Divide estimate
           originalTask.user_estimated_time ? Math.floor(originalTask.user_estimated_time / segments.length) : null,
           0, // Reset accumulated time
@@ -939,6 +949,41 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Complete task error:', error);
     res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Uncomplete task - Restore a deleted task
+app.patch('/api/tasks/:id/uncomplete', authenticateToken, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+
+    // Verify task exists
+    const taskResult = await pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    // Restore task by unmarking deleted and restoring to end of priority list
+    // Get max priority for appending
+    const maxPriorityResult = await pool.query(
+      'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
+      [req.user.id]
+    );
+    const nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
+
+    await pool.query(
+      'UPDATE tasks SET deleted = false, priority_order = $1 WHERE id = $2 AND user_id = $3',
+      [nextPriority, taskId, req.user.id]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Uncomplete task error:', error);
+    res.status(500).json({ error: 'Failed to uncomplete task' });
   }
 });
 
