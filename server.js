@@ -15,6 +15,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors({
   origin: [
+    'https://planassist.onrender.com',
     'https://planassist.vercel.app',
     'http://localhost:3000',
     'http://localhost:5173'
