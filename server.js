@@ -183,100 +183,352 @@ const convertToAssignmentUrl = (calendarUrl) => {
 };
 
 // ============================================================================
-// NEW AI TASK TIME ESTIMATION ALGORITHM
+// ADVANCED MULTI-TIER TIME ESTIMATION ALGORITHM
 // ============================================================================
 
+// Helper: Extract teacher name from class string
+const extractTeacherName = (className) => {
+  // Try to extract from formats like "TAiLOR English", "[ENG-11-SMITH]", "Math - JONES"
+  const patterns = [
+    /([A-Z][A-Za-z]+)\s+[A-Z]/,  // "TAiLOR English" → "TAiLOR"
+    /\[[\w-]+-([A-Z]+)\]/,        // "[ENG-11-SMITH]" → "SMITH"
+    /-\s*([A-Z][A-Za-z]+)$/       // "Math - JONES" → "JONES"
+  ];
+  
+  for (const pattern of patterns) {
+    const match = className.match(pattern);
+    if (match && match[1] && match[1].length >= 3) {
+      return match[1].toUpperCase();
+    }
+  }
+  
+  // Fallback: return first capitalized word that's not a common subject
+  const commonSubjects = ['MATH', 'ENGLISH', 'SCIENCE', 'HISTORY', 'SPANISH', 'FRENCH'];
+  const words = className.split(/[\s\[\]-]+/).filter(w => w.length > 2);
+  for (const word of words) {
+    const upper = word.toUpperCase();
+    if (upper === upper && !commonSubjects.includes(upper)) {
+      return upper;
+    }
+  }
+  
+  return null;
+};
+
+// Helper: Calculate linear regression for point-to-time correlation
+const calculatePointTimeCorrelation = (dataPoints) => {
+  // dataPoints: [{ points, time }, ...]
+  if (dataPoints.length < 5) return null;
+  
+  const n = dataPoints.length;
+  const sumPoints = dataPoints.reduce((sum, d) => sum + d.points, 0);
+  const sumTime = dataPoints.reduce((sum, d) => sum + d.time, 0);
+  const sumPointsTime = dataPoints.reduce((sum, d) => sum + (d.points * d.time), 0);
+  const sumPointsSquared = dataPoints.reduce((sum, d) => sum + (d.points * d.points), 0);
+  
+  // Calculate slope (m) and intercept (b)
+  const m = (n * sumPointsTime - sumPoints * sumTime) / (n * sumPointsSquared - sumPoints * sumPoints);
+  const b = (sumTime - m * sumPoints) / n;
+  
+  // Calculate R-squared
+  const meanTime = sumTime / n;
+  const ssTotal = dataPoints.reduce((sum, d) => sum + Math.pow(d.time - meanTime, 2), 0);
+  const ssResidual = dataPoints.reduce((sum, d) => {
+    const predicted = m * d.points + b;
+    return sum + Math.pow(d.time - predicted, 2);
+  }, 0);
+  const rSquared = 1 - (ssResidual / ssTotal);
+  
+  return { m, b, rSquared, n };
+};
+
+// Helper: Calculate user's speed factor
+const calculateUserSpeedFactor = async (userId) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+         AVG(actual_time::float / NULLIF(estimated_time, 0)) as speed_factor
+       FROM tasks_completed
+       WHERE user_id = $1 AND estimated_time > 0
+       HAVING COUNT(*) >= 5`,
+      [userId]
+    );
+    
+    if (result.rows[0] && result.rows[0].speed_factor) {
+      const factor = parseFloat(result.rows[0].speed_factor);
+      // Clamp between 0.5x and 2.0x to prevent extreme values
+      return Math.max(0.5, Math.min(2.0, factor));
+    }
+  } catch (error) {
+    console.error('Error calculating speed factor:', error.message);
+  }
+  
+  return 1.0; // Default: no adjustment
+};
+
+// Helper: Auto-segment tasks over 60 minutes
+const autoSegmentTask = (estimatedTime) => {
+  if (estimatedTime <= 60) return null;
+  
+  // Calculate number of segments needed
+  const segmentsNeeded = Math.ceil(estimatedTime / 60);
+  
+  // Divide time evenly
+  const timePerSegment = Math.floor(estimatedTime / segmentsNeeded);
+  const remainder = estimatedTime % segmentsNeeded;
+  
+  // Create segments
+  const segments = [];
+  for (let i = 1; i <= segmentsNeeded; i++) {
+    segments.push({
+      name: `Session ${i}`,
+      estimatedTime: timePerSegment + (i <= remainder ? 1 : 0)
+    });
+  }
+  
+  return segments;
+};
+
+// Main estimation function
 const estimateTaskTime = async (task, userId) => {
-  const { title, class: taskClass, url } = task;
+  const { 
+    title, 
+    class: taskClass, 
+    url, 
+    assignmentId,
+    pointsPossible, 
+    assignmentGroupId, 
+    gradingType,
+    description 
+  } = task;
   
   console.log(`\n=== ESTIMATING TIME FOR: "${title}" ===`);
   console.log(`Class: ${taskClass}`);
-  console.log(`URL: ${url}`);
+  console.log(`Points: ${pointsPossible || 'N/A'}`);
+  console.log(`Grading Type: ${gradingType || 'N/A'}`);
   
-  // STEP 1: Check for Homeroom tasks
-  if (taskClass.includes('Homeroom')) {
-    console.log('✓ STEP 1: Homeroom task detected → 0 minutes');
-    return 0;
-  }
-  console.log('✗ STEP 1: Not a Homeroom task');
+  let estimate = null;
+  let confidence = 'BASELINE';
+  let source = 'Default';
   
-  // STEP 2: Check for 3+ completions of this exact URL (global)
-  try {
-    const globalResult = await pool.query(
-      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
-       FROM tasks_completed 
-       WHERE url = $1`,
-      [url]
-    );
-    
-    if (globalResult.rows[0] && globalResult.rows[0].count >= 3) {
-      const estimate = globalResult.rows[0].avg_time;
-      console.log(`✓ STEP 2: Found ${globalResult.rows[0].count} global completions → ${estimate} minutes`);
-      return estimate;
-    }
-    console.log(`✗ STEP 2: Only ${globalResult.rows[0]?.count || 0} global completions (need 3+)`);
-  } catch (error) {
-    console.error('Error in Step 2:', error.message);
-  }
+  // ========================================================================
+  // TIER 1: PlanAssist Historical Analysis
+  // ========================================================================
   
-  // STEP 3: Check for 2+ completions with matching title prefix (user-specific + same class)
-  try {
-    // Extract first 50% of words from title (round up)
-    const words = title.split(' ');
-    const halfWords = Math.ceil(words.length * 0.5);
-    const titlePrefix = words.slice(0, halfWords).join(' ');
-    
-    console.log(`  Title prefix (first 50%): "${titlePrefix}"`);
-    
-    const userResult = await pool.query(
-      `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
-       FROM tasks_completed 
-       WHERE user_id = $1 
-       AND class = $2
-       AND title LIKE $3`,
-      [userId, taskClass, `${titlePrefix}%`]
-    );
-    
-    if (userResult.rows[0] && userResult.rows[0].count >= 2) {
-      const estimate = userResult.rows[0].avg_time;
-      console.log(`✓ STEP 3: Found ${userResult.rows[0].count} user completions with matching prefix → ${estimate} minutes`);
-      return estimate;
-    }
-    console.log(`✗ STEP 3: Only ${userResult.rows[0]?.count || 0} user completions (need 2+)`);
-  } catch (error) {
-    console.error('Error in Step 3:', error.message);
-  }
-  
-  // STEP 4: Check for major project keywords
-  const projectKeywords = ['Project', 'Essay', 'Lab', 'Exam', 'Test', 'Assessment', 'Summative'];
-  for (const keyword of projectKeywords) {
-    if (title.includes(keyword)) {
-      console.log(`✓ STEP 4: Found keyword "${keyword}" → 60 minutes`);
-      return 60;
+  // TIER 1A: Teacher-based point-to-time correlation
+  const teacherName = extractTeacherName(taskClass);
+  if (teacherName && pointsPossible && pointsPossible > 0) {
+    console.log(`\nTIER 1A: Checking teacher-based correlation (${teacherName})...`);
+    try {
+      const teacherData = await pool.query(
+        `SELECT tc.actual_time, 
+                COALESCE(t.points_possible, tc.estimated_time * 2) as points
+         FROM tasks_completed tc
+         LEFT JOIN tasks t ON tc.url = t.url
+         WHERE tc.class LIKE $1 
+           AND COALESCE(t.points_possible, tc.estimated_time * 2) > 0`,
+        [`%${teacherName}%`]
+      );
+      
+      if (teacherData.rows.length >= 5) {
+        const dataPoints = teacherData.rows.map(row => ({
+          points: parseFloat(row.points),
+          time: parseInt(row.actual_time)
+        }));
+        
+        const correlation = calculatePointTimeCorrelation(dataPoints);
+        
+        if (correlation && correlation.rSquared > 0.6) {
+          const baseEstimate = Math.round(correlation.m * pointsPossible + correlation.b);
+          const speedFactor = await calculateUserSpeedFactor(userId);
+          estimate = Math.round(baseEstimate * speedFactor);
+          confidence = correlation.rSquared > 0.7 ? 'VERY_HIGH' : 'HIGH';
+          source = `Teacher correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
+          console.log(`✓ TIER 1A SUCCESS: ${estimate} min (${source})`);
+        } else {
+          console.log(`✗ TIER 1A: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
+        }
+      } else {
+        console.log(`✗ TIER 1A: Only ${teacherData.rows.length} data points (need 5+)`);
+      }
+    } catch (error) {
+      console.error('TIER 1A error:', error.message);
     }
   }
-  console.log('✗ STEP 4: No major project keywords found');
   
-  // STEP 5: Check for OSGAccelerate Share tasks
-  if (title.includes('Share') && (taskClass.includes('OSGAccelerate') || taskClass.includes('OSG Accelerate'))) {
-    console.log('✓ STEP 5: OSGAccelerate Share task → 5 minutes');
-    return 5;
-  }
-  console.log('✗ STEP 5: Not an OSGAccelerate Share task');
-  
-  // STEP 6: Check for medium-length task keywords
-  const mediumKeywords = ['Discussion', 'Chapters', 'Gizmos', 'IXL', 'Quiz', 'Worksheet'];
-  for (const keyword of mediumKeywords) {
-    if (title.includes(keyword)) {
-      console.log(`✓ STEP 6: Found keyword "${keyword}" → 30 minutes`);
-      return 30;
+  // TIER 1B: Course-based correlation (if teacher-based failed)
+  if (!estimate && pointsPossible && pointsPossible > 0) {
+    console.log(`\nTIER 1B: Checking course-based correlation...`);
+    try {
+      const courseData = await pool.query(
+        `SELECT tc.actual_time,
+                COALESCE(t.points_possible, tc.estimated_time * 2) as points
+         FROM tasks_completed tc
+         LEFT JOIN tasks t ON tc.url = t.url
+         WHERE tc.class = $1 AND tc.user_id = $2
+           AND COALESCE(t.points_possible, tc.estimated_time * 2) > 0`,
+        [taskClass, userId]
+      );
+      
+      if (courseData.rows.length >= 8) {
+        const dataPoints = courseData.rows.map(row => ({
+          points: parseFloat(row.points),
+          time: parseInt(row.actual_time)
+        }));
+        
+        const correlation = calculatePointTimeCorrelation(dataPoints);
+        
+        if (correlation && correlation.rSquared > 0.5) {
+          const baseEstimate = Math.round(correlation.m * pointsPossible + correlation.b);
+          const speedFactor = await calculateUserSpeedFactor(userId);
+          estimate = Math.round(baseEstimate * speedFactor);
+          confidence = 'HIGH';
+          source = `Course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
+          console.log(`✓ TIER 1B SUCCESS: ${estimate} min (${source})`);
+        } else {
+          console.log(`✗ TIER 1B: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
+        }
+      } else {
+        console.log(`✗ TIER 1B: Only ${courseData.rows.length} data points (need 8+)`);
+      }
+    } catch (error) {
+      console.error('TIER 1B error:', error.message);
     }
   }
-  console.log('✗ STEP 6: No medium-length keywords found');
   
-  // STEP 7: Default estimate
-  console.log('✓ STEP 7: Using default → 20 minutes');
-  return 20;
+  // TIER 1D: Exact assignment average (if others failed)
+  if (!estimate && (url || assignmentId)) {
+    console.log(`\nTIER 1D: Checking exact assignment history...`);
+    try {
+      const exactResult = await pool.query(
+        `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
+         FROM tasks_completed
+         WHERE url = $1`,
+        [url]
+      );
+      
+      if (exactResult.rows[0] && exactResult.rows[0].count >= 3) {
+        const speedFactor = await calculateUserSpeedFactor(userId);
+        estimate = Math.round(exactResult.rows[0].avg_time * speedFactor);
+        confidence = 'HIGH';
+        source = `${exactResult.rows[0].count} completions of this assignment`;
+        console.log(`✓ TIER 1D SUCCESS: ${estimate} min (${source})`);
+      } else if (exactResult.rows[0] && exactResult.rows[0].count >= 1) {
+        console.log(`✗ TIER 1D: Only ${exactResult.rows[0].count} completion(s) (need 3+)`);
+      } else {
+        console.log(`✗ TIER 1D: No completion history`);
+      }
+    } catch (error) {
+      console.error('TIER 1D error:', error.message);
+    }
+  }
+  
+  // ========================================================================
+  // TIER 2: Canvas Statistical Analysis
+  // ========================================================================
+  
+  // TIER 2B: Submission type heuristics (simple for now)
+  if (!estimate && gradingType) {
+    console.log(`\nTIER 2B: Checking grading type heuristics...`);
+    switch (gradingType) {
+      case 'pass_fail':
+        estimate = 15;
+        source = 'Pass/fail typically quick';
+        break;
+      case 'gpa_scale':
+        estimate = 45;
+        source = 'GPA scale typically major assignments';
+        break;
+      default:
+        // Will fall through to Tier 3
+        console.log(`✗ TIER 2B: Standard grading type, using Tier 3`);
+    }
+    
+    if (estimate) {
+      confidence = 'MEDIUM';
+      console.log(`✓ TIER 2B SUCCESS: ${estimate} min (${source})`);
+    }
+  }
+  
+  // ========================================================================
+  // TIER 3: Pattern Recognition & Defaults
+  // ========================================================================
+  
+  if (!estimate) {
+    console.log(`\nTIER 3: Pattern recognition & defaults...`);
+    
+    // TIER 3A: Enhanced keyword analysis with points scaling
+    const keywordRules = {
+      'Project': { base: 90, pointsMultiplier: 1.2 },
+      'Essay': { base: 60, pointsMultiplier: 1.0 },
+      'Exam': { base: 60, pointsMultiplier: 0.8 },
+      'Test': { base: 45, pointsMultiplier: 0.8 },
+      'Lab': { base: 75, pointsMultiplier: 1.1 },
+      'Presentation': { base: 60, pointsMultiplier: 1.0 },
+      'Discussion': { base: 20, pointsMultiplier: 0.5 },
+      'Quiz': { base: 15, pointsMultiplier: 0.6 },
+      'Worksheet': { base: 25, pointsMultiplier: 0.7 },
+      'Reading': { base: 30, pointsMultiplier: 0.6 },
+      'Homework': { base: 30, pointsMultiplier: 0.8 },
+      'Share': { base: 5, pointsMultiplier: 0.3 },
+      'Reflection': { base: 15, pointsMultiplier: 0.5 },
+      'Response': { base: 10, pointsMultiplier: 0.4 }
+    };
+    
+    for (const [keyword, rule] of Object.entries(keywordRules)) {
+      if (title.includes(keyword)) {
+        if (pointsPossible && pointsPossible > 0) {
+          estimate = Math.round(rule.base + (pointsPossible * rule.pointsMultiplier));
+        } else {
+          estimate = rule.base;
+        }
+        confidence = 'LOW';
+        source = `Keyword "${keyword}" ${pointsPossible ? 'with points scaling' : ''}`;
+        console.log(`✓ TIER 3A: ${estimate} min (${source})`);
+        break;
+      }
+    }
+    
+    // TIER 3B: Points-based heuristics (if no keyword matched)
+    if (!estimate && pointsPossible) {
+      console.log(`TIER 3B: Points-based heuristics...`);
+      if (pointsPossible <= 10) estimate = 15;
+      else if (pointsPossible <= 25) estimate = 25;
+      else if (pointsPossible <= 50) estimate = 35;
+      else if (pointsPossible <= 100) estimate = 50;
+      else estimate = 75;
+      
+      confidence = 'LOW';
+      source = `Points-based (${pointsPossible} pts)`;
+      console.log(`✓ TIER 3B: ${estimate} min (${source})`);
+    }
+    
+    // TIER 3D: Smart defaults (final fallback)
+    if (!estimate) {
+      console.log(`TIER 3D: Smart defaults...`);
+      if (taskClass.includes('Homeroom')) {
+        estimate = 0;
+        source = 'Homeroom task';
+      } else if (taskClass.includes('OSGAccelerate')) {
+        estimate = 10;
+        source = 'OSGAccelerate typical';
+      } else {
+        estimate = 25;
+        source = 'Universal default';
+      }
+      confidence = 'BASELINE';
+      console.log(`✓ TIER 3D: ${estimate} min (${source})`);
+    }
+  }
+  
+  console.log(`\n=== FINAL ESTIMATE: ${estimate} minutes ===`);
+  console.log(`Confidence: ${confidence}`);
+  console.log(`Source: ${source}`);
+  
+  // Store confidence metadata (we'll add columns for this later)
+  // For now, just return the estimate
+  
+  return estimate;
 };
 
 // ============================================================================
@@ -852,8 +1104,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     
     console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
     
-    // Step 5: Format assignments for database
-    console.log('\n🔄 Formatting assignments...');
+    // Step 5: Format assignments for database with time estimation
+    console.log('\n🔄 Formatting assignments and estimating times...');
     const tasks = [];
     
     for (const assignment of allAssignments) {
@@ -868,32 +1120,84 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const submission = assignment.submission || {};
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
       
-      tasks.push({
+      // Create base task object for estimation
+      const taskForEstimation = {
         title: assignment.name,
-        segment: null,
         class: assignment.course_name,
-        description: assignment.description || '',
         url: assignment.html_url,
-        deadlineDate: deadlineDate,
-        deadlineTime: deadlineTime,
-        // New Canvas API fields
-        courseId: assignment.course_id,
         assignmentId: assignment.id,
         pointsPossible: assignment.points_possible || null,
         assignmentGroupId: assignment.assignment_group_id || null,
-        currentScore: submission.score || null,
-        currentGrade: submission.grade || null,
         gradingType: assignment.grading_type || 'points',
-        unlockAt: assignment.unlock_at || null,
-        lockAt: assignment.lock_at || null,
-        submittedAt: submission.submitted_at || null,
-        isMissing: submission.missing || false,
-        isLate: submission.late || false,
-        completed: isSubmitted
-      });
+        description: assignment.description || ''
+      };
+      
+      // Estimate time using new intelligent algorithm
+      const estimatedTime = await estimateTaskTime(taskForEstimation, req.user.id);
+      
+      // Check if auto-segmentation is needed (>60 minutes)
+      const segments = autoSegmentTask(estimatedTime);
+      
+      if (segments && segments.length > 1) {
+        // Task needs segmentation - create multiple tasks
+        console.log(`  ⚡ Auto-segmenting "${assignment.name}" into ${segments.length} sessions`);
+        
+        for (const segment of segments) {
+          tasks.push({
+            title: assignment.name,
+            segment: segment.name,  // "Session 1", "Session 2", etc.
+            class: assignment.course_name,
+            description: assignment.description || '',
+            url: assignment.html_url,
+            deadlineDate: deadlineDate,
+            deadlineTime: deadlineTime,
+            estimatedTime: segment.estimatedTime,
+            // New Canvas API fields
+            courseId: assignment.course_id,
+            assignmentId: assignment.id,
+            pointsPossible: assignment.points_possible || null,
+            assignmentGroupId: assignment.assignment_group_id || null,
+            currentScore: submission.score || null,
+            currentGrade: submission.grade || null,
+            gradingType: assignment.grading_type || 'points',
+            unlockAt: assignment.unlock_at || null,
+            lockAt: assignment.lock_at || null,
+            submittedAt: submission.submitted_at || null,
+            isMissing: submission.missing || false,
+            isLate: submission.late || false,
+            completed: isSubmitted
+          });
+        }
+      } else {
+        // Single task (no segmentation needed)
+        tasks.push({
+          title: assignment.name,
+          segment: null,
+          class: assignment.course_name,
+          description: assignment.description || '',
+          url: assignment.html_url,
+          deadlineDate: deadlineDate,
+          deadlineTime: deadlineTime,
+          estimatedTime: estimatedTime,
+          // New Canvas API fields
+          courseId: assignment.course_id,
+          assignmentId: assignment.id,
+          pointsPossible: assignment.points_possible || null,
+          assignmentGroupId: assignment.assignment_group_id || null,
+          currentScore: submission.score || null,
+          currentGrade: submission.grade || null,
+          gradingType: assignment.grading_type || 'points',
+          unlockAt: assignment.unlock_at || null,
+          lockAt: assignment.lock_at || null,
+          submittedAt: submission.submitted_at || null,
+          isMissing: submission.missing || false,
+          isLate: submission.late || false,
+          completed: isSubmitted
+        });
+      }
     }
     
-    console.log(`✓ Formatted ${tasks.length} tasks for database`);
+    console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation)`);
     console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
     
     res.json({ 
