@@ -36,10 +36,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     title VARCHAR(500) NOT NULL,                -- Base task name (never changes, acts like old parent_id)
     segment VARCHAR(500),                       -- NULL for base tasks, "Part 1" or "Hypothesis - First Phase" for splits
-    class VARCHAR(200) NOT NULL,                -- Extracted from brackets in SUMMARY [TAiLOR English]
-    description TEXT,                           -- From DESCRIPTION field in ICS
-    url TEXT NOT NULL,                          -- Converted from calendar URL to assignment URL
-    deadline TIMESTAMP NOT NULL,                -- From DTSTART/DTEND in ICS
+    class VARCHAR(200) NOT NULL,                -- Course name from Canvas API
+    description TEXT,                           -- From assignment.description in Canvas API (HTML formatted)
+    url TEXT NOT NULL,                          -- Direct assignment URL from Canvas API
+    deadline_date DATE NOT NULL,                -- From assignment.due_at (date part)
+    deadline_time TIME,                         -- From assignment.due_at (time part, NULL if date-only)
     estimated_time INTEGER NOT NULL,            -- AI-calculated estimate (minutes)
     user_estimated_time INTEGER,                -- User override (NULL if not set)
     accumulated_time INTEGER DEFAULT 0,         -- Replaces partial_completions table
@@ -47,8 +48,36 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     priority_order INTEGER,                     -- Manual priority override (NULL by default)
     is_new BOOLEAN DEFAULT FALSE,               -- Marks newly imported tasks
-    deleted BOOLEAN DEFAULT FALSE               -- Marks tasks as deleted/checked off without removing from database
+    deleted BOOLEAN DEFAULT FALSE,              -- Marks tasks as deleted/checked off without removing from database
+    -- NEW CANVAS API FIELDS
+    course_id BIGINT,                           -- Canvas course ID
+    assignment_id BIGINT,                       -- Canvas assignment ID (unique identifier)
+    points_possible DECIMAL(10,2),              -- Maximum points for assignment
+    assignment_group_id BIGINT,                 -- Category ID (Homework, Exams, etc.)
+    current_score DECIMAL(10,2),                -- Student's current score
+    current_grade VARCHAR(10),                  -- Student's current grade (letter/percent)
+    grading_type VARCHAR(20),                   -- How it's graded (points, percent, pass_fail, etc.)
+    unlock_at TIMESTAMP,                        -- When assignment becomes available
+    lock_at TIMESTAMP,                          -- When assignment locks
+    submitted_at TIMESTAMP,                     -- When student submitted
+    is_missing BOOLEAN DEFAULT false,           -- Canvas missing flag
+    is_late BOOLEAN DEFAULT false,              -- Canvas late flag
+    UNIQUE(user_id, assignment_id)              -- Prevent duplicate assignments per user
 );
+
+-- Migration: Add new Canvas API columns to existing tasks table
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS course_id BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_id BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS points_possible DECIMAL(10,2);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_group_id BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_score DECIMAL(10,2);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_grade VARCHAR(10);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grading_type VARCHAR(20);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unlock_at TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lock_at TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing BOOLEAN DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late BOOLEAN DEFAULT false;
 
 -- Schedules table - Fixed SERIAL ID
 CREATE TABLE IF NOT EXISTS schedules (
@@ -84,6 +113,34 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Courses table - For Marks tab and grade tracking
+CREATE TABLE IF NOT EXISTS courses (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    course_id BIGINT NOT NULL,                  -- Canvas course ID
+    name VARCHAR(255) NOT NULL,                 -- Course name
+    course_code VARCHAR(50),                    -- Course code (e.g., "ENG-11")
+    current_score DECIMAL(5,2),                 -- Current percentage in course
+    current_grade VARCHAR(10),                  -- Current letter grade
+    final_score DECIMAL(5,2),                   -- Final percentage (if available)
+    final_grade VARCHAR(10),                    -- Final letter grade
+    enrollment_id BIGINT,                       -- Canvas enrollment ID
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, course_id)                  -- Prevent duplicate courses per user
+);
+
+-- Assignment groups table - For grade weight calculations
+CREATE TABLE IF NOT EXISTS assignment_groups (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    course_id BIGINT NOT NULL,                  -- Which course this belongs to
+    group_id BIGINT NOT NULL,                   -- Canvas assignment group ID
+    name VARCHAR(255) NOT NULL,                 -- Category name (e.g., "Homework")
+    weight DECIMAL(5,2),                        -- Percentage weight in final grade
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, course_id, group_id)        -- Prevent duplicates
+);
+
 -- NEW Tasks Completed table - Replaces completion_history
 -- Consolidates segments automatically when all parts are complete
 CREATE TABLE IF NOT EXISTS tasks_completed (
@@ -111,12 +168,15 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_title ON tasks(title);
 CREATE INDEX IF NOT EXISTS idx_tasks_class ON tasks(class);
 CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
-CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline);
+CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date ON tasks(deadline_date);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority_order ON tasks(priority_order);
 CREATE INDEX IF NOT EXISTS idx_tasks_is_new ON tasks(is_new);
 CREATE INDEX IF NOT EXISTS idx_tasks_segment ON tasks(segment);
 CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(deleted);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignment_id ON tasks(assignment_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_course_id ON tasks(course_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignment_group_id ON tasks(assignment_group_id);
 
 -- Tasks Completed
 CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id ON tasks_completed(user_id);
@@ -134,6 +194,15 @@ CREATE INDEX IF NOT EXISTS idx_session_state_user_id ON session_state(user_id);
 -- Feedback
 CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at);
+
+-- Courses
+CREATE INDEX IF NOT EXISTS idx_courses_user_id ON courses(user_id);
+CREATE INDEX IF NOT EXISTS idx_courses_course_id ON courses(course_id);
+
+-- Assignment Groups
+CREATE INDEX IF NOT EXISTS idx_assignment_groups_user_id ON assignment_groups(user_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_groups_course_id ON assignment_groups(course_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_groups_group_id ON assignment_groups(group_id);
 
 -- ============================================================================
 -- TRIGGERS
