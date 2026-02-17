@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const axios = require('axios');
 const ICAL = require('ical.js');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,6 +45,62 @@ if (!JWT_SECRET) {
     JWT_SECRET = 'dev-only-insecure-secret-change-for-production';
   }
 }
+
+// Encryption key for Canvas API tokens - ENFORCE in production
+let ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('❌ FATAL ERROR: ENCRYPTION_KEY environment variable is required in production');
+    process.exit(1);
+  } else {
+    console.warn('⚠️  WARNING: Using default ENCRYPTION_KEY for development. Set ENCRYPTION_KEY env variable for production!');
+    // Must be 32 bytes for AES-256
+    ENCRYPTION_KEY = 'dev-only-insecure-encryption-key-32-chars!!';
+  }
+}
+
+// Ensure encryption key is 32 bytes
+const ENCRYPTION_KEY_BUFFER = Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
+
+// ============================================================================
+// ENCRYPTION HELPERS FOR CANVAS API TOKENS
+// ============================================================================
+
+// Encrypt Canvas API token
+const encryptToken = (token) => {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_BUFFER, iv);
+  
+  let encrypted = cipher.update(token, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  
+  const authTag = cipher.getAuthTag();
+  
+  return {
+    encryptedToken: encrypted,
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex')
+  };
+};
+
+// Decrypt Canvas API token
+const decryptToken = (encryptedToken, ivHex, authTagHex) => {
+  try {
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY_BUFFER, iv);
+    
+    decipher.setAuthTag(authTag);
+    
+    let decrypted = decipher.update(encryptedToken, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    return decrypted;
+  } catch (error) {
+    console.error('Token decryption failed:', error.message);
+    return null;
+  }
+};
 
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
@@ -318,7 +375,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT grade, canvas_url, present_periods FROM users WHERE id = $1',
+      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -327,6 +384,19 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
     }
 
     const user = result.rows[0];
+    
+    // Decrypt Canvas API token if it exists
+    let canvasApiToken = '';
+    if (user.canvas_api_token && user.canvas_api_token_iv) {
+      // For AES-GCM, the auth tag is appended to the encrypted token
+      const encryptedParts = user.canvas_api_token.split(':');
+      if (encryptedParts.length === 2) {
+        const decrypted = decryptToken(encryptedParts[0], user.canvas_api_token_iv, encryptedParts[1]);
+        if (decrypted) {
+          canvasApiToken = decrypted;
+        }
+      }
+    }
 
     const scheduleResult = await pool.query(
       'SELECT day, period, type FROM schedules WHERE user_id = $1',
@@ -341,7 +411,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 
     res.json({
       grade: user.grade || '',
-      canvasUrl: user.canvas_url || '',
+      canvasApiToken: canvasApiToken,
       presentPeriods: user.present_periods || '2-6',
       schedule
     });
@@ -354,16 +424,27 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 // Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const { grade, canvasUrl, presentPeriods, schedule } = req.body;
+    const { grade, canvasApiToken, presentPeriods, schedule } = req.body;
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
       return res.status(400).json({ error: 'Grade must be one of: 7, 8, 9, 10, 11, or 12' });
     }
+    
+    // Encrypt Canvas API token if provided
+    let encryptedToken = null;
+    let iv = null;
+    
+    if (canvasApiToken && canvasApiToken.trim()) {
+      const encrypted = encryptToken(canvasApiToken.trim());
+      // Store encrypted token with auth tag appended (format: encrypted:authTag)
+      encryptedToken = `${encrypted.encryptedToken}:${encrypted.authTag}`;
+      iv = encrypted.iv;
+    }
 
     await pool.query(
-      'UPDATE users SET grade = $1, canvas_url = $2, present_periods = $3, is_new_user = false WHERE id = $4',
-      [grade, canvasUrl, presentPeriods, req.user.id]
+      'UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3, present_periods = $4, is_new_user = false WHERE id = $5',
+      [grade, encryptedToken, iv, presentPeriods, req.user.id]
     );
 
     await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
