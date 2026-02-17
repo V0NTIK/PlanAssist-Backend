@@ -693,6 +693,266 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// NEW CANVAS API SYNC ENDPOINT
+// ============================================================================
+
+// Sync assignments from Canvas API (replaces /calendar/fetch)
+app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
+  try {
+    console.log('\n=== CANVAS API SYNC START ===');
+    
+    // Get user's encrypted Canvas API token
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    
+    if (!userResult.rows[0] || !userResult.rows[0].canvas_api_token) {
+      return res.status(400).json({ error: 'No Canvas API token found. Please add your token in Settings.' });
+    }
+    
+    // Decrypt the Canvas API token
+    const encryptedParts = userResult.rows[0].canvas_api_token.split(':');
+    if (encryptedParts.length !== 2) {
+      return res.status(500).json({ error: 'Invalid token format in database' });
+    }
+    
+    const canvasToken = decryptToken(
+      encryptedParts[0],
+      userResult.rows[0].canvas_api_token_iv,
+      encryptedParts[1]
+    );
+    
+    if (!canvasToken) {
+      return res.status(500).json({ error: 'Failed to decrypt Canvas API token' });
+    }
+    
+    console.log('✓ Canvas API token decrypted successfully');
+    
+    // Canvas API base URL
+    const CANVAS_API_BASE = 'https://canvas.oneschoolglobal.com/api/v1';
+    const headers = {
+      'Authorization': `Bearer ${canvasToken}`,
+      'Accept': 'application/json'
+    };
+    
+    // Step 1: Fetch all active courses for the user
+    console.log('\n📚 Fetching active courses...');
+    let coursesResponse;
+    try {
+      coursesResponse = await axios.get(
+        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&per_page=100`,
+        { headers, timeout: 15000 }
+      );
+    } catch (error) {
+      console.error('❌ Failed to fetch courses:', error.message);
+      if (error.response?.status === 401) {
+        return res.status(401).json({ error: 'Canvas API token is invalid or expired. Please update your token in Settings.' });
+      }
+      return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: error.message });
+    }
+    
+    const courses = coursesResponse.data;
+    console.log(`✓ Found ${courses.length} active courses`);
+    
+    // Step 2: Sync course data to database
+    console.log('\n💾 Syncing course data to database...');
+    for (const course of courses) {
+      // Get enrollment data for grades
+      const enrollment = course.enrollments?.[0] || {};
+      
+      await pool.query(
+        `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id, course_id)
+         DO UPDATE SET 
+           name = EXCLUDED.name,
+           course_code = EXCLUDED.course_code,
+           current_score = EXCLUDED.current_score,
+           current_grade = EXCLUDED.current_grade,
+           final_score = EXCLUDED.final_score,
+           final_grade = EXCLUDED.final_grade,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          req.user.id,
+          course.id,
+          course.name,
+          course.course_code || null,
+          enrollment.computed_current_score || null,
+          enrollment.computed_current_grade || null,
+          enrollment.computed_final_score || null,
+          enrollment.computed_final_grade || null,
+          enrollment.id || null
+        ]
+      );
+    }
+    console.log(`✓ Synced ${courses.length} courses to database`);
+    
+    // Step 3: Fetch assignment groups for grade weight calculations
+    console.log('\n⚖️  Fetching assignment groups...');
+    for (const course of courses) {
+      try {
+        const groupsResponse = await axios.get(
+          `${CANVAS_API_BASE}/courses/${course.id}/assignment_groups`,
+          { headers, timeout: 10000 }
+        );
+        
+        for (const group of groupsResponse.data) {
+          await pool.query(
+            `INSERT INTO assignment_groups (user_id, course_id, group_id, name, weight, updated_at)
+             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id, course_id, group_id)
+             DO UPDATE SET 
+               name = EXCLUDED.name,
+               weight = EXCLUDED.weight,
+               updated_at = CURRENT_TIMESTAMP`,
+            [req.user.id, course.id, group.id, group.name, group.group_weight || null]
+          );
+        }
+        console.log(`  ✓ Course: ${course.name} - ${groupsResponse.data.length} assignment groups`);
+      } catch (error) {
+        console.error(`  ⚠️  Failed to fetch assignment groups for ${course.name}:`, error.message);
+      }
+    }
+    
+    // Step 4: Fetch assignments from all courses
+    console.log('\n📋 Fetching assignments...');
+    const allAssignments = [];
+    const today = new Date();
+    const oneMonthFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+    
+    for (const course of courses) {
+      try {
+        const assignmentsResponse = await axios.get(
+          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
+          { headers, timeout: 15000 }
+        );
+        
+        for (const assignment of assignmentsResponse.data) {
+          // Only include assignments with due dates
+          if (!assignment.due_at) continue;
+          
+          const dueDate = new Date(assignment.due_at);
+          
+          // Only include assignments within the next month
+          if (dueDate >= today && dueDate <= oneMonthFromNow) {
+            allAssignments.push({
+              ...assignment,
+              course_name: course.name,
+              course_id: course.id
+            });
+          }
+        }
+        
+        console.log(`  ✓ Course: ${course.name} - ${assignmentsResponse.data.length} total assignments`);
+      } catch (error) {
+        console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
+      }
+    }
+    
+    console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
+    
+    // Step 5: Format assignments for database
+    console.log('\n🔄 Formatting assignments...');
+    const tasks = [];
+    
+    for (const assignment of allAssignments) {
+      const dueDate = new Date(assignment.due_at);
+      
+      // Extract date and time in UTC
+      const deadlineDate = dueDate.toISOString().split('T')[0]; // YYYY-MM-DD
+      const timeString = dueDate.toISOString().split('T')[1]; // HH:MM:SS.sssZ
+      const deadlineTime = timeString.split('.')[0]; // HH:MM:SS (remove milliseconds and Z)
+      
+      // Get submission data
+      const submission = assignment.submission || {};
+      const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
+      
+      tasks.push({
+        title: assignment.name,
+        segment: null,
+        class: assignment.course_name,
+        description: assignment.description || '',
+        url: assignment.html_url,
+        deadlineDate: deadlineDate,
+        deadlineTime: deadlineTime,
+        // New Canvas API fields
+        courseId: assignment.course_id,
+        assignmentId: assignment.id,
+        pointsPossible: assignment.points_possible || null,
+        assignmentGroupId: assignment.assignment_group_id || null,
+        currentScore: submission.score || null,
+        currentGrade: submission.grade || null,
+        gradingType: assignment.grading_type || 'points',
+        unlockAt: assignment.unlock_at || null,
+        lockAt: assignment.lock_at || null,
+        submittedAt: submission.submitted_at || null,
+        isMissing: submission.missing || false,
+        isLate: submission.late || false,
+        completed: isSubmitted
+      });
+    }
+    
+    console.log(`✓ Formatted ${tasks.length} tasks for database`);
+    console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
+    
+    res.json({ 
+      tasks,
+      stats: {
+        courses: courses.length,
+        assignments: tasks.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Canvas API sync error:', error);
+    console.error('Stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Failed to sync with Canvas',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// ============================================================================
+// COURSES & GRADES ROUTES (for Marks tab)
+// ============================================================================
+
+// Get all courses with current grades
+app.get('/api/courses', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM courses 
+       WHERE user_id = $1
+       ORDER BY name ASC`,
+      [req.user.id]
+    );
+    res.json(result.rows || []);
+  } catch (error) {
+    console.error('Get courses error:', error);
+    res.status(500).json({ error: 'Failed to get courses' });
+  }
+});
+
+// Get assignment groups for a specific course
+app.get('/api/courses/:courseId/assignment-groups', authenticateToken, async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    
+    const result = await pool.query(
+      `SELECT * FROM assignment_groups 
+       WHERE user_id = $1 AND course_id = $2
+       ORDER BY name ASC`,
+      [req.user.id, courseId]
+    );
+    res.json(result.rows || []);
+  } catch (error) {
+    console.error('Get assignment groups error:', error);
+    res.status(500).json({ error: 'Failed to get assignment groups' });
+  }
+});
+
+// ============================================================================
 // TASK MANAGEMENT ROUTES
 // ============================================================================
 
@@ -750,17 +1010,41 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               class = $5,
               url = $6,
               deadline_date = $7,
-              deadline_time = $8
-             WHERE id = $9 AND user_id = $10`,
+              deadline_time = $8,
+              course_id = $9,
+              assignment_id = $10,
+              points_possible = $11,
+              assignment_group_id = $12,
+              current_score = $13,
+              current_grade = $14,
+              grading_type = $15,
+              unlock_at = $16,
+              lock_at = $17,
+              submitted_at = $18,
+              is_missing = $19,
+              is_late = $20
+             WHERE id = $21 AND user_id = $22`,
             [
               incomingTask.title,
               incomingTask.description || '',
               incomingTask.estimatedTime,
-              false, // Always false during sync
+              incomingTask.completed || false,
               incomingTask.class,
               incomingTask.url,
               incomingTask.deadlineDate,
               incomingTask.deadlineTime,
+              incomingTask.courseId || null,
+              incomingTask.assignmentId || null,
+              incomingTask.pointsPossible || null,
+              incomingTask.assignmentGroupId || null,
+              incomingTask.currentScore || null,
+              incomingTask.currentGrade || null,
+              incomingTask.gradingType || 'points',
+              incomingTask.unlockAt || null,
+              incomingTask.lockAt || null,
+              incomingTask.submittedAt || null,
+              incomingTask.isMissing || false,
+              incomingTask.isLate || false,
               existingTask.id,
               req.user.id
             ]
@@ -791,8 +1075,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
           `INSERT INTO tasks 
-           (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+           (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
+            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
            RETURNING *`,
           [
             req.user.id,
@@ -808,8 +1093,20 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             0, // No accumulated time yet
             nextPriority, // Append to end
             true, // Mark as new
-            false, // Not completed
-            false // Not deleted
+            incomingTask.completed || false,
+            false, // Not deleted
+            incomingTask.courseId || null,
+            incomingTask.assignmentId || null,
+            incomingTask.pointsPossible || null,
+            incomingTask.assignmentGroupId || null,
+            incomingTask.currentScore || null,
+            incomingTask.currentGrade || null,
+            incomingTask.gradingType || 'points',
+            incomingTask.unlockAt || null,
+            incomingTask.lockAt || null,
+            incomingTask.submittedAt || null,
+            incomingTask.isMissing || false,
+            incomingTask.isLate || false
           ]
         );
         
