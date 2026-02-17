@@ -11,19 +11,24 @@
 -- CORE TABLES
 -- ============================================================================
 
--- Users table (unchanged)
+-- Users table
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password VARCHAR(255) NOT NULL,
     name VARCHAR(255) NOT NULL,
     grade VARCHAR(10),
-    canvas_url TEXT,
+    canvas_api_token TEXT,                      -- Encrypted Canvas API token (replaces canvas_url)
+    canvas_api_token_iv TEXT,                   -- Initialization vector for token encryption
     present_periods VARCHAR(10) DEFAULT '2-6',
     is_new_user BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Migration: Add API token columns if upgrading from ICS system
+ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token_iv TEXT;
 
 -- NEW Tasks table - Completely redesigned with title/segment system
 CREATE TABLE IF NOT EXISTS tasks (
