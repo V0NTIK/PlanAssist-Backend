@@ -1369,6 +1369,28 @@ app.get('/api/courses/:courseId/assignment-groups', authenticateToken, async (re
   }
 });
 
+// Get global average score for a course (across all PlanAssist users)
+app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    
+    const result = await pool.query(
+      `SELECT AVG(current_score) as avg_score, COUNT(DISTINCT user_id) as student_count
+       FROM courses
+       WHERE course_id = $1 AND current_score IS NOT NULL`,
+      [courseId]
+    );
+    
+    res.json({
+      averageScore: result.rows[0]?.avg_score ? parseFloat(result.rows[0].avg_score) : null,
+      studentCount: parseInt(result.rows[0]?.student_count) || 0
+    });
+  } catch (error) {
+    console.error('Get course average error:', error);
+    res.status(500).json({ error: 'Failed to get course average' });
+  }
+});
+
 // ============================================================================
 // TASK MANAGEMENT ROUTES
 // ============================================================================
