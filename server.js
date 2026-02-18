@@ -1058,28 +1058,52 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         
         let moduleCount = 0;
         let itemCount = 0;
-        const itemTypeSummary = {};
         for (const module of modulesResponse.data) {
           if (module.items && module.items.length > 0) {
             for (const item of module.items) {
-              // Track all item types for diagnostics
-              itemTypeSummary[item.type] = (itemTypeSummary[item.type] || 0) + 1;
-              // Accept ANY item with a content_id - Canvas uses content_id for
-              // Assignment, Quiz, Discussion, and ExternalTool types
+              const moduleData = {
+                moduleId: module.id,
+                moduleName: module.name,
+                modulePosition: module.position
+              };
+              
+              // Strategy 1: Map by content_id (works for standard Assignment/Quiz/Discussion items)
               if (item.content_id != null) {
-                assignmentToModule[item.content_id] = {
-                  moduleId: module.id,
-                  moduleName: module.name,
-                  modulePosition: module.position
-                };
+                assignmentToModule[item.content_id] = moduleData;
                 itemCount++;
+              }
+              
+              // Strategy 2: Parse assignment ID from html_url as fallback
+              // Handles New Quizzes and ExternalTool items where content_id != assignment ID
+              // Canvas html_url format: .../courses/:id/assignments/:assignmentId
+              if (item.html_url) {
+                const assignmentMatch = item.html_url.match(/\/assignments\/(\d+)/);
+                if (assignmentMatch) {
+                  const urlAssignmentId = parseInt(assignmentMatch[1]);
+                  if (urlAssignmentId && urlAssignmentId !== item.content_id) {
+                    // Only add if different from content_id (avoid double-counting)
+                    assignmentToModule[urlAssignmentId] = moduleData;
+                    itemCount++;
+                  }
+                }
+              }
+              
+              // Strategy 3: Parse from API url field (some external tool items use this)
+              if (item.url && !item.html_url) {
+                const assignmentMatch = item.url.match(/\/assignments\/(\d+)/);
+                if (assignmentMatch) {
+                  const urlAssignmentId = parseInt(assignmentMatch[1]);
+                  if (urlAssignmentId) {
+                    assignmentToModule[urlAssignmentId] = moduleData;
+                    itemCount++;
+                  }
+                }
               }
             }
             moduleCount++;
           }
         }
         console.log(`  ✓ Course: ${course.name} - ${modulesResponse.data.length} modules, ${itemCount} items mapped`);
-        console.log(`    Item types seen: ${JSON.stringify(itemTypeSummary)}`);
       } catch (error) {
         console.error(`  ⚠️  Failed to fetch modules for ${course.name}:`, error.message);
       }
