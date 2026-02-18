@@ -411,26 +411,32 @@ ADD COLUMN IF NOT EXISTS deadline_date DATE,
 ADD COLUMN IF NOT EXISTS deadline_time TIME;
 
 -- Step 2: Migrate existing data (if any exists)
--- Parse existing deadline column into date and time components
-UPDATE tasks
-SET 
-  deadline_date = CASE 
-    WHEN deadline IS NOT NULL THEN DATE(deadline)
-    ELSE NULL
-  END,
-  deadline_time = CASE 
-    WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
-      CASE 
-        -- If it's not 23:59:00 (our default), keep the time
-        WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
-        -- If it is 23:59:00, set to NULL (was likely a date-only assignment)
+-- Parse existing deadline column into date and time components (only if deadline column still exists)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'tasks' AND column_name = 'deadline'
+  ) THEN
+    UPDATE tasks
+    SET 
+      deadline_date = CASE 
+        WHEN deadline IS NOT NULL THEN DATE(deadline)
+        ELSE NULL
+      END,
+      deadline_time = CASE 
+        WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
+          CASE 
+            WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
+            ELSE NULL
+          END
         ELSE NULL
       END
-    ELSE NULL
-  END
-WHERE deadline IS NOT NULL;
+    WHERE deadline IS NOT NULL;
+  END IF;
+END $$;
 
--- Step 3: Drop old deadline column
+-- Step 3: Drop old deadline column (safe even if already dropped)
 ALTER TABLE tasks DROP COLUMN IF EXISTS deadline;
 
 -- Step 4: Add constraints
