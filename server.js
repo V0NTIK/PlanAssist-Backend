@@ -1058,14 +1058,15 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         
         let moduleCount = 0;
         let itemCount = 0;
+        const itemTypeSummary = {};
         for (const module of modulesResponse.data) {
           if (module.items && module.items.length > 0) {
             for (const item of module.items) {
-              // Accept Assignment, Quiz, and Discussion types - all can be Canvas assignments
-              const isAssignmentItem = item.type === 'Assignment' || 
-                                       item.type === 'Quiz' || 
-                                       item.type === 'Discussion';
-              if (isAssignmentItem && item.content_id) {
+              // Track all item types for diagnostics
+              itemTypeSummary[item.type] = (itemTypeSummary[item.type] || 0) + 1;
+              // Accept ANY item with a content_id - Canvas uses content_id for
+              // Assignment, Quiz, Discussion, and ExternalTool types
+              if (item.content_id != null) {
                 assignmentToModule[item.content_id] = {
                   moduleId: module.id,
                   moduleName: module.name,
@@ -1078,6 +1079,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           }
         }
         console.log(`  ✓ Course: ${course.name} - ${modulesResponse.data.length} modules, ${itemCount} items mapped`);
+        console.log(`    Item types seen: ${JSON.stringify(itemTypeSummary)}`);
       } catch (error) {
         console.error(`  ⚠️  Failed to fetch modules for ${course.name}:`, error.message);
       }
@@ -1143,6 +1145,17 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const moduleInfo = assignmentToModule[assignment.id] || {};
       if (moduleInfo.moduleName) {
         console.log(`  📁 Module found for "${assignment.name}": ${moduleInfo.moduleName}`);
+      } else {
+        // DIAGNOSTIC: Log missing module lookup to help debug
+        // Check if any key in the map is close to assignment.id (type coercion issue?)
+        const assignIdStr = String(assignment.id);
+        const mapKeys = Object.keys(assignmentToModule);
+        const closeMatch = mapKeys.find(k => String(k) === assignIdStr);
+        if (closeMatch) {
+          console.log(`  ⚠️  Type mismatch for "${assignment.name}": assignment.id=${assignment.id} (${typeof assignment.id}), map key="${closeMatch}" (${typeof closeMatch})`);
+        }
+        // Log the assignment ID so we can cross-reference with the module items
+        console.log(`  ❌ No module for "${assignment.name}" (assignmentId=${assignment.id}, course=${assignment.course_name})`);
       }
       
       // Check if this is an OSGAccelerate task that should be condensed
