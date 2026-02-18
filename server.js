@@ -479,9 +479,9 @@ const estimateTaskTime = async (task, userId) => {
       if (taskClass.includes('Homeroom')) {
         estimate = 0;
         source = 'Homeroom task';
-      } else if (taskClass.includes('OSGAccelerate')) {
-        estimate = 10;
-        source = 'OSGAccelerate typical';
+      } else if (taskClass.includes('Enrichment')) {
+        estimate = 5;
+        source = 'Enrichment typical';
       } else {
         estimate = 25;
         source = 'Universal default';
@@ -1037,6 +1037,40 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       }
     }
     
+    // Step 3.5: Fetch modules and build assignment-to-module mapping
+    console.log('\n📚 Fetching modules...');
+    const assignmentToModule = {}; // Map assignment_id → module info
+    
+    for (const course of courses) {
+      try {
+        const modulesResponse = await axios.get(
+          `${CANVAS_API_BASE}/courses/${course.id}/modules?include[]=items`,
+          { headers, timeout: 10000 }
+        );
+        
+        let moduleCount = 0;
+        for (const module of modulesResponse.data) {
+          if (module.items && module.items.length > 0) {
+            for (const item of module.items) {
+              if (item.type === 'Assignment' && item.content_id) {
+                assignmentToModule[item.content_id] = {
+                  moduleId: module.id,
+                  moduleName: module.name,
+                  modulePosition: module.position
+                };
+              }
+            }
+            moduleCount++;
+          }
+        }
+        console.log(`  ✓ Course: ${course.name} - ${moduleCount} modules mapped`);
+      } catch (error) {
+        console.error(`  ⚠️  Failed to fetch modules for ${course.name}:`, error.message);
+      }
+    }
+    
+    console.log(`✓ Built assignment-to-module mapping for ${Object.keys(assignmentToModule).length} assignments`);
+    
     // Step 4: Fetch assignments from all courses
     console.log('\n📋 Fetching assignments...');
     const allAssignments = [];
@@ -1077,6 +1111,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     // Step 5: Format assignments for database with time estimation
     console.log('\n🔄 Formatting assignments and estimating times...');
     const tasks = [];
+    const osgAccelerateTasks = []; // Collect OSGAccelerate tasks for condensing
     
     for (const assignment of allAssignments) {
       const dueDate = new Date(assignment.due_at);
@@ -1089,6 +1124,23 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       // Get submission data
       const submission = assignment.submission || {};
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
+      
+      // Get module info if available
+      const moduleInfo = assignmentToModule[assignment.id] || {};
+      
+      // Check if this is an OSGAccelerate task that should be condensed
+      if (assignment.course_name.includes('OSGAccelerate') && moduleInfo.moduleName) {
+        osgAccelerateTasks.push({
+          assignment,
+          dueDate,
+          deadlineDate,
+          deadlineTime,
+          submission,
+          isSubmitted,
+          moduleInfo
+        });
+        continue; // Don't process individually, we'll condense later
+      }
       
       // Create base task object for estimation
       const taskForEstimation = {
@@ -1122,7 +1174,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
             deadlineDate: deadlineDate,
             deadlineTime: deadlineTime,
             estimatedTime: segment.estimatedTime,
-            // New Canvas API fields
+            // Canvas API fields
             courseId: assignment.course_id,
             assignmentId: assignment.id,
             pointsPossible: assignment.points_possible || null,
@@ -1135,7 +1187,11 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
             submittedAt: submission.submitted_at || null,
             isMissing: submission.missing || false,
             isLate: submission.late || false,
-            completed: isSubmitted
+            completed: isSubmitted,
+            // Module info
+            moduleId: moduleInfo.moduleId || null,
+            moduleName: moduleInfo.moduleName || null,
+            modulePosition: moduleInfo.modulePosition || null
           });
         }
       } else {
@@ -1149,7 +1205,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           deadlineDate: deadlineDate,
           deadlineTime: deadlineTime,
           estimatedTime: estimatedTime,
-          // New Canvas API fields
+          // Canvas API fields
           courseId: assignment.course_id,
           assignmentId: assignment.id,
           pointsPossible: assignment.points_possible || null,
@@ -1162,12 +1218,90 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           submittedAt: submission.submitted_at || null,
           isMissing: submission.missing || false,
           isLate: submission.late || false,
-          completed: isSubmitted
+          completed: isSubmitted,
+          // Module info
+          moduleId: moduleInfo.moduleId || null,
+          moduleName: moduleInfo.moduleName || null,
+          modulePosition: moduleInfo.modulePosition || null
         });
       }
     }
     
-    console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation)`);
+    // Process OSGAccelerate tasks - condense by module + deadline
+    console.log('\n🎓 Processing OSGAccelerate tasks for condensing...');
+    const osgModuleGroups = {};
+    
+    for (const osgTask of osgAccelerateTasks) {
+      const key = `${osgTask.moduleInfo.moduleName}_${osgTask.deadlineDate}`;
+      if (!osgModuleGroups[key]) {
+        osgModuleGroups[key] = [];
+      }
+      osgModuleGroups[key].push(osgTask);
+    }
+    
+    // Create condensed tasks for each module group
+    for (const [groupKey, groupTasks] of Object.entries(osgModuleGroups)) {
+      if (groupTasks.length === 0) continue;
+      
+      const moduleName = groupTasks[0].moduleInfo.moduleName;
+      const firstTask = groupTasks[0];
+      
+      // Calculate condensed time using special formula:
+      // (Assessments * 30) + (Discussions * 5) + (Shares * 1) + 15
+      let assessmentCount = 0;
+      let discussionCount = 0;
+      let shareCount = 0;
+      
+      for (const task of groupTasks) {
+        const title = task.assignment.name.toLowerCase();
+        if (title.includes('assessment')) assessmentCount++;
+        if (title.includes('discussion')) discussionCount++;
+        if (title.includes('share')) shareCount++;
+      }
+      
+      const condensedTime = (assessmentCount * 30) + (discussionCount * 5) + (shareCount * 1) + 15;
+      
+      // Check if all tasks in group are submitted
+      const allSubmitted = groupTasks.every(t => t.isSubmitted);
+      
+      // Combine all assignment IDs for reference (comma-separated)
+      const combinedAssignmentIds = groupTasks.map(t => t.assignment.id).join(',');
+      
+      console.log(`  ✓ Condensed "${moduleName}": ${groupTasks.length} tasks → ${condensedTime} min`);
+      
+      tasks.push({
+        title: `OSGAccelerate - ${moduleName}`,
+        segment: null,
+        class: firstTask.assignment.course_name,
+        description: `Module: ${moduleName} (${groupTasks.length} tasks)`,
+        url: firstTask.assignment.html_url, // Use first task's URL as representative
+        deadlineDate: firstTask.deadlineDate,
+        deadlineTime: firstTask.deadlineTime,
+        estimatedTime: condensedTime,
+        // Canvas API fields
+        courseId: firstTask.assignment.course_id,
+        assignmentId: combinedAssignmentIds, // Store all IDs (will need special handling)
+        pointsPossible: null, // Not applicable for condensed tasks
+        assignmentGroupId: firstTask.assignment.assignment_group_id,
+        currentScore: null,
+        currentGrade: null,
+        gradingType: 'points',
+        unlockAt: null,
+        lockAt: null,
+        submittedAt: allSubmitted ? new Date().toISOString() : null,
+        isMissing: false,
+        isLate: false,
+        completed: allSubmitted,
+        // Module info
+        moduleId: firstTask.moduleInfo.moduleId,
+        moduleName: moduleName,
+        modulePosition: firstTask.moduleInfo.modulePosition
+      });
+    }
+    
+    console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation and OSG condensing)`);
+    console.log(`  - Regular tasks: ${tasks.length - Object.keys(osgModuleGroups).length}`);
+    console.log(`  - Condensed OSG modules: ${Object.keys(osgModuleGroups).length}`);
     console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
     
     res.json({ 
@@ -1273,11 +1407,30 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     const insertedTasks = [];
 
     for (const incomingTask of sortedTasks) {
-      // Check if this URL already exists in the database (including deleted tasks)
-      const existingTasksResult = await pool.query(
-        'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
-        [req.user.id, incomingTask.url]
-      );
+      // Check if this task already exists (match by assignment_id first, then URL)
+      let existingTasksResult;
+      
+      if (incomingTask.assignmentId) {
+        // Try matching by Canvas assignment_id first (most reliable)
+        existingTasksResult = await pool.query(
+          'SELECT * FROM tasks WHERE user_id = $1 AND assignment_id = $2',
+          [req.user.id, incomingTask.assignmentId]
+        );
+        
+        // If no match by assignment_id, fall back to URL matching
+        if (existingTasksResult.rows.length === 0) {
+          existingTasksResult = await pool.query(
+            'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+            [req.user.id, incomingTask.url]
+          );
+        }
+      } else {
+        // No assignment_id, just use URL
+        existingTasksResult = await pool.query(
+          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+          [req.user.id, incomingTask.url]
+        );
+      }
 
       if (existingTasksResult.rows.length > 0) {
         // URL EXISTS - Update existing task(s) with Canvas data, preserve user modifications
@@ -1306,8 +1459,11 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               lock_at = $17,
               submitted_at = $18,
               is_missing = $19,
-              is_late = $20
-             WHERE id = $21 AND user_id = $22`,
+              is_late = $20,
+              module_id = $21,
+              module_name = $22,
+              module_position = $23
+             WHERE id = $24 AND user_id = $25`,
             [
               incomingTask.title,
               incomingTask.description || '',
@@ -1329,6 +1485,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               incomingTask.submittedAt || null,
               incomingTask.isMissing || false,
               incomingTask.isLate || false,
+              incomingTask.moduleId || null,
+              incomingTask.moduleName || null,
+              incomingTask.modulePosition || null,
               existingTask.id,
               req.user.id
             ]
@@ -1360,8 +1519,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         const result = await pool.query(
           `INSERT INTO tasks 
            (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
-            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late,
+            module_id, module_name, module_position)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
            RETURNING *`,
           [
             req.user.id,
@@ -1390,7 +1550,10 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.lockAt || null,
             incomingTask.submittedAt || null,
             incomingTask.isMissing || false,
-            incomingTask.isLate || false
+            incomingTask.isLate || false,
+            incomingTask.moduleId || null,
+            incomingTask.moduleName || null,
+            incomingTask.modulePosition || null
           ]
         );
         
