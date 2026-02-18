@@ -1047,7 +1047,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     
     // Step 3.5: Fetch modules and build assignment-to-module mapping
     console.log('\n📚 Fetching modules...');
-    const assignmentToModule = {}; // Map assignment_id → module info
+    const assignmentToModule = {}; // Map assignment_id → module info (for standard items)
+    const moduleIdToInfo = {};     // Map canvas_module_id → module info (for assignment.module_ids lookup)
     
     for (const course of courses) {
       try {
@@ -1066,6 +1067,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
                 moduleName: module.name,
                 modulePosition: module.position
               };
+              // Always store module by its own ID for direct lookup via assignment.module_ids
+              moduleIdToInfo[module.id] = moduleData;
               
               // DIAGNOSTIC: Log first ExternalTool item per course to see its structure
               if (item.type === 'ExternalTool' && !course._debuggedExternalTool) {
@@ -1129,7 +1132,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     for (const course of courses) {
       try {
         const assignmentsResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
+          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&include[]=module_ids&per_page=100`,
           { headers, timeout: 15000 }
         );
         
@@ -1174,21 +1177,21 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const submission = assignment.submission || {};
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
       
-      // Get module info if available
-      const moduleInfo = assignmentToModule[assignment.id] || {};
+      // Get module info using two strategies:
+      // Primary: assignment.module_ids[] from API response → direct module ID lookup (works for ALL item types including ExternalTool/New Quizzes)
+      // Fallback: assignmentToModule map from modules API (works for standard Assignment/Discussion/Quiz items)
+      let moduleInfo = {};
+      
+      if (assignment.module_ids && assignment.module_ids.length > 0) {
+        moduleInfo = moduleIdToInfo[assignment.module_ids[0]] || {};
+      }
+      
+      if (!moduleInfo.moduleName) {
+        moduleInfo = assignmentToModule[assignment.id] || {};
+      }
+      
       if (moduleInfo.moduleName) {
         console.log(`  📁 Module found for "${assignment.name}": ${moduleInfo.moduleName}`);
-      } else {
-        // DIAGNOSTIC: Log missing module lookup to help debug
-        // Check if any key in the map is close to assignment.id (type coercion issue?)
-        const assignIdStr = String(assignment.id);
-        const mapKeys = Object.keys(assignmentToModule);
-        const closeMatch = mapKeys.find(k => String(k) === assignIdStr);
-        if (closeMatch) {
-          console.log(`  ⚠️  Type mismatch for "${assignment.name}": assignment.id=${assignment.id} (${typeof assignment.id}), map key="${closeMatch}" (${typeof closeMatch})`);
-        }
-        // Log the assignment ID so we can cross-reference with the module items
-        console.log(`  ❌ No module for "${assignment.name}" (assignmentId=${assignment.id}, course=${assignment.course_name})`);
       }
       
       // Check if this is an OSGAccelerate task that should be condensed
