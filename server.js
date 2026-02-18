@@ -1137,7 +1137,9 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const moduleInfo = assignmentToModule[assignment.id] || {};
       
       // Check if this is an OSGAccelerate task that should be condensed
-      if (assignment.course_name.includes('OSGAccelerate') && moduleInfo.moduleName) {
+      const isOSGCourse = assignment.course_name.includes('OSGAccelerate') || 
+                          assignment.course_name.includes('OSG Accelerate');
+      if (isOSGCourse && moduleInfo.moduleName) {
         osgAccelerateTasks.push({
           assignment,
           dueDate,
@@ -1464,68 +1466,99 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       }
 
       if (existingTasksResult.rows.length > 0) {
-        // URL EXISTS - Update existing task(s) with Canvas data, preserve user modifications
+        // Task EXISTS - Update, but only overwrite Canvas fields if they're actually provided
         console.log(`\n[UPDATE] Found ${existingTasksResult.rows.length} existing task(s) with URL: ${incomingTask.url}`);
         
+        // Detect if this is a Canvas sync (has canvas fields) vs a plan reorder (no canvas fields)
+        const hasCanvasData = incomingTask.courseId !== undefined || incomingTask.assignmentId !== undefined;
+        
         for (const existingTask of existingTasksResult.rows) {
-          // Update only Canvas-controlled fields, preserve user work
-          await pool.query(
-            `UPDATE tasks SET 
-              title = $1,
-              description = $2,
-              estimated_time = $3,
-              completed = $4,
-              class = $5,
-              url = $6,
-              deadline_date = $7,
-              deadline_time = $8,
-              course_id = $9,
-              assignment_id = $10,
-              points_possible = $11,
-              assignment_group_id = $12,
-              current_score = $13,
-              current_grade = $14,
-              grading_type = $15,
-              unlock_at = $16,
-              lock_at = $17,
-              submitted_at = $18,
-              is_missing = $19,
-              is_late = $20,
-              module_id = $21,
-              module_name = $22,
-              module_position = $23
-             WHERE id = $24 AND user_id = $25`,
-            [
-              incomingTask.title,
-              incomingTask.description || '',
-              incomingTask.estimatedTime,
-              incomingTask.completed ?? false,
-              incomingTask.class,
-              incomingTask.url,
-              incomingTask.deadlineDate,
-              incomingTask.deadlineTime,
-              incomingTask.courseId ?? null,
-              incomingTask.assignmentId ?? null,
-              incomingTask.pointsPossible ?? null,
-              incomingTask.assignmentGroupId ?? null,
-              incomingTask.currentScore ?? null,
-              incomingTask.currentGrade ?? null,
-              incomingTask.gradingType || 'points',
-              incomingTask.unlockAt ?? null,
-              incomingTask.lockAt ?? null,
-              incomingTask.submittedAt ?? null,
-              incomingTask.isMissing ?? false,
-              incomingTask.isLate ?? false,
-              incomingTask.moduleId ?? null,
-              incomingTask.moduleName ?? null,
-              incomingTask.modulePosition ?? null,
-              existingTask.id,
-              req.user.id
-            ]
-          );
+          if (hasCanvasData) {
+            // Full Canvas sync update — overwrite canvas fields with fresh data
+            await pool.query(
+              `UPDATE tasks SET 
+                title = $1,
+                description = $2,
+                estimated_time = $3,
+                completed = $4,
+                class = $5,
+                url = $6,
+                deadline_date = $7,
+                deadline_time = $8,
+                course_id = $9,
+                assignment_id = $10,
+                points_possible = $11,
+                assignment_group_id = $12,
+                current_score = $13,
+                current_grade = $14,
+                grading_type = $15,
+                unlock_at = $16,
+                lock_at = $17,
+                submitted_at = $18,
+                is_missing = $19,
+                is_late = $20,
+                module_id = $21,
+                module_name = $22,
+                module_position = $23
+               WHERE id = $24 AND user_id = $25`,
+              [
+                incomingTask.title,
+                incomingTask.description || '',
+                incomingTask.estimatedTime,
+                incomingTask.completed ?? false,
+                incomingTask.class,
+                incomingTask.url,
+                incomingTask.deadlineDate,
+                incomingTask.deadlineTime,
+                incomingTask.courseId ?? null,
+                incomingTask.assignmentId ?? null,
+                incomingTask.pointsPossible ?? null,
+                incomingTask.assignmentGroupId ?? null,
+                incomingTask.currentScore ?? null,
+                incomingTask.currentGrade ?? null,
+                incomingTask.gradingType || 'points',
+                incomingTask.unlockAt ?? null,
+                incomingTask.lockAt ?? null,
+                incomingTask.submittedAt ?? null,
+                incomingTask.isMissing ?? false,
+                incomingTask.isLate ?? false,
+                incomingTask.moduleId ?? null,
+                incomingTask.moduleName ?? null,
+                incomingTask.modulePosition ?? null,
+                existingTask.id,
+                req.user.id
+              ]
+            );
+          } else {
+            // Plan reorder / save — only update non-canvas fields, preserve all canvas data
+            await pool.query(
+              `UPDATE tasks SET 
+                title = $1,
+                description = $2,
+                estimated_time = $3,
+                completed = $4,
+                class = $5,
+                url = $6,
+                deadline_date = $7,
+                deadline_time = $8
+               WHERE id = $9 AND user_id = $10`,
+              [
+                incomingTask.title,
+                incomingTask.description || '',
+                incomingTask.estimatedTime,
+                incomingTask.completed ?? false,
+                incomingTask.class,
+                incomingTask.url,
+                incomingTask.deadlineDate,
+                incomingTask.deadlineTime,
+                existingTask.id,
+                req.user.id
+              ]
+            );
+          }
           
           console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
-          console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible}`);
+          console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible} (hasCanvasData=${hasCanvasData})`);
           console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
           updatedCount++;
         }
