@@ -1067,6 +1067,15 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
                 modulePosition: module.position
               };
               
+              // DIAGNOSTIC: Log first ExternalTool item per course to see its structure
+              if (item.type === 'ExternalTool' && !course._debuggedExternalTool) {
+                console.log(`    [DEBUG] First ExternalTool in "${course.name}" module "${module.name}":`);
+                console.log(`      content_id: ${item.content_id}, type: ${item.type}`);
+                console.log(`      html_url: ${item.html_url}`);
+                console.log(`      url: ${item.url}`);
+                course._debuggedExternalTool = true;
+              }
+              
               // Strategy 1: Map by content_id (works for standard Assignment/Quiz/Discussion items)
               if (item.content_id != null) {
                 assignmentToModule[item.content_id] = moduleData;
