@@ -1052,26 +1052,32 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     for (const course of courses) {
       try {
         const modulesResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/modules?include[]=items`,
-          { headers, timeout: 10000 }
+          `${CANVAS_API_BASE}/courses/${course.id}/modules?include[]=items&per_page=100`,
+          { headers, timeout: 15000 }
         );
         
         let moduleCount = 0;
+        let itemCount = 0;
         for (const module of modulesResponse.data) {
           if (module.items && module.items.length > 0) {
             for (const item of module.items) {
-              if (item.type === 'Assignment' && item.content_id) {
+              // Accept Assignment, Quiz, and Discussion types - all can be Canvas assignments
+              const isAssignmentItem = item.type === 'Assignment' || 
+                                       item.type === 'Quiz' || 
+                                       item.type === 'Discussion';
+              if (isAssignmentItem && item.content_id) {
                 assignmentToModule[item.content_id] = {
                   moduleId: module.id,
                   moduleName: module.name,
                   modulePosition: module.position
                 };
+                itemCount++;
               }
             }
             moduleCount++;
           }
         }
-        console.log(`  ✓ Course: ${course.name} - ${moduleCount} modules mapped`);
+        console.log(`  ✓ Course: ${course.name} - ${modulesResponse.data.length} modules, ${itemCount} items mapped`);
       } catch (error) {
         console.error(`  ⚠️  Failed to fetch modules for ${course.name}:`, error.message);
       }
@@ -1135,6 +1141,9 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       
       // Get module info if available
       const moduleInfo = assignmentToModule[assignment.id] || {};
+      if (moduleInfo.moduleName) {
+        console.log(`  📁 Module found for "${assignment.name}": ${moduleInfo.moduleName}`);
+      }
       
       // Check if this is an OSGAccelerate task that should be condensed
       const isOSGCourse = assignment.course_name.includes('OSGAccelerate') || 
