@@ -186,35 +186,6 @@ const convertToAssignmentUrl = (calendarUrl) => {
 // ADVANCED MULTI-TIER TIME ESTIMATION ALGORITHM
 // ============================================================================
 
-// Helper: Extract teacher name from class string
-const extractTeacherName = (className) => {
-  // Try to extract from formats like "TAiLOR English", "[ENG-11-SMITH]", "Math - JONES"
-  const patterns = [
-    /([A-Z][A-Za-z]+)\s+[A-Z]/,  // "TAiLOR English" → "TAiLOR"
-    /\[[\w-]+-([A-Z]+)\]/,        // "[ENG-11-SMITH]" → "SMITH"
-    /-\s*([A-Z][A-Za-z]+)$/       // "Math - JONES" → "JONES"
-  ];
-  
-  for (const pattern of patterns) {
-    const match = className.match(pattern);
-    if (match && match[1] && match[1].length >= 3) {
-      return match[1].toUpperCase();
-    }
-  }
-  
-  // Fallback: return first capitalized word that's not a common subject
-  const commonSubjects = ['MATH', 'ENGLISH', 'SCIENCE', 'HISTORY', 'SPANISH', 'FRENCH'];
-  const words = className.split(/[\s\[\]-]+/).filter(w => w.length > 2);
-  for (const word of words) {
-    const upper = word.toUpperCase();
-    if (upper === upper && !commonSubjects.includes(upper)) {
-      return upper;
-    }
-  }
-  
-  return null;
-};
-
 // Helper: Calculate linear regression for point-to-time correlation
 const calculatePointTimeCorrelation = (dataPoints) => {
   // dataPoints: [{ points, time }, ...]
@@ -315,23 +286,22 @@ const estimateTaskTime = async (task, userId) => {
   // TIER 1: PlanAssist Historical Analysis
   // ========================================================================
   
-  // TIER 1A: Teacher-based point-to-time correlation
-  const teacherName = extractTeacherName(taskClass);
-  if (teacherName && pointsPossible && pointsPossible > 0) {
-    console.log(`\nTIER 1A: Checking teacher-based correlation (${teacherName})...`);
+  // TIER 1A: Course-based point-to-time correlation (renamed from teacher-based)
+  if (pointsPossible && pointsPossible > 0) {
+    console.log(`\nTIER 1A: Checking course-based correlation (${taskClass})...`);
     try {
-      const teacherData = await pool.query(
+      const courseData = await pool.query(
         `SELECT tc.actual_time, 
                 COALESCE(t.points_possible, tc.estimated_time * 2) as points
          FROM tasks_completed tc
          LEFT JOIN tasks t ON tc.url = t.url
-         WHERE tc.class LIKE $1 
+         WHERE tc.class = $1 
            AND COALESCE(t.points_possible, tc.estimated_time * 2) > 0`,
-        [`%${teacherName}%`]
+        [taskClass]
       );
       
-      if (teacherData.rows.length >= 5) {
-        const dataPoints = teacherData.rows.map(row => ({
+      if (courseData.rows.length >= 5) {
+        const dataPoints = courseData.rows.map(row => ({
           points: parseFloat(row.points),
           time: parseInt(row.actual_time)
         }));
@@ -343,24 +313,24 @@ const estimateTaskTime = async (task, userId) => {
           const speedFactor = await calculateUserSpeedFactor(userId);
           estimate = Math.round(baseEstimate * speedFactor);
           confidence = correlation.rSquared > 0.7 ? 'VERY_HIGH' : 'HIGH';
-          source = `Teacher correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
+          source = `Course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
           console.log(`✓ TIER 1A SUCCESS: ${estimate} min (${source})`);
         } else {
           console.log(`✗ TIER 1A: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
         }
       } else {
-        console.log(`✗ TIER 1A: Only ${teacherData.rows.length} data points (need 5+)`);
+        console.log(`✗ TIER 1A: Only ${courseData.rows.length} data points (need 5+)`);
       }
     } catch (error) {
       console.error('TIER 1A error:', error.message);
     }
   }
   
-  // TIER 1B: Course-based correlation (if teacher-based failed)
+  // TIER 1B: User-specific course correlation (if course-wide failed)
   if (!estimate && pointsPossible && pointsPossible > 0) {
-    console.log(`\nTIER 1B: Checking course-based correlation...`);
+    console.log(`\nTIER 1B: Checking user-specific course correlation...`);
     try {
-      const courseData = await pool.query(
+      const userCourseData = await pool.query(
         `SELECT tc.actual_time,
                 COALESCE(t.points_possible, tc.estimated_time * 2) as points
          FROM tasks_completed tc
@@ -370,8 +340,8 @@ const estimateTaskTime = async (task, userId) => {
         [taskClass, userId]
       );
       
-      if (courseData.rows.length >= 8) {
-        const dataPoints = courseData.rows.map(row => ({
+      if (userCourseData.rows.length >= 3) {
+        const dataPoints = userCourseData.rows.map(row => ({
           points: parseFloat(row.points),
           time: parseInt(row.actual_time)
         }));
@@ -383,13 +353,13 @@ const estimateTaskTime = async (task, userId) => {
           const speedFactor = await calculateUserSpeedFactor(userId);
           estimate = Math.round(baseEstimate * speedFactor);
           confidence = 'HIGH';
-          source = `Course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
+          source = `User course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
           console.log(`✓ TIER 1B SUCCESS: ${estimate} min (${source})`);
         } else {
           console.log(`✗ TIER 1B: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
         }
       } else {
-        console.log(`✗ TIER 1B: Only ${courseData.rows.length} data points (need 8+)`);
+        console.log(`✗ TIER 1B: Only ${userCourseData.rows.length} data points (need 3+)`);
       }
     } catch (error) {
       console.error('TIER 1B error:', error.message);
@@ -1285,14 +1255,24 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Tasks must be an array' });
     }
 
-    console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from ICS ===`);
+    console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from Canvas API ===`);
+
+    // CRITICAL: Sort tasks by deadline before assigning priorities
+    // This ensures priority_order follows chronological deadline order
+    const sortedTasks = [...tasks].sort((a, b) => {
+      const dateA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
+      const dateB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
+      return dateA - dateB;
+    });
+    
+    console.log('✓ Tasks sorted by deadline (earliest first)');
 
     // Track what we do for logging
     let updatedCount = 0;
     let newCount = 0;
     const insertedTasks = [];
 
-    for (const incomingTask of tasks) {
+    for (const incomingTask of sortedTasks) {
       // Check if this URL already exists in the database (including deleted tasks)
       const existingTasksResult = await pool.query(
         'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
@@ -1747,15 +1727,17 @@ app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
     const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds } = req.body;
     
-    // Validate current task exists and isn't deleted before saving
+    // Validate current task exists - if it was completed/deleted, that's okay, just don't save state
     const taskResult = await pool.query(
-      'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
+      'SELECT id, deleted, completed FROM tasks WHERE id = $1 AND user_id = $2',
       [currentTaskIndex, req.user.id]
     );
     
-    if (taskResult.rows.length === 0 || taskResult.rows[0].deleted) {
-      console.log(`⚠️  Cannot save session: task ${currentTaskIndex} is invalid or deleted`);
-      return res.status(400).json({ error: 'Cannot save session with invalid or deleted task' });
+    // If current task is deleted or completed, don't save session state (session is effectively done)
+    if (taskResult.rows.length === 0 || taskResult.rows[0].deleted || taskResult.rows[0].completed) {
+      console.log(`⚠️  Current task ${currentTaskIndex} is completed/deleted - clearing session state instead of saving`);
+      await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+      return res.json({ success: true, message: 'Session cleared (current task complete)' });
     }
     
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
