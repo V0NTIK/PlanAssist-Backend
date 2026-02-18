@@ -963,7 +963,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     let coursesResponse;
     try {
       coursesResponse = await axios.get(
-        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&per_page=100`,
+        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
         { headers, timeout: 15000 }
       );
     } catch (error) {
@@ -980,8 +980,16 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     // Step 2: Sync course data to database
     console.log('\n💾 Syncing course data to database...');
     for (const course of courses) {
-      // Get enrollment data for grades
+      // Get enrollment data for grades - Canvas API returns enrollments array with total_scores
       const enrollment = course.enrollments?.[0] || {};
+      
+      // Canvas returns computed_current_score OR grades.current_score depending on API version
+      const currentScore = enrollment.computed_current_score ?? enrollment.grades?.current_score ?? null;
+      const currentGrade = enrollment.computed_current_grade ?? enrollment.grades?.current_grade ?? null;
+      const finalScore = enrollment.computed_final_score ?? enrollment.grades?.final_score ?? null;
+      const finalGrade = enrollment.computed_final_grade ?? enrollment.grades?.final_grade ?? null;
+      
+      console.log(`  Course: ${course.name} | Score: ${currentScore} | Grade: ${currentGrade}`);
       
       await pool.query(
         `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id, updated_at)
@@ -1000,10 +1008,10 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           course.id,
           course.name,
           course.course_code || null,
-          enrollment.computed_current_score || null,
-          enrollment.computed_current_grade || null,
-          enrollment.computed_final_score || null,
-          enrollment.computed_final_grade || null,
+          currentScore,
+          currentGrade,
+          finalScore,
+          finalGrade,
           enrollment.id || null
         ]
       );
@@ -1264,8 +1272,9 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       // Check if all tasks in group are submitted
       const allSubmitted = groupTasks.every(t => t.isSubmitted);
       
-      // Combine all assignment IDs for reference (comma-separated)
-      const combinedAssignmentIds = groupTasks.map(t => t.assignment.id).join(',');
+      // Use the first assignment's ID as representative (BIGINT compatible)
+      // The full set of IDs is captured in the description field
+      const combinedAssignmentIds = groupTasks[0].assignment.id;
       
       console.log(`  ✓ Condensed "${moduleName}": ${groupTasks.length} tasks → ${condensedTime} min`);
       
@@ -1273,7 +1282,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         title: `OSGAccelerate - ${moduleName}`,
         segment: null,
         class: firstTask.assignment.course_name,
-        description: `Module: ${moduleName} (${groupTasks.length} tasks)`,
+        description: `Module: ${moduleName} (${groupTasks.length} tasks) | Assignment IDs: ${groupTasks.map(t => t.assignment.id).join(',')}`,
         url: firstTask.assignment.html_url, // Use first task's URL as representative
         deadlineDate: firstTask.deadlineDate,
         deadlineTime: firstTask.deadlineTime,
@@ -1357,28 +1366,6 @@ app.get('/api/courses/:courseId/assignment-groups', authenticateToken, async (re
   } catch (error) {
     console.error('Get assignment groups error:', error);
     res.status(500).json({ error: 'Failed to get assignment groups' });
-  }
-});
-
-// Get global average score for a course (across all users)
-app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) => {
-  try {
-    const { courseId } = req.params;
-    
-    const result = await pool.query(
-      `SELECT AVG(current_score) as avg_score, COUNT(DISTINCT user_id) as student_count
-       FROM courses
-       WHERE course_id = $1 AND current_score IS NOT NULL`,
-      [courseId]
-    );
-    
-    res.json({
-      averageScore: result.rows[0]?.avg_score ? parseFloat(result.rows[0].avg_score) : null,
-      studentCount: parseInt(result.rows[0]?.student_count) || 0
-    });
-  } catch (error) {
-    console.error('Get course average error:', error);
-    res.status(500).json({ error: 'Failed to get course average' });
   }
 });
 
@@ -1490,32 +1477,33 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               incomingTask.title,
               incomingTask.description || '',
               incomingTask.estimatedTime,
-              incomingTask.completed || false,
+              incomingTask.completed ?? false,
               incomingTask.class,
               incomingTask.url,
               incomingTask.deadlineDate,
               incomingTask.deadlineTime,
-              incomingTask.courseId || null,
-              incomingTask.assignmentId || null,
-              incomingTask.pointsPossible || null,
-              incomingTask.assignmentGroupId || null,
-              incomingTask.currentScore || null,
-              incomingTask.currentGrade || null,
+              incomingTask.courseId ?? null,
+              incomingTask.assignmentId ?? null,
+              incomingTask.pointsPossible ?? null,
+              incomingTask.assignmentGroupId ?? null,
+              incomingTask.currentScore ?? null,
+              incomingTask.currentGrade ?? null,
               incomingTask.gradingType || 'points',
-              incomingTask.unlockAt || null,
-              incomingTask.lockAt || null,
-              incomingTask.submittedAt || null,
-              incomingTask.isMissing || false,
-              incomingTask.isLate || false,
-              incomingTask.moduleId || null,
-              incomingTask.moduleName || null,
-              incomingTask.modulePosition || null,
+              incomingTask.unlockAt ?? null,
+              incomingTask.lockAt ?? null,
+              incomingTask.submittedAt ?? null,
+              incomingTask.isMissing ?? false,
+              incomingTask.isLate ?? false,
+              incomingTask.moduleId ?? null,
+              incomingTask.moduleName ?? null,
+              incomingTask.modulePosition ?? null,
               existingTask.id,
               req.user.id
             ]
           );
           
           console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
+          console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible}`);
           console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
           updatedCount++;
         }
@@ -1530,6 +1518,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       } else {
         // URL DOESN'T EXIST - Import as new task
         console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
+        console.log(`  courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, pointsPossible=${incomingTask.pointsPossible}`);
         
         // Get max priority for appending new tasks
         const maxPriorityResult = await pool.query(
@@ -1544,6 +1533,29 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late,
             module_id, module_name, module_position)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+           ON CONFLICT (user_id, assignment_id) DO UPDATE SET
+             title = EXCLUDED.title,
+             description = EXCLUDED.description,
+             estimated_time = EXCLUDED.estimated_time,
+             completed = EXCLUDED.completed,
+             class = EXCLUDED.class,
+             url = EXCLUDED.url,
+             deadline_date = EXCLUDED.deadline_date,
+             deadline_time = EXCLUDED.deadline_time,
+             course_id = EXCLUDED.course_id,
+             points_possible = EXCLUDED.points_possible,
+             assignment_group_id = EXCLUDED.assignment_group_id,
+             current_score = EXCLUDED.current_score,
+             current_grade = EXCLUDED.current_grade,
+             grading_type = EXCLUDED.grading_type,
+             unlock_at = EXCLUDED.unlock_at,
+             lock_at = EXCLUDED.lock_at,
+             submitted_at = EXCLUDED.submitted_at,
+             is_missing = EXCLUDED.is_missing,
+             is_late = EXCLUDED.is_late,
+             module_id = EXCLUDED.module_id,
+             module_name = EXCLUDED.module_name,
+             module_position = EXCLUDED.module_position
            RETURNING *`,
           [
             req.user.id,
@@ -1559,22 +1571,22 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             0, // No accumulated time yet
             nextPriority, // Append to end
             true, // Mark as new
-            incomingTask.completed || false,
+            incomingTask.completed ?? false,
             false, // Not deleted
-            incomingTask.courseId || null,
-            incomingTask.assignmentId || null,
-            incomingTask.pointsPossible || null,
-            incomingTask.assignmentGroupId || null,
-            incomingTask.currentScore || null,
-            incomingTask.currentGrade || null,
+            incomingTask.courseId ?? null,
+            incomingTask.assignmentId ?? null,
+            incomingTask.pointsPossible ?? null,
+            incomingTask.assignmentGroupId ?? null,
+            incomingTask.currentScore ?? null,
+            incomingTask.currentGrade ?? null,
             incomingTask.gradingType || 'points',
-            incomingTask.unlockAt || null,
-            incomingTask.lockAt || null,
-            incomingTask.submittedAt || null,
-            incomingTask.isMissing || false,
-            incomingTask.isLate || false,
-            incomingTask.moduleId || null,
-            incomingTask.moduleName || null,
+            incomingTask.unlockAt ?? null,
+            incomingTask.lockAt ?? null,
+            incomingTask.submittedAt ?? null,
+            incomingTask.isMissing ?? false,
+            incomingTask.isLate ?? false,
+            incomingTask.moduleId ?? null,
+            incomingTask.moduleName ?? null,
             incomingTask.modulePosition || null
           ]
         );
