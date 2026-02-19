@@ -1178,12 +1178,24 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
       
       // Get module info using two strategies:
-      // Primary: assignment.module_ids[] from API response → direct module ID lookup (works for ALL item types including ExternalTool/New Quizzes)
-      // Fallback: assignmentToModule map from modules API (works for standard Assignment/Discussion/Quiz items)
+      // Primary: assignment.module_ids[] from API response → direct module ID lookup
+      // Fallback: assignmentToModule map from modules API
       let moduleInfo = {};
+      
+      const isOSGDebug = assignment.course_name && assignment.course_name.includes('OSG Accelerate') 
+                         && assignment.name && assignment.name.includes('Discussion 21');
       
       if (assignment.module_ids && assignment.module_ids.length > 0) {
         moduleInfo = moduleIdToInfo[assignment.module_ids[0]] || {};
+        if (isOSGDebug) {
+          console.log(`  [OSG DEBUG] "${assignment.name}" module_ids=${JSON.stringify(assignment.module_ids)}`);
+          console.log(`  [OSG DEBUG] moduleIdToInfo has ${Object.keys(moduleIdToInfo).length} entries`);
+          console.log(`  [OSG DEBUG] First 5 moduleIdToInfo keys: ${Object.keys(moduleIdToInfo).slice(0,5).join(',')}`);
+          console.log(`  [OSG DEBUG] moduleInfo result: ${JSON.stringify(moduleInfo)}`);
+        }
+      } else if (isOSGDebug) {
+        console.log(`  [OSG DEBUG] "${assignment.name}" has NO module_ids (undefined or empty)`);
+        console.log(`  [OSG DEBUG] assignment.module_ids = ${JSON.stringify(assignment.module_ids)}`);
       }
       
       if (!moduleInfo.moduleName) {
