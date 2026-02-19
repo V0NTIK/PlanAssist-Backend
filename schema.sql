@@ -62,16 +62,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     submitted_at TIMESTAMP,                     -- When student submitted
     is_missing BOOLEAN DEFAULT false,           -- Canvas missing flag
     is_late BOOLEAN DEFAULT false,              -- Canvas late flag
-    module_id BIGINT,                           -- Canvas module ID
-    module_name VARCHAR(255),                   -- Canvas module name
-    module_position INTEGER,                    -- Module order in course
     UNIQUE(user_id, assignment_id)              -- Prevent duplicate assignments per user
 );
-
--- Migration: Add module columns to existing tasks table
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS module_id BIGINT;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS module_name VARCHAR(255);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS module_position INTEGER;
 
 -- Migration: Add new Canvas API columns to existing tasks table
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS course_id BIGINT;
