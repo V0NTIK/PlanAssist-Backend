@@ -1556,7 +1556,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
              lock_at = EXCLUDED.lock_at,
              submitted_at = EXCLUDED.submitted_at,
              is_missing = EXCLUDED.is_missing,
-             is_late = EXCLUDED.is_late,
+             is_late = EXCLUDED.is_late
            RETURNING *`,
           [
             req.user.id,
