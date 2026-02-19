@@ -1461,7 +1461,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 lock_at = $17,
                 submitted_at = $18,
                 is_missing = $19,
-                is_late = $20,
+                is_late = $20
                WHERE id = $21 AND user_id = $22`,
               [
                 incomingTask.title,
