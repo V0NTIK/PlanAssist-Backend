@@ -1163,11 +1163,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
             submittedAt: submission.submitted_at || null,
             isMissing: submission.missing || false,
             isLate: submission.late || false,
-            completed: isSubmitted,
-            // Module info
-            moduleId: moduleInfo.moduleId || null,
-            moduleName: moduleInfo.moduleName || null,
-            modulePosition: moduleInfo.modulePosition || null
+            completed: isSubmitted
           });
         }
       } else {
@@ -1194,11 +1190,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           submittedAt: submission.submitted_at || null,
           isMissing: submission.missing || false,
           isLate: submission.late || false,
-          completed: isSubmitted,
-          // Module info
-          moduleId: moduleInfo.moduleId || null,
-          moduleName: moduleInfo.moduleName || null,
-          modulePosition: moduleInfo.modulePosition || null
+          completed: isSubmitted
         });
       }
     }
