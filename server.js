@@ -1045,83 +1045,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       }
     }
     
-    // Step 3.5: Fetch modules and build assignment-to-module mapping
-    console.log('\n📚 Fetching modules...');
-    const assignmentToModule = {}; // Map assignment_id → module info (for standard items)
-    const moduleIdToInfo = {};     // Map canvas_module_id → module info (for assignment.module_ids lookup)
-    
-    for (const course of courses) {
-      try {
-        const modulesResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/modules?include[]=items&per_page=100`,
-          { headers, timeout: 15000 }
-        );
-        
-        let moduleCount = 0;
-        let itemCount = 0;
-        for (const module of modulesResponse.data) {
-          if (module.items && module.items.length > 0) {
-            for (const item of module.items) {
-              const moduleData = {
-                moduleId: module.id,
-                moduleName: module.name,
-                modulePosition: module.position
-              };
-              // Always store module by its own ID for direct lookup via assignment.module_ids
-              moduleIdToInfo[module.id] = moduleData;
-              
-              // DIAGNOSTIC: Log first ExternalTool item per course to see its structure
-              if (item.type === 'ExternalTool' && !course._debuggedExternalTool) {
-                console.log(`    [DEBUG] First ExternalTool in "${course.name}" module "${module.name}":`);
-                console.log(`      content_id: ${item.content_id}, type: ${item.type}`);
-                console.log(`      html_url: ${item.html_url}`);
-                console.log(`      url: ${item.url}`);
-                course._debuggedExternalTool = true;
-              }
-              
-              // Strategy 1: Map by content_id (works for standard Assignment/Quiz/Discussion items)
-              if (item.content_id != null) {
-                assignmentToModule[item.content_id] = moduleData;
-                itemCount++;
-              }
-              
-              // Strategy 2: Parse assignment ID from html_url as fallback
-              // Handles New Quizzes and ExternalTool items where content_id != assignment ID
-              // Canvas html_url format: .../courses/:id/assignments/:assignmentId
-              if (item.html_url) {
-                const assignmentMatch = item.html_url.match(/\/assignments\/(\d+)/);
-                if (assignmentMatch) {
-                  const urlAssignmentId = parseInt(assignmentMatch[1]);
-                  if (urlAssignmentId && urlAssignmentId !== item.content_id) {
-                    // Only add if different from content_id (avoid double-counting)
-                    assignmentToModule[urlAssignmentId] = moduleData;
-                    itemCount++;
-                  }
-                }
-              }
-              
-              // Strategy 3: Parse from API url field (some external tool items use this)
-              if (item.url && !item.html_url) {
-                const assignmentMatch = item.url.match(/\/assignments\/(\d+)/);
-                if (assignmentMatch) {
-                  const urlAssignmentId = parseInt(assignmentMatch[1]);
-                  if (urlAssignmentId) {
-                    assignmentToModule[urlAssignmentId] = moduleData;
-                    itemCount++;
-                  }
-                }
-              }
-            }
-            moduleCount++;
-          }
-        }
-        console.log(`  ✓ Course: ${course.name} - ${modulesResponse.data.length} modules, ${itemCount} items mapped`);
-      } catch (error) {
-        console.error(`  ⚠️  Failed to fetch modules for ${course.name}:`, error.message);
-      }
-    }
-    
-    console.log(`✓ Built assignment-to-module mapping for ${Object.keys(assignmentToModule).length} assignments`);
+
     
     // Step 4: Fetch assignments from all courses
     console.log('\n📋 Fetching assignments...');
@@ -1132,7 +1056,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     for (const course of courses) {
       try {
         const assignmentsResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&include[]=module_ids&per_page=100`,
+          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
           { headers, timeout: 15000 }
         );
         
@@ -1177,47 +1101,19 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const submission = assignment.submission || {};
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
       
-      // Get module info using two strategies:
-      // Primary: assignment.module_ids[] from API response → direct module ID lookup
-      // Fallback: assignmentToModule map from modules API
-      let moduleInfo = {};
-      
-      const isOSGDebug = assignment.course_name && assignment.course_name.includes('OSG Accelerate') 
-                         && assignment.name && assignment.name.includes('Discussion 21');
-      
-      if (assignment.module_ids && assignment.module_ids.length > 0) {
-        moduleInfo = moduleIdToInfo[assignment.module_ids[0]] || {};
-        if (isOSGDebug) {
-          console.log(`  [OSG DEBUG] "${assignment.name}" module_ids=${JSON.stringify(assignment.module_ids)}`);
-          console.log(`  [OSG DEBUG] moduleIdToInfo has ${Object.keys(moduleIdToInfo).length} entries`);
-          console.log(`  [OSG DEBUG] First 5 moduleIdToInfo keys: ${Object.keys(moduleIdToInfo).slice(0,5).join(',')}`);
-          console.log(`  [OSG DEBUG] moduleInfo result: ${JSON.stringify(moduleInfo)}`);
-        }
-      } else if (isOSGDebug) {
-        console.log(`  [OSG DEBUG] "${assignment.name}" has NO module_ids (undefined or empty)`);
-        console.log(`  [OSG DEBUG] assignment.module_ids = ${JSON.stringify(assignment.module_ids)}`);
-      }
-      
-      if (!moduleInfo.moduleName) {
-        moduleInfo = assignmentToModule[assignment.id] || {};
-      }
-      
-      if (moduleInfo.moduleName) {
-        console.log(`  📁 Module found for "${assignment.name}": ${moduleInfo.moduleName}`);
-      }
+
       
       // Check if this is an OSGAccelerate task that should be condensed
       const isOSGCourse = assignment.course_name.includes('OSGAccelerate') || 
                           assignment.course_name.includes('OSG Accelerate');
-      if (isOSGCourse && moduleInfo.moduleName) {
+      if (isOSGCourse) {
         osgAccelerateTasks.push({
           assignment,
           dueDate,
           deadlineDate,
           deadlineTime,
           submission,
-          isSubmitted,
-          moduleInfo
+          isSubmitted
         });
         continue; // Don't process individually, we'll condense later
       }
@@ -1307,62 +1203,64 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       }
     }
     
-    // Process OSGAccelerate tasks - condense by module + deadline
+    // Process OSGAccelerate tasks - condense by deadline date
     console.log('\n🎓 Processing OSGAccelerate tasks for condensing...');
-    const osgModuleGroups = {};
+    const osgDayGroups = {};
     
     for (const osgTask of osgAccelerateTasks) {
-      const key = `${osgTask.moduleInfo.moduleName}_${osgTask.deadlineDate}`;
-      if (!osgModuleGroups[key]) {
-        osgModuleGroups[key] = [];
+      const key = osgTask.deadlineDate; // Group by due date only
+      if (!osgDayGroups[key]) {
+        osgDayGroups[key] = [];
       }
-      osgModuleGroups[key].push(osgTask);
+      osgDayGroups[key].push(osgTask);
     }
     
-    // Create condensed tasks for each module group
-    for (const [groupKey, groupTasks] of Object.entries(osgModuleGroups)) {
+    // Create condensed tasks for each day group
+    for (const [deadlineDate, groupTasks] of Object.entries(osgDayGroups)) {
       if (groupTasks.length === 0) continue;
       
-      const moduleName = groupTasks[0].moduleInfo.moduleName;
       const firstTask = groupTasks[0];
       
-      // Calculate condensed time using special formula:
-      // (Assessments * 30) + (Discussions * 5) + (Shares * 1) + 15
+      // Count by type: Assessment = contains "Assessment", Quiz = contains "Quiz"
       let assessmentCount = 0;
-      let discussionCount = 0;
-      let shareCount = 0;
+      let quizCount = 0;
       
       for (const task of groupTasks) {
-        const title = task.assignment.name.toLowerCase();
-        if (title.includes('assessment')) assessmentCount++;
-        if (title.includes('discussion')) discussionCount++;
-        if (title.includes('share')) shareCount++;
+        const title = task.assignment.name;
+        if (title.includes('Assessment')) assessmentCount++;
+        if (title.includes('Quiz')) quizCount++;
       }
       
-      const condensedTime = (assessmentCount * 30) + (discussionCount * 5) + (shareCount * 1) + 15;
+      // Build title: "OSG Accelerate (2 Assessments) (7 Quizzes)"
+      const titleParts = [];
+      if (assessmentCount > 0) titleParts.push(`${assessmentCount} Assessment${assessmentCount !== 1 ? 's' : ''}`);
+      if (quizCount > 0) titleParts.push(`${quizCount} ${quizCount !== 1 ? 'Quizzes' : 'Quiz'}`);
+      const condensedTitle = `OSG Accelerate (${titleParts.join(') (')})`;
+      
+      // Time formula: (Assessments * 30) + (Quizzes * 5) + 15
+      const condensedTime = (assessmentCount * 30) + (quizCount * 5) + 15;
       
       // Check if all tasks in group are submitted
       const allSubmitted = groupTasks.every(t => t.isSubmitted);
       
-      // Use the first assignment's ID as representative (BIGINT compatible)
-      // The full set of IDs is captured in the description field
-      const combinedAssignmentIds = groupTasks[0].assignment.id;
+      // URL: OSG Accelerate course assignments page, unique per day via query param
+      const osgCourseId = firstTask.assignment.course_id;
+      const condensedUrl = `https://canvas.oneschoolglobal.com/courses/${osgCourseId}/assignments#${deadlineDate}`;
       
-      console.log(`  ✓ Condensed "${moduleName}": ${groupTasks.length} tasks → ${condensedTime} min`);
+      console.log(`  ✓ Condensed OSG ${deadlineDate}: ${groupTasks.length} tasks (${assessmentCount} assessments, ${quizCount} quizzes) → ${condensedTime} min`);
       
       tasks.push({
-        title: `OSGAccelerate - ${moduleName}`,
+        title: condensedTitle,
         segment: null,
         class: firstTask.assignment.course_name,
-        description: `Module: ${moduleName} (${groupTasks.length} tasks) | Assignment IDs: ${groupTasks.map(t => t.assignment.id).join(',')}`,
-        url: firstTask.assignment.html_url, // Use first task's URL as representative
+        description: `OSG Accelerate condensed tasks for ${deadlineDate} | Assignment IDs: ${groupTasks.map(t => t.assignment.id).join(',')}`,
+        url: condensedUrl,
         deadlineDate: firstTask.deadlineDate,
         deadlineTime: firstTask.deadlineTime,
         estimatedTime: condensedTime,
-        // Canvas API fields
         courseId: firstTask.assignment.course_id,
-        assignmentId: combinedAssignmentIds, // Store all IDs (will need special handling)
-        pointsPossible: null, // Not applicable for condensed tasks
+        assignmentId: null, // No single assignment ID for condensed tasks
+        pointsPossible: null,
         assignmentGroupId: firstTask.assignment.assignment_group_id,
         currentScore: null,
         currentGrade: null,
@@ -1372,17 +1270,13 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         submittedAt: allSubmitted ? new Date().toISOString() : null,
         isMissing: false,
         isLate: false,
-        completed: allSubmitted,
-        // Module info
-        moduleId: firstTask.moduleInfo.moduleId,
-        moduleName: moduleName,
-        modulePosition: firstTask.moduleInfo.modulePosition
+        completed: allSubmitted
       });
     }
     
     console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation and OSG condensing)`);
-    console.log(`  - Regular tasks: ${tasks.length - Object.keys(osgModuleGroups).length}`);
-    console.log(`  - Condensed OSG modules: ${Object.keys(osgModuleGroups).length}`);
+    console.log(`  - Regular tasks: ${tasks.length - Object.keys(osgDayGroups).length}`);
+    console.log(`  - Condensed OSG days: ${Object.keys(osgDayGroups).length}`);
     console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
     
     res.json({ 
@@ -1567,10 +1461,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 submitted_at = $18,
                 is_missing = $19,
                 is_late = $20,
-                module_id = $21,
-                module_name = $22,
-                module_position = $23
-               WHERE id = $24 AND user_id = $25`,
+               WHERE id = $21 AND user_id = $22`,
               [
                 incomingTask.title,
                 incomingTask.description || '',
@@ -1592,9 +1483,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 incomingTask.submittedAt ?? null,
                 incomingTask.isMissing ?? false,
                 incomingTask.isLate ?? false,
-                incomingTask.moduleId ?? null,
-                incomingTask.moduleName ?? null,
-                incomingTask.modulePosition ?? null,
                 existingTask.id,
                 req.user.id
               ]
@@ -1655,9 +1543,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         const result = await pool.query(
           `INSERT INTO tasks 
            (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
-            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late,
-            module_id, module_name, module_position)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
            ON CONFLICT (user_id, assignment_id) DO UPDATE SET
              title = EXCLUDED.title,
              description = EXCLUDED.description,
@@ -1678,9 +1565,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
              submitted_at = EXCLUDED.submitted_at,
              is_missing = EXCLUDED.is_missing,
              is_late = EXCLUDED.is_late,
-             module_id = EXCLUDED.module_id,
-             module_name = EXCLUDED.module_name,
-             module_position = EXCLUDED.module_position
            RETURNING *`,
           [
             req.user.id,
@@ -1709,10 +1593,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.lockAt ?? null,
             incomingTask.submittedAt ?? null,
             incomingTask.isMissing ?? false,
-            incomingTask.isLate ?? false,
-            incomingTask.moduleId ?? null,
-            incomingTask.moduleName ?? null,
-            incomingTask.modulePosition || null
+            incomingTask.isLate ?? false
           ]
         );
         
