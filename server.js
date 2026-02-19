@@ -1241,17 +1241,15 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       
       console.log(`  ✓ Condensed OSG ${deadlineDate}: ${groupTasks.length} tasks (${assessmentCount} assessments, ${quizCount} quizzes) → ${condensedTime} min`);
       
-      tasks.push({
+      const condensedTaskBase = {
         title: condensedTitle,
-        segment: null,
         class: firstTask.assignment.course_name,
         description: `OSG Accelerate condensed tasks for ${deadlineDate} | Assignment IDs: ${groupTasks.map(t => t.assignment.id).join(',')}`,
         url: condensedUrl,
         deadlineDate: firstTask.deadlineDate,
         deadlineTime: firstTask.deadlineTime,
-        estimatedTime: condensedTime,
         courseId: firstTask.assignment.course_id,
-        assignmentId: null, // No single assignment ID for condensed tasks
+        assignmentId: null,
         pointsPossible: null,
         assignmentGroupId: firstTask.assignment.assignment_group_id,
         currentScore: null,
@@ -1263,7 +1261,18 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         isMissing: false,
         isLate: false,
         completed: allSubmitted
-      });
+      };
+      
+      // Apply auto-segmentation if condensed time exceeds 60 minutes
+      const condensedSegments = autoSegmentTask(condensedTime);
+      if (condensedSegments && condensedSegments.length > 1) {
+        console.log(`  ⚡ Auto-segmenting condensed OSG task into ${condensedSegments.length} sessions`);
+        for (const seg of condensedSegments) {
+          tasks.push({ ...condensedTaskBase, segment: seg.name, estimatedTime: seg.estimatedTime });
+        }
+      } else {
+        tasks.push({ ...condensedTaskBase, segment: null, estimatedTime: condensedTime });
+      }
     }
     
     console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation and OSG condensing)`);
