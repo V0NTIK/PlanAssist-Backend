@@ -1133,42 +1133,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       // Estimate time using new intelligent algorithm
       const estimatedTime = await estimateTaskTime(taskForEstimation, req.user.id);
       
-      // Check if auto-segmentation is needed (>60 minutes)
-      const segments = autoSegmentTask(estimatedTime);
-      
-      if (segments && segments.length > 1) {
-        // Task needs segmentation - create multiple tasks
-        console.log(`  ⚡ Auto-segmenting "${assignment.name}" into ${segments.length} sessions`);
-        
-        for (const segment of segments) {
-          tasks.push({
-            title: assignment.name,
-            segment: segment.name,  // "Session 1", "Session 2", etc.
-            class: assignment.course_name,
-            description: assignment.description || '',
-            url: assignment.html_url,
-            deadlineDate: deadlineDate,
-            deadlineTime: deadlineTime,
-            estimatedTime: segment.estimatedTime,
-            // Canvas API fields
-            courseId: assignment.course_id,
-            assignmentId: assignment.id,
-            pointsPossible: assignment.points_possible || null,
-            assignmentGroupId: assignment.assignment_group_id || null,
-            currentScore: submission.score || null,
-            currentGrade: submission.grade || null,
-            gradingType: assignment.grading_type || 'points',
-            unlockAt: assignment.unlock_at || null,
-            lockAt: assignment.lock_at || null,
-            submittedAt: submission.submitted_at || null,
-            isMissing: submission.missing || false,
-            isLate: submission.late || false,
-            completed: isSubmitted
-          });
-        }
-      } else {
-        // Single task (no segmentation needed)
-        tasks.push({
+      tasks.push({
           title: assignment.name,
           segment: null,
           class: assignment.course_name,
@@ -1192,7 +1157,6 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           isLate: submission.late || false,
           completed: isSubmitted
         });
-      }
     }
     
     // Process OSGAccelerate tasks - condense by deadline date
@@ -1263,16 +1227,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         completed: allSubmitted
       };
       
-      // Apply auto-segmentation if condensed time exceeds 60 minutes
-      const condensedSegments = autoSegmentTask(condensedTime);
-      if (condensedSegments && condensedSegments.length > 1) {
-        console.log(`  ⚡ Auto-segmenting condensed OSG task into ${condensedSegments.length} sessions`);
-        for (const seg of condensedSegments) {
-          tasks.push({ ...condensedTaskBase, segment: seg.name, estimatedTime: seg.estimatedTime });
-        }
-      } else {
-        tasks.push({ ...condensedTaskBase, segment: null, estimatedTime: condensedTime });
-      }
+      tasks.push({ ...condensedTaskBase, segment: null, estimatedTime: condensedTime });
     }
     
     console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation and OSG condensing)`);
@@ -1440,54 +1395,91 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         for (const existingTask of existingTasksResult.rows) {
           if (hasCanvasData) {
             // Full Canvas sync update — overwrite canvas fields with fresh data
-            await pool.query(
-              `UPDATE tasks SET 
-                title = $1,
-                description = $2,
-                estimated_time = $3,
-                completed = $4,
-                class = $5,
-                url = $6,
-                deadline_date = $7,
-                deadline_time = $8,
-                course_id = $9,
-                assignment_id = $10,
-                points_possible = $11,
-                assignment_group_id = $12,
-                current_score = $13,
-                current_grade = $14,
-                grading_type = $15,
-                unlock_at = $16,
-                lock_at = $17,
-                submitted_at = $18,
-                is_missing = $19,
-                is_late = $20
-               WHERE id = $21 AND user_id = $22`,
-              [
-                incomingTask.title,
-                incomingTask.description || '',
-                incomingTask.estimatedTime,
-                incomingTask.completed ?? false,
-                incomingTask.class,
-                incomingTask.url,
-                incomingTask.deadlineDate,
-                incomingTask.deadlineTime,
-                incomingTask.courseId ?? null,
-                incomingTask.assignmentId ?? null,
-                incomingTask.pointsPossible ?? null,
-                incomingTask.assignmentGroupId ?? null,
-                incomingTask.currentScore ?? null,
-                incomingTask.currentGrade ?? null,
-                incomingTask.gradingType || 'points',
-                incomingTask.unlockAt ?? null,
-                incomingTask.lockAt ?? null,
-                incomingTask.submittedAt ?? null,
-                incomingTask.isMissing ?? false,
-                incomingTask.isLate ?? false,
-                existingTask.id,
-                req.user.id
-              ]
-            );
+            // For split segments, skip canvas field update entirely to avoid
+            // duplicate assignment_id constraint violations across multiple segments
+            if (existingTask.segment) {
+              // This is a user-created segment - only update non-canvas display fields
+              await pool.query(
+                `UPDATE tasks SET 
+                  title = $1,
+                  class = $2,
+                  url = $3,
+                  deadline_date = $4,
+                  deadline_time = $5,
+                  points_possible = $6,
+                  current_score = $7,
+                  current_grade = $8,
+                  submitted_at = $9,
+                  is_missing = $10,
+                  is_late = $11
+                 WHERE id = $12 AND user_id = $13`,
+                [
+                  incomingTask.title,
+                  incomingTask.class,
+                  incomingTask.url,
+                  incomingTask.deadlineDate,
+                  incomingTask.deadlineTime,
+                  incomingTask.pointsPossible ?? null,
+                  incomingTask.currentScore ?? null,
+                  incomingTask.currentGrade ?? null,
+                  incomingTask.submittedAt ?? null,
+                  incomingTask.isMissing ?? false,
+                  incomingTask.isLate ?? false,
+                  existingTask.id,
+                  req.user.id
+                ]
+              );
+            } else {
+              // Non-segment task: full canvas field update
+              await pool.query(
+                `UPDATE tasks SET 
+                  title = $1,
+                  description = $2,
+                  estimated_time = $3,
+                  completed = $4,
+                  class = $5,
+                  url = $6,
+                  deadline_date = $7,
+                  deadline_time = $8,
+                  course_id = $9,
+                  assignment_id = $10,
+                  points_possible = $11,
+                  assignment_group_id = $12,
+                  current_score = $13,
+                  current_grade = $14,
+                  grading_type = $15,
+                  unlock_at = $16,
+                  lock_at = $17,
+                  submitted_at = $18,
+                  is_missing = $19,
+                  is_late = $20
+                 WHERE id = $21 AND user_id = $22`,
+                [
+                  incomingTask.title,
+                  incomingTask.description || '',
+                  incomingTask.estimatedTime,
+                  incomingTask.completed ?? false,
+                  incomingTask.class,
+                  incomingTask.url,
+                  incomingTask.deadlineDate,
+                  incomingTask.deadlineTime,
+                  incomingTask.courseId ?? null,
+                  incomingTask.assignmentId ?? null,
+                  incomingTask.pointsPossible ?? null,
+                  incomingTask.assignmentGroupId ?? null,
+                  incomingTask.currentScore ?? null,
+                  incomingTask.currentGrade ?? null,
+                  incomingTask.gradingType || 'points',
+                  incomingTask.unlockAt ?? null,
+                  incomingTask.lockAt ?? null,
+                  incomingTask.submittedAt ?? null,
+                  incomingTask.isMissing ?? false,
+                  incomingTask.isLate ?? false,
+                  existingTask.id,
+                  req.user.id
+                ]
+              );
+            }
           } else {
             // Plan reorder / save — only update non-canvas fields, preserve all canvas data
             await pool.query(
