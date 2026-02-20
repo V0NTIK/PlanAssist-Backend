@@ -1522,6 +1522,17 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         insertedTasks.push(...updatedTasksResult.rows);
 
       } else {
+        // URL DOESN'T EXIST in active tasks - check if already completed in PlanAssist
+        // This prevents duplicating tasks the user marked done before Canvas registered submission
+        const alreadyCompleted = await pool.query(
+          'SELECT id FROM tasks_completed WHERE user_id = $1 AND url = $2',
+          [req.user.id, incomingTask.url]
+        );
+        if (alreadyCompleted.rows.length > 0) {
+          console.log(`\n[SKIP] Task already completed by user: ${incomingTask.title}`);
+          continue;
+        }
+        
         // URL DOESN'T EXIST - Import as new task
         console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
         console.log(`  courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, pointsPossible=${incomingTask.pointsPossible}`);
@@ -1938,10 +1949,17 @@ app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
     
     await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
     
+    // Build partial_task_times JSONB: map of task_id -> accumulated minutes
+    // This allows resume to show correct Time Spent for the in-progress task
+    let partialTaskTimesJson = null;
+    if (req.body.partialTaskTimes && Object.keys(req.body.partialTaskTimes).length > 0) {
+      partialTaskTimesJson = JSON.stringify(req.body.partialTaskTimes);
+    }
+    
     await pool.query(
-      `INSERT INTO session_state (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids, saved_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
-      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds]
+      `INSERT INTO session_state (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids, partial_task_times, saved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskTimesJson]
     );
     
     res.json({ success: true });
@@ -1966,6 +1984,7 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
         currentTaskIndex: cleanedSession.current_task_index,
         taskStartTime: cleanedSession.task_start_time,
         completedTaskIds: cleanedSession.completed_task_ids || [],
+        partialTaskTimes: cleanedSession.partial_task_times || {},
         savedAt: cleanedSession.saved_at
       });
     } else {
