@@ -6,6 +6,8 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const Anthropic = require('@anthropic-ai/sdk');
+const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const axios = require('axios');
 const ICAL = require('ical.js');
 const crypto = require('crypto');
@@ -260,244 +262,320 @@ const autoSegmentTask = (estimatedTime) => {
   return segments;
 };
 
+// Helper: Strip HTML tags and decode entities for AI consumption
+const stripHtmlForAI = (html) => {
+  if (!html) return '';
+  return html
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/p>/gi, ' ')
+    .replace(/<li>/gi, '• ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+};
+
+// Helper: Cached AI estimate - store in DB to avoid repeat calls
+const getAIEstimate = async (assignmentId, title, description, pointsPossible) => {
+  try {
+    // Check cache first (stored in tasks table ai_estimate column if it exists,
+    // otherwise just call the API each time - it's fast and cheap)
+    const cleanDesc = stripHtmlForAI(description);
+    const prompt = `You are estimating how long a high school assignment will take to complete.
+Title: "${title}"
+Description: "${cleanDesc}"
+${pointsPossible ? `Points possible: ${pointsPossible}` : ''}
+
+Consider the complexity, length requirements, and type of work described.
+Reply with ONLY a single integer: the number of minutes this assignment will realistically take a typical student to complete.
+Do not include any other text.`;
+
+    const response = await anthropicClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const rawText = response.content[0].text.trim();
+    const minutes = parseInt(rawText);
+    if (!isNaN(minutes) && minutes >= 5 && minutes <= 300) {
+      console.log(`  ✓ AI estimate: \${minutes} min`);
+      return minutes;
+    }
+    console.log(`  ✗ AI returned unparseable value: "\${rawText}"`);
+    return null;
+  } catch (error) {
+    console.error('  AI estimation error:', error.message);
+    return null;
+  }
+};
+
 // Main estimation function
 const estimateTaskTime = async (task, userId) => {
-  const { 
-    title, 
-    class: taskClass, 
-    url, 
+  const {
+    title,
+    class: taskClass,
+    url,
     assignmentId,
-    pointsPossible, 
-    assignmentGroupId, 
+    courseId,
+    pointsPossible,
     gradingType,
-    description 
+    description,
+    isOSGCondensed,
+    osgAssessments,
+    osgQuizzes
   } = task;
-  
+
   console.log(`\n=== ESTIMATING TIME FOR: "${title}" ===`);
-  console.log(`Class: ${taskClass}`);
-  console.log(`Points: ${pointsPossible || 'N/A'}`);
-  console.log(`Grading Type: ${gradingType || 'N/A'}`);
-  
+  console.log(`Class: ${taskClass} | Points: ${pointsPossible || 'N/A'} | AssignmentId: ${assignmentId || 'N/A'}`);
+
   let estimate = null;
   let confidence = 'BASELINE';
   let source = 'Default';
-  
-  // ========================================================================
-  // TIER 1: PlanAssist Historical Analysis
-  // ========================================================================
-  
-  // TIER 1A: Course-based point-to-time correlation (renamed from teacher-based)
-  if (pointsPossible && pointsPossible > 0) {
-    console.log(`\nTIER 1A: Checking course-based correlation (${taskClass})...`);
-    try {
-      const courseData = await pool.query(
-        `SELECT tc.actual_time, 
-                COALESCE(t.points_possible, tc.estimated_time * 2) as points
-         FROM tasks_completed tc
-         LEFT JOIN tasks t ON tc.url = t.url
-         WHERE tc.class = $1 
-           AND COALESCE(t.points_possible, tc.estimated_time * 2) > 0`,
-        [taskClass]
-      );
-      
-      if (courseData.rows.length >= 5) {
-        const dataPoints = courseData.rows.map(row => ({
-          points: parseFloat(row.points),
-          time: parseInt(row.actual_time)
-        }));
-        
-        const correlation = calculatePointTimeCorrelation(dataPoints);
-        
-        if (correlation && correlation.rSquared > 0.6) {
-          const baseEstimate = Math.round(correlation.m * pointsPossible + correlation.b);
-          const speedFactor = await calculateUserSpeedFactor(userId);
-          estimate = Math.round(baseEstimate * speedFactor);
-          confidence = correlation.rSquared > 0.7 ? 'VERY_HIGH' : 'HIGH';
-          source = `Course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
-          console.log(`✓ TIER 1A SUCCESS: ${estimate} min (${source})`);
-        } else {
-          console.log(`✗ TIER 1A: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
-        }
-      } else {
-        console.log(`✗ TIER 1A: Only ${courseData.rows.length} data points (need 5+)`);
-      }
-    } catch (error) {
-      console.error('TIER 1A error:', error.message);
-    }
+
+  // =========================================================================
+  // STEP 1: Homeroom → always 0
+  // =========================================================================
+  if (taskClass && (taskClass.includes('Homeroom') || taskClass.includes('homeroom'))) {
+    console.log('✓ STEP 1: Homeroom → 0 min');
+    return 0;
   }
-  
-  // TIER 1B: User-specific course correlation (if course-wide failed)
-  if (!estimate && pointsPossible && pointsPossible > 0) {
-    console.log(`\nTIER 1B: Checking user-specific course correlation...`);
-    try {
-      const userCourseData = await pool.query(
-        `SELECT tc.actual_time,
-                COALESCE(t.points_possible, tc.estimated_time * 2) as points
-         FROM tasks_completed tc
-         LEFT JOIN tasks t ON tc.url = t.url
-         WHERE tc.class = $1 AND tc.user_id = $2
-           AND COALESCE(t.points_possible, tc.estimated_time * 2) > 0`,
-        [taskClass, userId]
-      );
-      
-      if (userCourseData.rows.length >= 3) {
-        const dataPoints = userCourseData.rows.map(row => ({
-          points: parseFloat(row.points),
-          time: parseInt(row.actual_time)
-        }));
-        
-        const correlation = calculatePointTimeCorrelation(dataPoints);
-        
-        if (correlation && correlation.rSquared > 0.5) {
-          const baseEstimate = Math.round(correlation.m * pointsPossible + correlation.b);
-          const speedFactor = await calculateUserSpeedFactor(userId);
-          estimate = Math.round(baseEstimate * speedFactor);
-          confidence = 'HIGH';
-          source = `User course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${correlation.n})`;
-          console.log(`✓ TIER 1B SUCCESS: ${estimate} min (${source})`);
-        } else {
-          console.log(`✗ TIER 1B: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
-        }
-      } else {
-        console.log(`✗ TIER 1B: Only ${userCourseData.rows.length} data points (need 3+)`);
-      }
-    } catch (error) {
-      console.error('TIER 1B error:', error.message);
-    }
+
+  // =========================================================================
+  // STEP 2: OSG Accelerate condensed task → formula
+  // =========================================================================
+  if (isOSGCondensed && (osgAssessments !== undefined || osgQuizzes !== undefined)) {
+    const assessments = osgAssessments || 0;
+    const quizzes = osgQuizzes || 0;
+    estimate = (assessments * 30) + (quizzes * 5) + 15;
+    console.log(`✓ STEP 2: OSG formula → ${estimate} min (${assessments}×30 + ${quizzes}×5 + 15)`);
+    return estimate;
   }
-  
-  // TIER 1D: Exact assignment average (if others failed)
-  if (!estimate && (url || assignmentId)) {
-    console.log(`\nTIER 1D: Checking exact assignment history...`);
+
+  // =========================================================================
+  // STEP 3: Same assignment completed by ANY user ≥6 times → correlation
+  // =========================================================================
+  if (!estimate && assignmentId) {
+    console.log('STEP 3: Checking cross-user assignment history...');
     try {
       const exactResult = await pool.query(
-        `SELECT AVG(actual_time)::INTEGER as avg_time, COUNT(*) as count
-         FROM tasks_completed
-         WHERE url = $1`,
-        [url]
+        `SELECT tc.actual_time, t.points_possible
+         FROM tasks_completed tc
+         LEFT JOIN tasks t ON t.assignment_id = $1 AND t.user_id = tc.user_id
+         WHERE tc.url IN (
+           SELECT url FROM tasks WHERE assignment_id = $1 LIMIT 1
+         )
+         AND tc.actual_time > 0`,
+        [assignmentId]
       );
-      
-      if (exactResult.rows[0] && exactResult.rows[0].count >= 3) {
-        const speedFactor = await calculateUserSpeedFactor(userId);
-        estimate = Math.round(exactResult.rows[0].avg_time * speedFactor);
-        confidence = 'HIGH';
-        source = `${exactResult.rows[0].count} completions of this assignment`;
-        console.log(`✓ TIER 1D SUCCESS: ${estimate} min (${source})`);
-      } else if (exactResult.rows[0] && exactResult.rows[0].count >= 1) {
-        console.log(`✗ TIER 1D: Only ${exactResult.rows[0].count} completion(s) (need 3+)`);
+
+      if (exactResult.rows.length >= 6) {
+        if (pointsPossible && pointsPossible > 0) {
+          // Try points correlation first
+          const dataPoints = exactResult.rows
+            .filter(r => r.points_possible > 0)
+            .map(r => ({ points: parseFloat(r.points_possible), time: parseInt(r.actual_time) }));
+
+          if (dataPoints.length >= 6) {
+            const correlation = calculatePointTimeCorrelation(dataPoints);
+            if (correlation && correlation.rSquared > 0.5) {
+              const speedFactor = await calculateUserSpeedFactor(userId);
+              estimate = Math.round((correlation.m * pointsPossible + correlation.b) * speedFactor);
+              confidence = 'VERY_HIGH';
+              source = `Same assignment, \${exactResult.rows.length} completions, points correlation (R²=\${correlation.rSquared.toFixed(2)})`;
+              console.log(`✓ STEP 3 (correlation): \${estimate} min`);
+            }
+          }
+        }
+
+        // Fall back to simple average if correlation didn't fire
+        if (!estimate) {
+          const times = exactResult.rows.map(r => parseInt(r.actual_time)).sort((a, b) => a - b);
+          // Trimmed mean: drop top and bottom if we have enough
+          const trimmed = times.length >= 8 ? times.slice(1, -1) : times;
+          const avg = Math.round(trimmed.reduce((s, t) => s + t, 0) / trimmed.length);
+          const speedFactor = await calculateUserSpeedFactor(userId);
+          estimate = Math.round(avg * speedFactor);
+          confidence = 'VERY_HIGH';
+          source = `Same assignment, \${exactResult.rows.length} completions, avg \${avg} min`;
+          console.log(`✓ STEP 3 (average): \${estimate} min`);
+        }
       } else {
-        console.log(`✗ TIER 1D: No completion history`);
+        console.log(`✗ STEP 3: Only \${exactResult.rows.length} completions (need 6+)`);
       }
     } catch (error) {
-      console.error('TIER 1D error:', error.message);
+      console.error('STEP 3 error:', error.message);
     }
   }
-  
-  // ========================================================================
-  // TIER 2: Canvas Statistical Analysis
-  // ========================================================================
-  
-  // TIER 2B: Submission type heuristics (simple for now)
-  if (!estimate && gradingType) {
-    console.log(`\nTIER 2B: Checking grading type heuristics...`);
-    switch (gradingType) {
-      case 'pass_fail':
-        estimate = 15;
-        source = 'Pass/fail typically quick';
-        break;
-      case 'gpa_scale':
-        estimate = 45;
-        source = 'GPA scale typically major assignments';
-        break;
-      default:
-        // Will fall through to Tier 3
-        console.log(`✗ TIER 2B: Standard grading type, using Tier 3`);
-    }
-    
-    if (estimate) {
-      confidence = 'MEDIUM';
-      console.log(`✓ TIER 2B SUCCESS: ${estimate} min (${source})`);
-    }
+
+  // =========================================================================
+  // STEP 4: Enrichment / NEST → 10 min
+  // =========================================================================
+  if (!estimate && taskClass && (
+    taskClass.includes('Enrichment') || taskClass.includes('enrichment') || taskClass.includes('NEST')
+  )) {
+    console.log('✓ STEP 4: Enrichment/NEST → 10 min');
+    return 10;
   }
-  
-  // ========================================================================
-  // TIER 3: Pattern Recognition & Defaults
-  // ========================================================================
-  
-  if (!estimate) {
-    console.log(`\nTIER 3: Pattern recognition & defaults...`);
-    
-    // TIER 3A: Enhanced keyword analysis with points scaling
-    const keywordRules = {
-      'Project': { base: 90, pointsMultiplier: 1.2 },
-      'Essay': { base: 60, pointsMultiplier: 1.0 },
-      'Exam': { base: 60, pointsMultiplier: 0.8 },
-      'Test': { base: 45, pointsMultiplier: 0.8 },
-      'Lab': { base: 75, pointsMultiplier: 1.1 },
-      'Presentation': { base: 60, pointsMultiplier: 1.0 },
-      'Discussion': { base: 20, pointsMultiplier: 0.5 },
-      'Quiz': { base: 15, pointsMultiplier: 0.6 },
-      'Worksheet': { base: 25, pointsMultiplier: 0.7 },
-      'Reading': { base: 30, pointsMultiplier: 0.6 },
-      'Homework': { base: 30, pointsMultiplier: 0.8 },
-      'Share': { base: 5, pointsMultiplier: 0.3 },
-      'Reflection': { base: 15, pointsMultiplier: 0.5 },
-      'Response': { base: 10, pointsMultiplier: 0.4 }
-    };
-    
-    for (const [keyword, rule] of Object.entries(keywordRules)) {
-      if (title.includes(keyword)) {
-        if (pointsPossible && pointsPossible > 0) {
-          estimate = Math.round(rule.base + (pointsPossible * rule.pointsMultiplier));
-        } else {
-          estimate = rule.base;
-        }
-        confidence = 'LOW';
-        source = `Keyword "${keyword}" ${pointsPossible ? 'with points scaling' : ''}`;
-        console.log(`✓ TIER 3A: ${estimate} min (${source})`);
-        break;
-      }
-    }
-    
-    // TIER 3B: Points-based heuristics (if no keyword matched)
-    if (!estimate && pointsPossible) {
-      console.log(`TIER 3B: Points-based heuristics...`);
-      if (pointsPossible <= 10) estimate = 15;
-      else if (pointsPossible <= 25) estimate = 25;
-      else if (pointsPossible <= 50) estimate = 35;
-      else if (pointsPossible <= 100) estimate = 50;
-      else estimate = 75;
-      
-      confidence = 'LOW';
-      source = `Points-based (${pointsPossible} pts)`;
-      console.log(`✓ TIER 3B: ${estimate} min (${source})`);
-    }
-    
-    // TIER 3D: Smart defaults (final fallback)
-    if (!estimate) {
-      console.log(`TIER 3D: Smart defaults...`);
-      if (taskClass.includes('Homeroom')) {
-        estimate = 0;
-        source = 'Homeroom task';
-      } else if (taskClass.includes('Enrichment')) {
-        estimate = 5;
-        source = 'Enrichment typical';
+
+  // =========================================================================
+  // STEP 5: Same course (course_id OR course_name), ≥14 completions → correlation
+  // =========================================================================
+  if (!estimate && pointsPossible && pointsPossible > 0) {
+    console.log('STEP 5: Checking cross-user course correlation...');
+    try {
+      // Match on course_id if available, otherwise course name
+      let courseQuery, courseParams;
+      if (courseId) {
+        courseQuery = `SELECT tc.actual_time, t.points_possible
+                        FROM tasks_completed tc
+                        JOIN tasks t ON tc.url = t.url
+                        WHERE t.course_id = $1
+                          AND t.points_possible > 0
+                          AND tc.actual_time > 0`;
+        courseParams = [courseId];
       } else {
-        estimate = 25;
-        source = 'Universal default';
+        courseQuery = `SELECT tc.actual_time, t.points_possible
+                        FROM tasks_completed tc
+                        JOIN tasks t ON tc.url = t.url
+                        WHERE tc.class = $1
+                          AND t.points_possible > 0
+                          AND tc.actual_time > 0`;
+        courseParams = [taskClass];
       }
-      confidence = 'BASELINE';
-      console.log(`✓ TIER 3D: ${estimate} min (${source})`);
+
+      const courseData = await pool.query(courseQuery, courseParams);
+
+      if (courseData.rows.length >= 14) {
+        const dataPoints = courseData.rows.map(r => ({
+          points: parseFloat(r.points_possible),
+          time: parseInt(r.actual_time)
+        }));
+
+        const correlation = calculatePointTimeCorrelation(dataPoints);
+        if (correlation && correlation.rSquared > 0.5) {
+          const speedFactor = await calculateUserSpeedFactor(userId);
+          estimate = Math.round((correlation.m * pointsPossible + correlation.b) * speedFactor);
+          confidence = 'HIGH';
+          source = `Course correlation (R²=\${correlation.rSquared.toFixed(2)}, n=\${courseData.rows.length})`;
+          console.log(`✓ STEP 5: \${estimate} min (\${source})`);
+        } else {
+          console.log(`✗ STEP 5: Weak correlation (R²=\${correlation?.rSquared.toFixed(2) || 'N/A'})`);
+        }
+      } else {
+        console.log(`✗ STEP 5: Only \${courseData.rows.length} course completions (need 14+)`);
+      }
+    } catch (error) {
+      console.error('STEP 5 error:', error.message);
     }
   }
-  
-  console.log(`\n=== FINAL ESTIMATE: ${estimate} minutes ===`);
-  console.log(`Confidence: ${confidence}`);
-  console.log(`Source: ${source}`);
-  
-  // Store confidence metadata (we'll add columns for this later)
-  // For now, just return the estimate
-  
+
+  // =========================================================================
+  // STEP 6: AI description analysis (Haiku)
+  // =========================================================================
+  if (!estimate && description) {
+    const cleanDesc = stripHtmlForAI(description);
+    if (cleanDesc.length >= 20 && cleanDesc.length <= 1200) {
+      console.log(`STEP 6: AI description analysis (\${cleanDesc.length} chars)...`);
+      try {
+        const aiEstimate = await getAIEstimate(assignmentId, title, cleanDesc, pointsPossible);
+        if (aiEstimate !== null) {
+          estimate = aiEstimate;
+          confidence = 'MEDIUM';
+          source = 'AI description analysis';
+          console.log(`✓ STEP 6: \${estimate} min`);
+        } else {
+          console.log('✗ STEP 6: AI returned no usable estimate');
+        }
+      } catch (error) {
+        console.error('STEP 6 error:', error.message);
+      }
+    } else {
+      console.log(`✗ STEP 6: Description length \${cleanDesc.length} chars (need 20-1200)`);
+    }
+  }
+
+  // =========================================================================
+  // STEP 7: Keyword matching — check ALL keywords, average their estimates
+  // =========================================================================
+  if (!estimate) {
+    console.log('STEP 7: Keyword analysis...');
+    const keywordRules = {
+      'Project':      { base: 90,  pointsMultiplier: 1.2 },
+      'Essay':        { base: 60,  pointsMultiplier: 1.0 },
+      'Exam':         { base: 60,  pointsMultiplier: 0.8 },
+      'Test':         { base: 45,  pointsMultiplier: 0.8 },
+      'Lab':          { base: 75,  pointsMultiplier: 1.1 },
+      'Presentation': { base: 60,  pointsMultiplier: 1.0 },
+      'Discussion':   { base: 20,  pointsMultiplier: 0.5 },
+      'Quiz':         { base: 15,  pointsMultiplier: 0.6 },
+      'Assessment':   { base: 30,  pointsMultiplier: 0.7 },
+      'Worksheet':    { base: 25,  pointsMultiplier: 0.7 },
+      'Reading':      { base: 30,  pointsMultiplier: 0.6 },
+      'Homework':     { base: 30,  pointsMultiplier: 0.8 },
+      'Share':        { base: 5,   pointsMultiplier: 0.3 },
+      'Reflection':   { base: 15,  pointsMultiplier: 0.5 },
+      'Response':     { base: 10,  pointsMultiplier: 0.4 }
+    };
+
+    const matchedEstimates = [];
+    const titleUpper = title.toUpperCase();
+
+    for (const [keyword, rule] of Object.entries(keywordRules)) {
+      if (titleUpper.includes(keyword.toUpperCase())) {
+        const kEstimate = pointsPossible && pointsPossible > 0
+          ? Math.round(rule.base + (pointsPossible * rule.pointsMultiplier))
+          : rule.base;
+        matchedEstimates.push(kEstimate);
+        console.log(`  Keyword "\${keyword}": \${kEstimate} min`);
+      }
+    }
+
+    if (matchedEstimates.length > 0) {
+      estimate = Math.round(matchedEstimates.reduce((s, v) => s + v, 0) / matchedEstimates.length);
+      confidence = 'LOW';
+      source = `Keyword match (\${matchedEstimates.length} keywords, averaged)`;
+      console.log(`✓ STEP 7: \${estimate} min (\${source})`);
+    } else {
+      console.log('✗ STEP 7: No keywords matched');
+    }
+  }
+
+  // =========================================================================
+  // STEP 8: Points-based fallback
+  // =========================================================================
+  if (!estimate && pointsPossible && pointsPossible > 0) {
+    console.log('STEP 8: Points-based fallback...');
+    if      (pointsPossible <= 5)   estimate = 15;
+    else if (pointsPossible <= 20)  estimate = 25;
+    else if (pointsPossible <= 50)  estimate = 35;
+    else if (pointsPossible <= 100) estimate = 50;
+    else if (pointsPossible <= 200) estimate = 70;
+    else                            estimate = 90;
+    confidence = 'LOW';
+    source = `Points-based (\${pointsPossible} pts)`;
+    console.log(`✓ STEP 8: \${estimate} min (\${source})`);
+  }
+
+  // =========================================================================
+  // STEP 9: Final fallback → 20 min
+  // =========================================================================
+  if (!estimate) {
+    estimate = 20;
+    confidence = 'BASELINE';
+    source = 'Default fallback';
+    console.log('✓ STEP 9: Default → 20 min');
+  }
+
+  // Clamp to sane range
+  estimate = Math.max(5, Math.min(300, estimate));
+
+  console.log(`\n=== FINAL ESTIMATE: \${estimate} min | \${confidence} | \${source} ===`);
   return estimate;
 };
 
