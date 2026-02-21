@@ -304,10 +304,10 @@ Do not include any other text.`;
     const rawText = response.content[0].text.trim();
     const minutes = parseInt(rawText);
     if (!isNaN(minutes) && minutes >= 5 && minutes <= 300) {
-      console.log(`  ✓ AI estimate: \${minutes} min`);
+      console.log(`  ✓ AI estimate: ${minutes} min`);
       return minutes;
     }
-    console.log(`  ✗ AI returned unparseable value: "\${rawText}"`);
+    console.log(`  ✗ AI returned unparseable value: "${rawText}"`);
     return null;
   } catch (error) {
     console.error('  AI estimation error:', error.message);
@@ -387,8 +387,8 @@ const estimateTaskTime = async (task, userId) => {
               const speedFactor = await calculateUserSpeedFactor(userId);
               estimate = Math.round((correlation.m * pointsPossible + correlation.b) * speedFactor);
               confidence = 'VERY_HIGH';
-              source = `Same assignment, \${exactResult.rows.length} completions, points correlation (R²=\${correlation.rSquared.toFixed(2)})`;
-              console.log(`✓ STEP 3 (correlation): \${estimate} min`);
+              source = `Same assignment, ${exactResult.rows.length} completions, points correlation (R²=${correlation.rSquared.toFixed(2)})`;
+              console.log(`✓ STEP 3 (correlation): ${estimate} min`);
             }
           }
         }
@@ -402,11 +402,11 @@ const estimateTaskTime = async (task, userId) => {
           const speedFactor = await calculateUserSpeedFactor(userId);
           estimate = Math.round(avg * speedFactor);
           confidence = 'VERY_HIGH';
-          source = `Same assignment, \${exactResult.rows.length} completions, avg \${avg} min`;
-          console.log(`✓ STEP 3 (average): \${estimate} min`);
+          source = `Same assignment, ${exactResult.rows.length} completions, avg ${avg} min`;
+          console.log(`✓ STEP 3 (average): ${estimate} min`);
         }
       } else {
-        console.log(`✗ STEP 3: Only \${exactResult.rows.length} completions (need 6+)`);
+        console.log(`✗ STEP 3: Only ${exactResult.rows.length} completions (need 6+)`);
       }
     } catch (error) {
       console.error('STEP 3 error:', error.message);
@@ -462,13 +462,13 @@ const estimateTaskTime = async (task, userId) => {
           const speedFactor = await calculateUserSpeedFactor(userId);
           estimate = Math.round((correlation.m * pointsPossible + correlation.b) * speedFactor);
           confidence = 'HIGH';
-          source = `Course correlation (R²=\${correlation.rSquared.toFixed(2)}, n=\${courseData.rows.length})`;
-          console.log(`✓ STEP 5: \${estimate} min (\${source})`);
+          source = `Course correlation (R²=${correlation.rSquared.toFixed(2)}, n=${courseData.rows.length})`;
+          console.log(`✓ STEP 5: ${estimate} min (${source})`);
         } else {
-          console.log(`✗ STEP 5: Weak correlation (R²=\${correlation?.rSquared.toFixed(2) || 'N/A'})`);
+          console.log(`✗ STEP 5: Weak correlation (R²=${correlation?.rSquared.toFixed(2) || 'N/A'})`);
         }
       } else {
-        console.log(`✗ STEP 5: Only \${courseData.rows.length} course completions (need 14+)`);
+        console.log(`✗ STEP 5: Only ${courseData.rows.length} course completions (need 14+)`);
       }
     } catch (error) {
       console.error('STEP 5 error:', error.message);
@@ -481,14 +481,14 @@ const estimateTaskTime = async (task, userId) => {
   if (!estimate && description) {
     const cleanDesc = stripHtmlForAI(description);
     if (cleanDesc.length >= 20 && cleanDesc.length <= 1200) {
-      console.log(`STEP 6: AI description analysis (\${cleanDesc.length} chars)...`);
+      console.log(`STEP 6: AI description analysis (${cleanDesc.length} chars)...`);
       try {
         const aiEstimate = await getAIEstimate(assignmentId, title, cleanDesc, pointsPossible);
         if (aiEstimate !== null) {
           estimate = aiEstimate;
           confidence = 'MEDIUM';
           source = 'AI description analysis';
-          console.log(`✓ STEP 6: \${estimate} min`);
+          console.log(`✓ STEP 6: ${estimate} min`);
         } else {
           console.log('✗ STEP 6: AI returned no usable estimate');
         }
@@ -496,7 +496,7 @@ const estimateTaskTime = async (task, userId) => {
         console.error('STEP 6 error:', error.message);
       }
     } else {
-      console.log(`✗ STEP 6: Description length \${cleanDesc.length} chars (need 20-1200)`);
+      console.log(`✗ STEP 6: Description length ${cleanDesc.length} chars (need 20-1200)`);
     }
   }
 
@@ -532,15 +532,15 @@ const estimateTaskTime = async (task, userId) => {
           ? Math.round(rule.base + (pointsPossible * rule.pointsMultiplier))
           : rule.base;
         matchedEstimates.push(kEstimate);
-        console.log(`  Keyword "\${keyword}": \${kEstimate} min`);
+        console.log(`  Keyword "${keyword}": ${kEstimate} min`);
       }
     }
 
     if (matchedEstimates.length > 0) {
       estimate = Math.round(matchedEstimates.reduce((s, v) => s + v, 0) / matchedEstimates.length);
       confidence = 'LOW';
-      source = `Keyword match (\${matchedEstimates.length} keywords, averaged)`;
-      console.log(`✓ STEP 7: \${estimate} min (\${source})`);
+      source = `Keyword match (${matchedEstimates.length} keywords, averaged)`;
+      console.log(`✓ STEP 7: ${estimate} min (${source})`);
     } else {
       console.log('✗ STEP 7: No keywords matched');
     }
@@ -558,8 +558,8 @@ const estimateTaskTime = async (task, userId) => {
     else if (pointsPossible <= 200) estimate = 70;
     else                            estimate = 90;
     confidence = 'LOW';
-    source = `Points-based (\${pointsPossible} pts)`;
-    console.log(`✓ STEP 8: \${estimate} min (\${source})`);
+    source = `Points-based (${pointsPossible} pts)`;
+    console.log(`✓ STEP 8: ${estimate} min (${source})`);
   }
 
   // =========================================================================
@@ -575,7 +575,7 @@ const estimateTaskTime = async (task, userId) => {
   // Clamp to sane range
   estimate = Math.max(5, Math.min(300, estimate));
 
-  console.log(`\n=== FINAL ESTIMATE: \${estimate} min | \${confidence} | \${source} ===`);
+  console.log(`\n=== FINAL ESTIMATE: ${estimate} min | ${confidence} | ${source} ===`);
   return estimate;
 };
 
