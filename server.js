@@ -1173,17 +1173,24 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
     
     // Step 5: Format assignments for database with time estimation
-    // MIGRATION: Update any existing OSG condensed tasks with old URL format (assignments#date) to /modules
-    const osgOldUrlPattern = 'canvas.oneschoolglobal.com/courses/';
-    const oldOsgUrlRows = await pool.query(
-      `SELECT id, url FROM tasks WHERE user_id = $1 AND url LIKE $2 AND url LIKE $3 AND deleted = false`,
-      [req.user.id, '%' + osgOldUrlPattern + '%', '%assignments#%']
+    // MIGRATION: Update any existing OSG condensed tasks with old URL formats to /modules?week=YYYY-MM-DD
+    // Old format 1: /assignments#YYYY-MM-DD  (pre-fix format with date fragment)
+    // Old format 2: /modules (no week param - from previous migration, missing date)
+    const oldOsgRows = await pool.query(
+      `SELECT id, url, deadline_date FROM tasks
+       WHERE user_id = $1
+         AND deleted = false
+         AND title LIKE 'OSG Accelerate%'
+         AND (url LIKE '%assignments#%' OR (url LIKE '%/modules' AND url NOT LIKE '%?week=%'))`,
+      [req.user.id]
     );
-    for (const row of oldOsgUrlRows.rows) {
-      // Extract course ID from URL and build new /modules URL
-      const match = row.url.match(/\/courses\/(\d+)\/assignments#/);
-      if (match) {
-        const newUrl = `https://canvas.oneschoolglobal.com/courses/${match[1]}/modules`;
+    for (const row of oldOsgRows.rows) {
+      const courseMatch = row.url.match(/\/courses\/(\d+)\//);
+      if (courseMatch && row.deadline_date) {
+        const dateStr = typeof row.deadline_date === 'string'
+          ? row.deadline_date.split('T')[0]
+          : new Date(row.deadline_date).toISOString().split('T')[0];
+        const newUrl = `https://canvas.oneschoolglobal.com/courses/${courseMatch[1]}/modules?week=${dateStr}`;
         await pool.query('UPDATE tasks SET url = $1 WHERE id = $2', [newUrl, row.id]);
         console.log(`  ✓ Migrated OSG URL: ${row.url} → ${newUrl}`);
       }
@@ -1305,7 +1312,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       
       // URL: OSG Accelerate course assignments page, unique per day via query param
       const osgCourseId = firstTask.assignment.course_id;
-      const condensedUrl = `https://canvas.oneschoolglobal.com/courses/${osgCourseId}/modules`;
+      const condensedUrl = `https://canvas.oneschoolglobal.com/courses/${osgCourseId}/modules?week=${deadlineDate}`;
       
       console.log(`  ✓ Condensed OSG ${deadlineDate}: ${groupTasks.length} tasks (${assessmentCount} assessments, ${quizCount} quizzes) → ${condensedTime} min`);
       
