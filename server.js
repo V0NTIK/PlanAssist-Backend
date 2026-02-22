@@ -675,7 +675,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods FROM users WHERE id = $1',
+      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -1687,6 +1687,26 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         if (alreadyCompleted.rows.length > 0) {
           console.log(`\n[SKIP] Task already completed by user: ${incomingTask.title}`);
           continue;
+        }
+
+        // SAFETY NET for OSG condensed tasks (assignmentId=null):
+        // Check if a non-deleted task with same title + deadline_date already exists.
+        // This prevents duplicates when URL format changes or URL lookup misses.
+        if (!incomingTask.assignmentId && incomingTask.title && incomingTask.deadlineDate) {
+          const osgDuplicate = await pool.query(
+            `SELECT id FROM tasks
+             WHERE user_id = $1 AND title = $2 AND deadline_date = $3 AND deleted = false`,
+            [req.user.id, incomingTask.title, incomingTask.deadlineDate]
+          );
+          if (osgDuplicate.rows.length > 0) {
+            console.log(`\n[SKIP] Duplicate OSG task detected (title+date match): ${incomingTask.title} on ${incomingTask.deadlineDate}`);
+            // Update the URL on the existing row to new format
+            await pool.query(
+              'UPDATE tasks SET url = $1 WHERE id = $2',
+              [incomingTask.url, osgDuplicate.rows[0].id]
+            );
+            continue;
+          }
         }
         
         // URL DOESN'T EXIST - Import as new task
