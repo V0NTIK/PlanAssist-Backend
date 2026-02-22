@@ -1478,7 +1478,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM tasks 
-       WHERE user_id = $1 AND completed = false AND deleted = false
+       WHERE user_id = $1 AND deleted = false
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
