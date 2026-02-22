@@ -715,7 +715,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       presentPeriods: user.present_periods || '2-6',
       schedule,
       calendarTodayCentered: user.calendar_today_centered ?? false,
-      calendarShowHomeroom: user.calendar_show_homeroom ?? false,
+      calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true
     });
   } catch (error) {
