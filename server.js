@@ -1449,16 +1449,16 @@ app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
     // Only fetch within a reasonable window (30 days back, 30 days forward)
     const completedResult = await pool.query(
       `SELECT id, title, NULL as segment, class, url, NULL as description,
-              deadline::date as deadline_date,
-              deadline::time as deadline_time,
+              deadline_date,
+              deadline_time,
               NULL as priority_order,
               true as completed, completed_at as submitted_at,
               false as is_missing, false as is_late,
               NULL as points_possible, NULL as course_id, NULL as assignment_id
        FROM tasks_completed
        WHERE user_id = $1
-         AND deadline >= NOW() - INTERVAL '30 days'
-         AND deadline <= NOW() + INTERVAL '30 days'`,
+         AND deadline_date >= CURRENT_DATE - INTERVAL '30 days'
+         AND deadline_date <= CURRENT_DATE + INTERVAL '30 days'`,
       [req.user.id]
     );
 
