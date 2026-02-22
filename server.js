@@ -1203,10 +1203,20 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     for (const assignment of allAssignments) {
       const dueDate = new Date(assignment.due_at);
       
-      // Extract date and time in UTC
-      const deadlineDate = dueDate.toISOString().split('T')[0]; // YYYY-MM-DD
+      // Extract local date from Canvas due_at string (preserves the date as Canvas shows it)
+      // Canvas returns e.g. "2026-02-24T23:59:00-05:00" - we want local date "2026-02-24"
+      // Using UTC date (toISOString) would shift "Feb 24 11:59 PM EST" to "Feb 25" UTC.
+      let deadlineDate;
+      const dueatStr = assignment.due_at || '';
+      const localDateMatch = dueatStr.match(/^(\d{4}-\d{2}-\d{2})T/);
+      if (localDateMatch) {
+        deadlineDate = localDateMatch[1]; // e.g. "2026-02-24"
+      } else {
+        deadlineDate = dueDate.toISOString().split('T')[0]; // fallback to UTC date
+      }
+      // Store time in UTC for consistent DB storage
       const timeString = dueDate.toISOString().split('T')[1]; // HH:MM:SS.sssZ
-      const deadlineTime = timeString.split('.')[0]; // HH:MM:SS (remove milliseconds and Z)
+      const deadlineTime = timeString.split('.')[0]; // HH:MM:SS
       
       // Get submission data
       const submission = assignment.submission || {};
@@ -1478,7 +1488,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM tasks 
-       WHERE user_id = $1 AND deleted = false
+       WHERE user_id = $1
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
