@@ -713,7 +713,10 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       grade: user.grade || '',
       canvasApiToken: canvasApiToken,
       presentPeriods: user.present_periods || '2-6',
-      schedule
+      schedule,
+      calendarTodayCentered: user.calendar_today_centered ?? false,
+      calendarShowHomeroom: user.calendar_show_homeroom ?? false,
+      calendarShowCompleted: user.calendar_show_completed ?? true
     });
   } catch (error) {
     console.error('Get account setup error:', error);
@@ -724,7 +727,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 // Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const { grade, canvasApiToken, presentPeriods, schedule } = req.body;
+    const { grade, canvasApiToken, presentPeriods, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted } = req.body;
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -743,8 +746,15 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     }
 
     await pool.query(
-      'UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3, present_periods = $4, is_new_user = false WHERE id = $5',
-      [grade, encryptedToken, iv, presentPeriods, req.user.id]
+      `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
+        present_periods = $4, is_new_user = false,
+        calendar_today_centered = $5, calendar_show_homeroom = $6, calendar_show_completed = $7
+       WHERE id = $8`,
+      [grade, encryptedToken, iv, presentPeriods,
+       calendarTodayCentered ?? false,
+       calendarShowHomeroom ?? false,
+       calendarShowCompleted ?? true,
+       req.user.id]
     );
 
     await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
@@ -1412,6 +1422,51 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
 // ============================================================================
 
 // Get tasks (all incomplete tasks)
+// Calendar endpoint - returns ALL non-deleted tasks (including completed)
+// plus tasks_completed entries, merged for the calendar view
+app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
+  try {
+    // Active + completed tasks still in tasks table (deleted=false)
+    const activeResult = await pool.query(
+      `SELECT id, title, segment, class, url, description,
+              deadline_date, deadline_time, priority_order,
+              completed, submitted_at, is_missing, is_late,
+              points_possible, course_id, assignment_id
+       FROM tasks
+       WHERE user_id = $1 AND deleted = false
+       ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST`,
+      [req.user.id]
+    );
+
+    // Tasks completed via sessions (hard-deleted from tasks, moved to tasks_completed)
+    // Only fetch within a reasonable window (30 days back, 30 days forward)
+    const completedResult = await pool.query(
+      `SELECT id, title, NULL as segment, class, url, NULL as description,
+              deadline::date as deadline_date,
+              deadline::time as deadline_time,
+              NULL as priority_order,
+              true as completed, completed_at as submitted_at,
+              false as is_missing, false as is_late,
+              NULL as points_possible, NULL as course_id, NULL as assignment_id
+       FROM tasks_completed
+       WHERE user_id = $1
+         AND deadline >= NOW() - INTERVAL '30 days'
+         AND deadline <= NOW() + INTERVAL '30 days'`,
+      [req.user.id]
+    );
+
+    // Merge: avoid duplicates (tasks_completed entries whose url matches active tasks)
+    const activeUrls = new Set(activeResult.rows.map(t => t.url));
+    const dedupedCompleted = completedResult.rows.filter(t => !activeUrls.has(t.url));
+
+    const allTasks = [...activeResult.rows, ...dedupedCompleted];
+    res.json(allTasks);
+  } catch (error) {
+    console.error('Calendar tasks error:', error);
+    res.json([]);
+  }
+});
+
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
