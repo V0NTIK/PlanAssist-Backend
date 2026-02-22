@@ -1534,11 +1534,45 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           );
         }
       } else {
-        // No assignment_id, just use URL
-        existingTasksResult = await pool.query(
-          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
-          [req.user.id, incomingTask.url]
-        );
+        // No assignment_id (e.g. OSG condensed tasks) - match by title+deadline_date first,
+        // which is more reliable than URL since URL format can change
+        if (incomingTask.title && incomingTask.deadlineDate) {
+          existingTasksResult = await pool.query(
+            `SELECT * FROM tasks WHERE user_id = $1 AND title = $2 AND deadline_date = $3
+             ORDER BY id ASC`,
+            [req.user.id, incomingTask.title, incomingTask.deadlineDate]
+          );
+          if (existingTasksResult.rows.length > 0) {
+            console.log(`[OSG MATCH] Found by title+date: "${incomingTask.title}" on ${incomingTask.deadlineDate}`);
+            // Update URL to current format while we're here
+            const existRow = existingTasksResult.rows[0];
+            if (existRow.url !== incomingTask.url) {
+              await pool.query('UPDATE tasks SET url = $1 WHERE id = $2', [incomingTask.url, existRow.id]);
+              existingTasksResult.rows[0].url = incomingTask.url;
+            }
+            // If multiple rows found (old duplicates), soft-delete extras
+            if (existingTasksResult.rows.length > 1) {
+              const extraIds = existingTasksResult.rows.slice(1).map(r => r.id);
+              await pool.query(
+                `UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = ANY($1)`,
+                [extraIds]
+              );
+              console.log(`[OSG CLEANUP] Soft-deleted ${extraIds.length} duplicate(s): ids ${extraIds.join(',')}`);
+              existingTasksResult = { rows: [existingTasksResult.rows[0]] };
+            }
+          } else {
+            // Fall back to URL
+            existingTasksResult = await pool.query(
+              'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+              [req.user.id, incomingTask.url]
+            );
+          }
+        } else {
+          existingTasksResult = await pool.query(
+            'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+            [req.user.id, incomingTask.url]
+          );
+        }
       }
 
       if (existingTasksResult.rows.length > 0) {
