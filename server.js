@@ -1611,7 +1611,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   current_grade = $8,
                   submitted_at = $9,
                   is_missing = $10,
-                  is_late = $11
+                  is_late = $11,
+                  deleted = false
                  WHERE id = $12 AND user_id = $13`,
                 [
                   incomingTask.title,
@@ -1652,7 +1653,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   lock_at = $17,
                   submitted_at = $18,
                   is_missing = $19,
-                  is_late = $20
+                  is_late = $20,
+                  deleted = false
                  WHERE id = $21 AND user_id = $22`,
                 [
                   incomingTask.title,
