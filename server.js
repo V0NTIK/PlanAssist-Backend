@@ -36,6 +36,12 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// Force UTC timezone for all DB sessions so DATE columns are never shifted
+// by the Supabase server timezone (which may be EST/America_New_York)
+pool.on('connect', client => {
+  client.query("SET TIME ZONE 'UTC'");
+});
+
 // JWT Secret - ENFORCE in production
 let JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
@@ -1211,7 +1217,6 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const isoStr = dueDate.toISOString(); // always UTC, e.g. "2026-02-25T04:59:00.000Z"
       const deadlineDate = isoStr.split('T')[0];          // UTC date: "2026-02-25"
       const deadlineTime = isoStr.split('T')[1].split('.')[0]; // UTC time: "04:59:00"
-      console.log(`[DATE DEBUG] due_at="${assignment.due_at}" → deadlineDate="${deadlineDate}" deadlineTime="${deadlineTime}"`);
       
       // Get submission data
       const submission = assignment.submission || {};
@@ -1504,10 +1509,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 
     console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from Canvas API ===`);
-    // Debug: log all tasks with deadlineTime < 05:00:00 (the ones suspected of date shifting)
-    tasks.filter(t => t.deadlineTime && t.deadlineTime < '05:00:00').forEach(t => {
-      console.log(`[POST /tasks DEBUG] title="${t.title?.substring(0,35)}" deadlineDate="${t.deadlineDate}" deadlineTime="${t.deadlineTime}"`);
-    });
 
     // CRITICAL: Sort tasks by deadline before assigning priorities
     // This ensures priority_order follows chronological deadline order
@@ -1767,7 +1768,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
         }
 
-        console.log(`[PRE-INSERT] "${incomingTask.title?.substring(0,30)}" deadlineDate="${incomingTask.deadlineDate}" type=${typeof incomingTask.deadlineDate}`);
         const result = await pool.query(
           `INSERT INTO tasks 
            (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
