@@ -1141,41 +1141,37 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     
 
     
-    // Step 4: Fetch assignments from all courses
-    console.log('\n📋 Fetching assignments...');
-    const allAssignments = [];
+    // Step 4: Fetch assignments from all courses IN PARALLEL
+    // Previously sequential (one request at a time) — now all requests fire simultaneously.
+    // 10 courses × ~2s each = ~20s sequential → ~2-3s parallel (slowest single request).
+    console.log('\n📋 Fetching assignments (parallel)...');
     const today = new Date();
     const oneMonthFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
-    
-    for (const course of courses) {
-      try {
-        const assignmentsResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
-          { headers, timeout: 15000 }
-        );
-        
-        for (const assignment of assignmentsResponse.data) {
-          // Only include assignments with due dates
-          if (!assignment.due_at) continue;
-          
-          const dueDate = new Date(assignment.due_at);
-          
-          // Only include assignments within the next month
-          if (dueDate >= today && dueDate <= oneMonthFromNow) {
-            allAssignments.push({
-              ...assignment,
-              course_name: course.name,
-              course_id: course.id
-            });
-          }
+
+    const courseAssignmentResults = await Promise.all(
+      courses.map(async (course) => {
+        try {
+          const assignmentsResponse = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
+            { headers, timeout: 15000 }
+          );
+          console.log(`  ✓ Course: ${course.name} - ${assignmentsResponse.data.length} total assignments`);
+          return assignmentsResponse.data
+            .filter(a => {
+              if (!a.due_at) return false;
+              const dueDate = new Date(a.due_at);
+              return dueDate >= today && dueDate <= oneMonthFromNow;
+            })
+            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
+        } catch (error) {
+          console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
+          return [];
         }
-        
-        console.log(`  ✓ Course: ${course.name} - ${assignmentsResponse.data.length} total assignments`);
-      } catch (error) {
-        console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
-      }
-    }
-    
+      })
+    );
+
+    // Flatten results from all courses into a single array
+    const allAssignments = courseAssignmentResults.flat();
     console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
     
     // Step 5: Format assignments for database with time estimation
