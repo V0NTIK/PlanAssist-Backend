@@ -1203,20 +1203,16 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     for (const assignment of allAssignments) {
       const dueDate = new Date(assignment.due_at);
       
-      // Extract local date from Canvas due_at string (preserves the date as Canvas shows it)
-      // Canvas returns e.g. "2026-02-24T23:59:00-05:00" - we want local date "2026-02-24"
-      // Using UTC date (toISOString) would shift "Feb 24 11:59 PM EST" to "Feb 25" UTC.
-      let deadlineDate;
-      const dueatStr = assignment.due_at || '';
-      const localDateMatch = dueatStr.match(/^(\d{4}-\d{2}-\d{2})T/);
-      if (localDateMatch) {
-        deadlineDate = localDateMatch[1]; // e.g. "2026-02-24"
-      } else {
-        deadlineDate = dueDate.toISOString().split('T')[0]; // fallback to UTC date
-      }
-      // Store time in UTC for consistent DB storage
-      const timeString = dueDate.toISOString().split('T')[1]; // HH:MM:SS.sssZ
-      const deadlineTime = timeString.split('.')[0]; // HH:MM:SS
+      // Always derive deadline_date and deadline_time from the UTC representation.
+      // Canvas may return due_at with a timezone offset (e.g. "2026-02-24T23:59:00-05:00")
+      // or in UTC (e.g. "2026-02-25T04:59:00Z"). Using dueDate.toISOString() normalises
+      // both to UTC, so deadline_date and deadline_time are always a consistent UTC pair.
+      // Frontend reconstructs correctly: new Date(`${deadline_date}T${deadline_time}Z`)
+      const isoStr = dueDate.toISOString(); // always UTC, e.g. "2026-02-25T04:59:00.000Z"
+      const deadlineDate = isoStr.split('T')[0];          // UTC date: "2026-02-25"
+      const deadlineTime = isoStr.split('T')[1].split('.')[0]; // UTC time: "04:59:00"
+      // Note: the frontend converts this back to local time correctly, so a task stored
+      // as "2026-02-25 04:59:00 UTC" displays as "Feb 24 11:59 PM EST" to the user.
       
       // Get submission data
       const submission = assignment.submission || {};
@@ -1757,12 +1753,16 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
         console.log(`  courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, pointsPossible=${incomingTask.pointsPossible}`);
         
-        // Get max priority for appending new tasks
-        const maxPriorityResult = await pool.query(
-          'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
-          [req.user.id]
-        );
-        const nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
+        // Get max priority for appending new tasks (only for incomplete tasks)
+        let nextPriority = null;
+        const isAlreadyCompleted = incomingTask.completed ?? false;
+        if (!isAlreadyCompleted) {
+          const maxPriorityResult = await pool.query(
+            'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
+            [req.user.id]
+          );
+          nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
+        }
 
         const result = await pool.query(
           `INSERT INTO tasks 
@@ -1803,7 +1803,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             null, // No user override yet
             0, // No accumulated time yet
             nextPriority, // Append to end
-            true, // Mark as new
+            !isAlreadyCompleted, // Mark as new only if not already completed
             incomingTask.completed ?? false,
             false, // Not deleted
             incomingTask.courseId ?? null,
