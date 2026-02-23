@@ -1,0 +1,29 @@
+name: Daily Morning Email
+
+on:
+  schedule:
+    # 10:00 AM UTC, Monday through Friday
+    - cron: '0 10 * * 1-5'
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  send-emails:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger PlanAssist daily email
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            https://planassist.onrender.com/api/cron/daily-email)
+          
+          echo "Response status: $response"
+          
+          if [ "$response" != "200" ]; then
+            echo "❌ Email job failed with status $response"
+            exit 1
+          else
+            echo "✅ Email job completed successfully"
+          fi
