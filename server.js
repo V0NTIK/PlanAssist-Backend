@@ -1211,8 +1211,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const isoStr = dueDate.toISOString(); // always UTC, e.g. "2026-02-25T04:59:00.000Z"
       const deadlineDate = isoStr.split('T')[0];          // UTC date: "2026-02-25"
       const deadlineTime = isoStr.split('T')[1].split('.')[0]; // UTC time: "04:59:00"
-      // Note: the frontend converts this back to local time correctly, so a task stored
-      // as "2026-02-25 04:59:00 UTC" displays as "Feb 24 11:59 PM EST" to the user.
+      console.log(`[DATE DEBUG] due_at="${assignment.due_at}" → deadlineDate="${deadlineDate}" deadlineTime="${deadlineTime}"`);
       
       // Get submission data
       const submission = assignment.submission || {};
