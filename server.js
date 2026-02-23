@@ -1504,9 +1504,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 
     console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from Canvas API ===`);
-    // Debug: log first few tasks' deadlineDate as received
-    tasks.slice(0, 3).forEach(t => {
-      console.log(`[POST /tasks DEBUG] title="${t.title?.substring(0,30)}" deadlineDate="${t.deadlineDate}" deadlineTime="${t.deadlineTime}"`);
+    // Debug: log all tasks with deadlineTime < 05:00:00 (the ones suspected of date shifting)
+    tasks.filter(t => t.deadlineTime && t.deadlineTime < '05:00:00').forEach(t => {
+      console.log(`[POST /tasks DEBUG] title="${t.title?.substring(0,35)}" deadlineDate="${t.deadlineDate}" deadlineTime="${t.deadlineTime}"`);
     });
 
     // CRITICAL: Sort tasks by deadline before assigning priorities
