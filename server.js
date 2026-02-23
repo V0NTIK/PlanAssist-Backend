@@ -1652,7 +1652,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   lock_at = $17,
                   submitted_at = $18,
                   is_missing = $19,
-                  is_late = $20
+                  is_late = $20,
+                  priority_order = CASE WHEN $4 THEN NULL ELSE priority_order END
                  WHERE id = $21 AND user_id = $22`,
                 [
                   incomingTask.title,
@@ -1792,7 +1793,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
              lock_at = EXCLUDED.lock_at,
              submitted_at = EXCLUDED.submitted_at,
              is_missing = EXCLUDED.is_missing,
-             is_late = EXCLUDED.is_late
+             is_late = EXCLUDED.is_late,
+             priority_order = CASE WHEN EXCLUDED.completed THEN NULL ELSE tasks.priority_order END
            RETURNING *`,
           [
             req.user.id,
