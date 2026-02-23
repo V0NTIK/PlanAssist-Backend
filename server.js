@@ -1767,6 +1767,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
         }
 
+        console.log(`[PRE-INSERT] "${incomingTask.title?.substring(0,30)}" deadlineDate="${incomingTask.deadlineDate}" type=${typeof incomingTask.deadlineDate}`);
         const result = await pool.query(
           `INSERT INTO tasks 
            (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
