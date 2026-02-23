@@ -1375,6 +1375,33 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// PRIORITY ORDER CLEANUP - Run after any sync/save to keep orders clean
+// ============================================================================
+
+async function reprioritizeTasks(userId, pool) {
+  // Step 1: Null out priority_order for completed or deleted tasks
+  await pool.query(
+    `UPDATE tasks SET priority_order = NULL
+     WHERE user_id = $1 AND (completed = true OR deleted = true)`,
+    [userId]
+  );
+
+  // Step 2: Renumber remaining active tasks 1,2,3... preserving relative order
+  await pool.query(
+    `WITH ordered AS (
+      SELECT id,
+             ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
+      FROM tasks
+      WHERE user_id = $1 AND completed = false AND deleted = false
+    )
+    UPDATE tasks SET priority_order = ordered.new_order
+    FROM ordered
+    WHERE tasks.id = ordered.id`,
+    [userId]
+  );
+}
+
+// ============================================================================
 // COURSES & GRADES ROUTES (for Marks tab)
 // ============================================================================
 
@@ -1870,6 +1897,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     console.log(`Cleaned up: ${cleanedUpCount} past-due tasks`);
     console.log(`Total returned: ${insertedTasks.length} tasks\n`);
 
+    // Reprioritize: null completed/deleted, renumber active tasks cleanly
+    await reprioritizeTasks(req.user.id, pool);
+
     res.json({ 
       success: true, 
       tasks: insertedTasks, 
@@ -1981,15 +2011,18 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'taskOrder must be an array' });
     }
 
-    // Update priority orders, but only for non-deleted tasks
+    // Update priority orders, but only for non-deleted, non-completed tasks
     const updatePromises = taskOrder.map((taskId, index) =>
       pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false',
+        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false AND completed = false',
         [index + 1, taskId, req.user.id]
       )
     );
 
     await Promise.all(updatePromises);
+
+    // Clean up: null completed/deleted, renumber active tasks
+    await reprioritizeTasks(req.user.id, pool);
     res.json({ success: true });
   } catch (error) {
     console.error('Reorder tasks error:', error);
