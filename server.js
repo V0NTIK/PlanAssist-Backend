@@ -11,6 +11,7 @@ const anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const axios = require('axios');
 const ICAL = require('ical.js');
 const crypto = require('crypto');
+const { Resend } = require('resend');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,9 @@ const pool = new Pool({
 pool.on('connect', client => {
   client.query("SET TIME ZONE 'UTC'");
 });
+
+// Resend email client
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // JWT Secret - ENFORCE in production
 let JWT_SECRET = process.env.JWT_SECRET;
@@ -1367,6 +1371,195 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       error: 'Failed to sync with Canvas',
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
+  }
+});
+
+// ============================================================================
+// DAILY EMAIL CRON ENDPOINT
+// Called by GitHub Actions at 10:00 AM UTC Monday-Friday
+// Protected by CRON_SECRET environment variable
+// ============================================================================
+
+function buildEmailHtml(user, yesterdayTasks, topPriorities, dueToday, dueTomorrow) {
+  const firstName = user.name ? user.name.split(' ')[0] : 'there';
+  const today = new Date();
+  const dateStr = today.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+  const taskRow = (task, showDeadline = false) => {
+    const time = task.user_estimated_time || task.estimated_time;
+    const timeStr = time ? `${time} min` : '';
+    const deadlineStr = showDeadline && task.deadline_time
+      ? new Date(`${task.deadline_date}T${task.deadline_time}Z`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
+      : '';
+    return `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">
+          <span style="font-weight:600;color:#1a1a1a;">${task.title}</span>
+          <span style="color:#888;font-size:12px;margin-left:8px;">${task.class || ''}</span>
+        </td>
+        <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;color:#666;font-size:13px;white-space:nowrap;">
+          ${deadlineStr || timeStr}
+        </td>
+      </tr>`;
+  };
+
+  const section = (title, color, rows) => rows.length === 0 ? '' : `
+    <div style="margin-bottom:28px;">
+      <h2 style="font-size:16px;font-weight:700;color:${color};margin:0 0 10px 0;padding-bottom:6px;border-bottom:2px solid ${color};">
+        ${title}
+      </h2>
+      <table style="width:100%;border-collapse:collapse;">
+        ${rows.join('')}
+      </table>
+    </div>`;
+
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div style="max-width:600px;margin:0 auto;padding:24px 16px;">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#7c3aed,#4f46e5);border-radius:12px;padding:28px 32px;margin-bottom:24px;">
+      <div style="font-size:22px;font-weight:800;color:#fff;">📚 PlanAssist</div>
+      <div style="font-size:14px;color:#c4b5fd;margin-top:4px;">Good morning, ${firstName}! Here's your day.</div>
+      <div style="font-size:13px;color:#a78bfa;margin-top:2px;">${dateStr}</div>
+    </div>
+
+    <!-- Body -->
+    <div style="background:#fff;border-radius:12px;padding:28px 32px;">
+
+      ${section('✅ Completed Yesterday', '#16a34a', yesterdayTasks.map(t => taskRow(t)))}
+      ${section('🎯 Top Priorities Today', '#7c3aed', topPriorities.map(t => taskRow(t)))}
+      ${section('⚠️ Due Today', '#dc2626', dueToday.map(t => taskRow(t, true)))}
+      ${section('📅 Due Tomorrow', '#d97706', dueTomorrow.map(t => taskRow(t, true)))}
+
+      ${yesterdayTasks.length === 0 && topPriorities.length === 0 && dueToday.length === 0 && dueTomorrow.length === 0
+        ? '<p style="color:#888;text-align:center;padding:20px 0;">You\'re all caught up \u2014 nothing due in the next two days!</p>'
+        : ''}
+
+      <hr style="border:none;border-top:1px solid #f0f0f0;margin:24px 0;">
+      <p style="font-size:12px;color:#aaa;text-align:center;margin:0;">
+        You're receiving this because email notifications are enabled in PlanAssist.<br>
+        Have a productive day! 🚀
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+app.post('/api/cron/daily-email', async (req, res) => {
+  // Verify the cron secret to prevent unauthorized calls
+  const secret = req.headers['x-cron-secret'];
+  if (!secret || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    console.log('\n📧 Starting daily email job...');
+
+    // Get all users with email notifications enabled
+    const usersResult = await pool.query(
+      `SELECT id, name, email FROM users WHERE email_notifications = true`
+    );
+    const users = usersResult.rows;
+    console.log(`Found ${users.length} users to email`);
+
+    // Build date strings in UTC
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0];
+    const yesterday = new Date(now);
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+    // Skip Sunday (0) — yesterday would be Sunday, not a school day
+    // GitHub Actions only runs Mon-Fri so yesterday is always a weekday except Monday morning
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+    const tomorrow = new Date(now);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const user of users) {
+      try {
+        // 1. What they completed yesterday
+        const yesterdayResult = await pool.query(
+          `SELECT title, class, estimated_time, actual_time
+           FROM tasks_completed
+           WHERE user_id = $1
+             AND completed_at >= $2::date
+             AND completed_at < $3::date
+           ORDER BY completed_at DESC`,
+          [user.id, yesterdayStr, todayStr]
+        );
+
+        // 2. Top priorities today (up to 8 active tasks)
+        const prioritiesResult = await pool.query(
+          `SELECT title, class, estimated_time, user_estimated_time, deadline_date, deadline_time
+           FROM tasks
+           WHERE user_id = $1
+             AND completed = false
+             AND deleted = false
+           ORDER BY priority_order ASC NULLS LAST, deadline_date ASC
+           LIMIT 8`,
+          [user.id]
+        );
+
+        // 3. Due today
+        const dueTodayResult = await pool.query(
+          `SELECT title, class, estimated_time, deadline_date, deadline_time
+           FROM tasks
+           WHERE user_id = $1
+             AND deadline_date = $2
+             AND completed = false
+             AND deleted = false
+           ORDER BY deadline_time ASC NULLS LAST`,
+          [user.id, todayStr]
+        );
+
+        // 4. Due tomorrow
+        const dueTomorrowResult = await pool.query(
+          `SELECT title, class, estimated_time, deadline_date, deadline_time
+           FROM tasks
+           WHERE user_id = $1
+             AND deadline_date = $2
+             AND completed = false
+             AND deleted = false
+           ORDER BY deadline_time ASC NULLS LAST`,
+          [user.id, tomorrowStr]
+        );
+
+        const html = buildEmailHtml(
+          user,
+          yesterdayResult.rows,
+          prioritiesResult.rows,
+          dueTodayResult.rows,
+          dueTomorrowResult.rows
+        );
+
+        await resend.emails.send({
+          from: 'PlanAssist <onboarding@resend.dev>',
+          to: user.email,
+          subject: `📚 Your PlanAssist Morning Briefing — ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}`,
+          html
+        });
+
+        console.log(`  ✓ Emailed ${user.name} <${user.email}>`);
+        successCount++;
+      } catch (userError) {
+        console.error(`  ✗ Failed for ${user.email}:`, userError.message);
+        failCount++;
+      }
+    }
+
+    console.log(`\n✅ Daily email job complete: ${successCount} sent, ${failCount} failed\n`);
+    res.json({ success: true, sent: successCount, failed: failCount });
+
+  } catch (error) {
+    console.error('Daily email job error:', error);
+    res.status(500).json({ error: 'Email job failed', details: error.message });
   }
 });
 
