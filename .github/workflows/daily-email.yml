@@ -17,7 +17,7 @@ jobs:
             -X POST \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
-            https://planassist.onrender.com/api/cron/daily-email)
+            https://planassist-api.onrender.com/api/cron/daily-email)
           
           echo "Response status: $response"
           
