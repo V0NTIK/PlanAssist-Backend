@@ -2504,6 +2504,7 @@ app.post('/api/sessions/today', authenticateToken, async (req, res) => {
       `SELECT id, estimated_time, user_estimated_time
        FROM tasks
        WHERE user_id = $1 AND completed = false AND deleted = false
+         AND LOWER(class) NOT LIKE '%homeroom%'
          ${scheduledIds.length > 0 ? `AND id != ALL($2)` : ''}
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC
        LIMIT 5`,
