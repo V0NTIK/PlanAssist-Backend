@@ -43,22 +43,6 @@ pool.on('connect', client => {
   client.query("SET TIME ZONE 'UTC'");
 });
 
-// Ensure session_state table exists (created here in case migration wasn't run)
-pool.query(`
-  CREATE TABLE IF NOT EXISTS session_state (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    day TEXT,
-    period INTEGER,
-    remaining_time INTEGER,
-    current_task_index INTEGER,
-    task_start_time INTEGER,
-    completed_task_ids INTEGER[] DEFAULT '{}',
-    partial_task_times JSONB DEFAULT '{}',
-    saved_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id)
-  )
-`).catch(err => console.error('session_state table check failed:', err.message));
 
 // Resend email client (optional — only initialized if RESEND_API_KEY is set)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -2446,65 +2430,57 @@ app.patch('/api/tasks/:id/uncomplete', authenticateToken, async (req, res) => {
 // Helper function to validate and clean session state
 async function cleanupSessionState(userId) {
   try {
+    // Find the in-progress session for today
+    const today = new Date().toISOString().split('T')[0];
     const sessionResult = await pool.query(
-      'SELECT * FROM session_state WHERE user_id = $1',
-      [userId]
+      `SELECT * FROM user_sessions
+       WHERE user_id = $1 AND session_date = $2 AND in_progress = true
+       ORDER BY saved_at DESC LIMIT 1`,
+      [userId, today]
     );
-    
-    if (sessionResult.rows.length === 0) {
-      return null; // No session to clean
-    }
-    
+
+    if (sessionResult.rows.length === 0) return null;
+
     const session = sessionResult.rows[0];
-    let needsCleanup = false;
-    let cleanedCompletedIds = [];
-    
-    // Check if current_task_index is valid (exists and not deleted)
+
+    // Validate current task still exists and isn't deleted
     const currentTaskResult = await pool.query(
       'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
       [session.current_task_index, userId]
     );
-    
+
     if (currentTaskResult.rows.length === 0 || currentTaskResult.rows[0].deleted) {
-      console.log(`⚠️  Session state cleanup: current_task_index ${session.current_task_index} is invalid or deleted`);
-      needsCleanup = true;
-    }
-    
-    // Check completed_task_ids array - remove any deleted or non-existent tasks
-    if (session.completed_task_ids && session.completed_task_ids.length > 0) {
-      for (const taskId of session.completed_task_ids) {
-        const taskResult = await pool.query(
-          'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
-          [taskId, userId]
-        );
-        
-        if (taskResult.rows.length > 0 && !taskResult.rows[0].deleted) {
-          cleanedCompletedIds.push(taskId);
-        } else {
-          console.log(`⚠️  Session state cleanup: removing invalid/deleted task ${taskId} from completed_task_ids`);
-          needsCleanup = true;
-        }
-      }
-    }
-    
-    // If current task is invalid, clear the entire session
-    if (currentTaskResult.rows.length === 0 || currentTaskResult.rows[0].deleted) {
-      console.log(`🗑️  Clearing invalid session state for user ${userId}`);
-      await pool.query('DELETE FROM session_state WHERE user_id = $1', [userId]);
+      // Clear in-progress state — task no longer valid
+      await pool.query(
+        'UPDATE user_sessions SET in_progress = false WHERE id = $1',
+        [session.id]
+      );
       return null;
     }
-    
-    // If only completed_task_ids need cleaning, update them
-    if (needsCleanup && cleanedCompletedIds.length !== session.completed_task_ids.length) {
-      console.log(`🧹 Cleaning completed_task_ids for user ${userId}: ${session.completed_task_ids.length} -> ${cleanedCompletedIds.length}`);
-      await pool.query(
-        'UPDATE session_state SET completed_task_ids = $1 WHERE user_id = $2',
-        [cleanedCompletedIds, userId]
+
+    // Clean completed_task_ids — remove any deleted/missing tasks
+    const completedIds = session.completed_task_ids || [];
+    const cleanedIds = [];
+    for (const taskId of completedIds) {
+      const t = await pool.query(
+        'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
+        [taskId, userId]
       );
-      session.completed_task_ids = cleanedCompletedIds;
+      if (t.rows.length > 0 && !t.rows[0].deleted) cleanedIds.push(taskId);
     }
-    
-    return session;
+    if (cleanedIds.length !== completedIds.length) {
+      await pool.query(
+        'UPDATE user_sessions SET completed_task_ids = $1 WHERE id = $2',
+        [cleanedIds, session.id]
+      );
+      session.completed_task_ids = cleanedIds;
+    }
+
+    // Return in a shape compatible with what callers expect
+    return {
+      ...session,
+      day: new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }),
+    };
   } catch (error) {
     console.error('Session state cleanup error:', error);
     return null;
@@ -2704,7 +2680,7 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
     const cleanedSession = await cleanupSessionState(req.user.id);
     if (cleanedSession) {
       res.json({
-        sessionId: `${cleanedSession.day}-${cleanedSession.period}`,
+        sessionId: `today-${cleanedSession.period}`,
         day: cleanedSession.day,
         period: cleanedSession.period,
         remainingTime: cleanedSession.remaining_time,
@@ -2723,31 +2699,40 @@ app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/sessions/saved-state — save in-progress session state
+// POST /api/sessions/saved-state — save in-progress session state into user_sessions
 app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
-    const { sessionId, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds } = req.body;
+    const { period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskTimes } = req.body;
+    const today = new Date().toISOString().split('T')[0];
 
+    // Validate current task still exists and is active
     const taskResult = await pool.query(
       'SELECT id, deleted, completed FROM tasks WHERE id = $1 AND user_id = $2',
       [currentTaskIndex, req.user.id]
     );
     if (taskResult.rows.length === 0 || taskResult.rows[0].deleted || taskResult.rows[0].completed) {
-      await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+      // Clear in-progress state on the matching session
+      await pool.query(
+        `UPDATE user_sessions SET in_progress = false
+         WHERE user_id = $1 AND session_date = $2 AND period = $3`,
+        [req.user.id, today, period]
+      );
       return res.json({ success: true, message: 'Session cleared (current task complete)' });
     }
 
-    await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
-
-    let partialTaskTimesJson = null;
-    if (req.body.partialTaskTimes && Object.keys(req.body.partialTaskTimes).length > 0) {
-      partialTaskTimesJson = JSON.stringify(req.body.partialTaskTimes);
-    }
-
     await pool.query(
-      `INSERT INTO session_state (user_id, day, period, remaining_time, current_task_index, task_start_time, completed_task_ids, partial_task_times, saved_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
-      [req.user.id, day, period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskTimesJson]
+      `UPDATE user_sessions SET
+         in_progress = true,
+         remaining_time = $1,
+         current_task_index = $2,
+         task_start_time = $3,
+         completed_task_ids = $4,
+         partial_task_times = $5,
+         saved_at = NOW()
+       WHERE user_id = $6 AND session_date = $7 AND period = $8`,
+      [remainingTime, currentTaskIndex, taskStartTime,
+       completedTaskIds || [], JSON.stringify(partialTaskTimes || {}),
+       req.user.id, today, period]
     );
 
     res.json({ success: true });
@@ -2757,10 +2742,15 @@ app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /api/sessions/saved-state
+// DELETE /api/sessions/saved-state — clear in-progress flag
 app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
   try {
-    await pool.query('DELETE FROM session_state WHERE user_id = $1', [req.user.id]);
+    const today = new Date().toISOString().split('T')[0];
+    await pool.query(
+      `UPDATE user_sessions SET in_progress = false
+       WHERE user_id = $1 AND session_date = $2 AND in_progress = true`,
+      [req.user.id, today]
+    );
     res.json({ success: true });
   } catch (error) {
     console.error('Delete session state error:', error);
