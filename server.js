@@ -2425,11 +2425,12 @@ app.get('/api/sessions/today', authenticateToken, async (req, res) => {
       return res.json({ sessions: [], generated: true });
     }
 
-    // Get priority-ordered incomplete tasks
+    // Get priority-ordered incomplete tasks — exclude Homeroom tasks
     const tasksResult = await pool.query(
       `SELECT id, estimated_time, user_estimated_time
        FROM tasks
        WHERE user_id = $1 AND completed = false AND deleted = false
+         AND LOWER(class) NOT LIKE '%homeroom%'
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC`,
       [req.user.id]
     );
