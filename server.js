@@ -1086,12 +1086,19 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const currentGrade = enrollment.computed_current_grade ?? enrollment.grades?.current_grade ?? null;
       const finalScore = enrollment.computed_final_score ?? enrollment.grades?.final_score ?? null;
       const finalGrade = enrollment.computed_final_grade ?? enrollment.grades?.final_grade ?? null;
-      
-      console.log(`  Course: ${course.name} | Score: ${currentScore} | Grade: ${currentGrade}`);
+
+      // Grading period scores (current quarter/term only) — from include[]=current_grading_period_scores
+      const currentPeriodScore = enrollment.current_period_computed_current_score ?? null;
+      const currentPeriodGrade = enrollment.current_period_computed_current_grade ?? null;
+      const gradingPeriodId = enrollment.current_grading_period_id ?? null;
+      const gradingPeriodTitle = enrollment.current_grading_period_title ?? null;
+
+      console.log(`  Course: ${course.name} | Score: ${currentScore} | Period: ${gradingPeriodTitle} ${currentPeriodScore}`);
       
       await pool.query(
-        `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+        `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id,
+           current_period_score, current_period_grade, grading_period_id, grading_period_title, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
          ON CONFLICT (user_id, course_id)
          DO UPDATE SET 
            name = EXCLUDED.name,
@@ -1100,6 +1107,10 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
            current_grade = EXCLUDED.current_grade,
            final_score = EXCLUDED.final_score,
            final_grade = EXCLUDED.final_grade,
+           current_period_score = EXCLUDED.current_period_score,
+           current_period_grade = EXCLUDED.current_period_grade,
+           grading_period_id = EXCLUDED.grading_period_id,
+           grading_period_title = EXCLUDED.grading_period_title,
            updated_at = CURRENT_TIMESTAMP`,
         [
           req.user.id,
@@ -1110,7 +1121,11 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           currentGrade,
           finalScore,
           finalGrade,
-          enrollment.id || null
+          enrollment.id || null,
+          currentPeriodScore,
+          currentPeriodGrade,
+          gradingPeriodId,
+          gradingPeriodTitle
         ]
       );
     }
@@ -1371,6 +1386,102 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       error: 'Failed to sync with Canvas',
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
+  }
+});
+
+// ============================================================================
+// ADMIN: Refresh all users' course grading period data
+// Protected by CRON_SECRET — call once after migration to backfill all users
+// POST /api/admin/refresh-courses
+// ============================================================================
+
+app.post('/api/admin/refresh-courses', async (req, res) => {
+  const secret = req.headers['x-cron-secret'];
+  if (!secret || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    console.log('\n🔄 Starting course refresh for all users...');
+
+    // Get all users who have a Canvas token stored
+    const usersResult = await pool.query(
+      `SELECT id, canvas_api_token, canvas_api_token_iv FROM users
+       WHERE canvas_api_token IS NOT NULL AND canvas_api_token != ''`
+    );
+
+    let success = 0, failed = 0;
+
+    for (const user of usersResult.rows) {
+      try {
+        // Decrypt token
+        let token;
+        try {
+          const key = Buffer.from(process.env.ENCRYPTION_KEY, 'hex');
+          const iv = Buffer.from(user.canvas_api_token_iv, 'hex');
+          const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+          const encryptedData = Buffer.from(user.canvas_api_token, 'hex');
+          const authTag = encryptedData.slice(-16);
+          const encrypted = encryptedData.slice(0, -16);
+          decipher.setAuthTag(authTag);
+          token = decipher.update(encrypted, null, 'utf8') + decipher.final('utf8');
+        } catch (e) {
+          console.log(`  ✗ User ${user.id}: failed to decrypt token`);
+          failed++;
+          continue;
+        }
+
+        const headers = { 'Authorization': `Bearer ${token}` };
+        const response = await axios.get(
+          `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
+          { headers, timeout: 15000 }
+        );
+
+        for (const course of response.data) {
+          const enrollment = course.enrollments?.[0] || {};
+          const currentScore = enrollment.computed_current_score ?? enrollment.grades?.current_score ?? null;
+          const currentGrade = enrollment.computed_current_grade ?? enrollment.grades?.current_grade ?? null;
+          const finalScore = enrollment.computed_final_score ?? enrollment.grades?.final_score ?? null;
+          const finalGrade = enrollment.computed_final_grade ?? enrollment.grades?.final_grade ?? null;
+          const currentPeriodScore = enrollment.current_period_computed_current_score ?? null;
+          const currentPeriodGrade = enrollment.current_period_computed_current_grade ?? null;
+          const gradingPeriodId = enrollment.current_grading_period_id ?? null;
+          const gradingPeriodTitle = enrollment.current_grading_period_title ?? null;
+
+          await pool.query(
+            `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id,
+               current_period_score, current_period_grade, grading_period_id, grading_period_title, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id, course_id)
+             DO UPDATE SET
+               current_score = EXCLUDED.current_score,
+               current_grade = EXCLUDED.current_grade,
+               final_score = EXCLUDED.final_score,
+               final_grade = EXCLUDED.final_grade,
+               current_period_score = EXCLUDED.current_period_score,
+               current_period_grade = EXCLUDED.current_period_grade,
+               grading_period_id = EXCLUDED.grading_period_id,
+               grading_period_title = EXCLUDED.grading_period_title,
+               updated_at = CURRENT_TIMESTAMP`,
+            [user.id, course.id, course.name, course.course_code || null,
+             currentScore, currentGrade, finalScore, finalGrade, enrollment.id || null,
+             currentPeriodScore, currentPeriodGrade, gradingPeriodId, gradingPeriodTitle]
+          );
+        }
+
+        console.log(`  ✓ User ${user.id}: refreshed ${response.data.length} courses`);
+        success++;
+      } catch (err) {
+        console.error(`  ✗ User ${user.id}:`, err.message);
+        failed++;
+      }
+    }
+
+    console.log(`\n✅ Course refresh complete: ${success} users updated, ${failed} failed`);
+    res.json({ success: true, updated: success, failed });
+  } catch (error) {
+    console.error('Course refresh error:', error);
+    res.status(500).json({ error: 'Refresh failed', details: error.message });
   }
 });
 
