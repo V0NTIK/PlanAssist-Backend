@@ -43,8 +43,8 @@ pool.on('connect', client => {
   client.query("SET TIME ZONE 'UTC'");
 });
 
-// Resend email client
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Resend email client (optional — only initialized if RESEND_API_KEY is set)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 // JWT Secret - ENFORCE in production
 let JWT_SECRET = process.env.JWT_SECRET;
