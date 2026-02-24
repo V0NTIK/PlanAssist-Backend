@@ -43,6 +43,23 @@ pool.on('connect', client => {
   client.query("SET TIME ZONE 'UTC'");
 });
 
+// Ensure session_state table exists (created here in case migration wasn't run)
+pool.query(`
+  CREATE TABLE IF NOT EXISTS session_state (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day TEXT,
+    period INTEGER,
+    remaining_time INTEGER,
+    current_task_index INTEGER,
+    task_start_time INTEGER,
+    completed_task_ids INTEGER[] DEFAULT '{}',
+    partial_task_times JSONB DEFAULT '{}',
+    saved_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id)
+  )
+`).catch(err => console.error('session_state table check failed:', err.message));
+
 // Resend email client (optional — only initialized if RESEND_API_KEY is set)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
@@ -1414,19 +1431,15 @@ app.post('/api/admin/refresh-courses', async (req, res) => {
 
     for (const user of usersResult.rows) {
       try {
-        // Decrypt token
+        // Decrypt token using same approach as canvas/sync endpoint
         let token;
         try {
-          const key = Buffer.from(process.env.ENCRYPTION_KEY, 'hex');
-          const iv = Buffer.from(user.canvas_api_token_iv, 'hex');
-          const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-          const encryptedData = Buffer.from(user.canvas_api_token, 'hex');
-          const authTag = encryptedData.slice(-16);
-          const encrypted = encryptedData.slice(0, -16);
-          decipher.setAuthTag(authTag);
-          token = decipher.update(encrypted, null, 'utf8') + decipher.final('utf8');
+          const encryptedParts = user.canvas_api_token.split(':');
+          if (encryptedParts.length !== 2) throw new Error('Invalid token format');
+          token = decryptToken(encryptedParts[0], user.canvas_api_token_iv, encryptedParts[1]);
+          if (!token) throw new Error('Decryption returned null');
         } catch (e) {
-          console.log(`  ✗ User ${user.id}: failed to decrypt token`);
+          console.log(`  ✗ User ${user.id}: failed to decrypt token - ${e.message}`);
           failed++;
           continue;
         }
