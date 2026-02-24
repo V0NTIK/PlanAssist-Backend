@@ -2408,11 +2408,15 @@ app.get('/api/sessions/today', authenticateToken, async (req, res) => {
     }
 
     // No sessions for today yet — auto-generate from schedule + priority-ordered tasks
-    const setupResult = await pool.query(
-      'SELECT schedule FROM account_setup WHERE user_id = $1',
+    const scheduleResult = await pool.query(
+      'SELECT day, period, type FROM schedules WHERE user_id = $1',
       [req.user.id]
     );
-    const schedule = setupResult.rows[0]?.schedule || {};
+    const schedule = {};
+    scheduleResult.rows.forEach(row => {
+      if (!schedule[row.day]) schedule[row.day] = {};
+      schedule[row.day][row.period] = row.type;
+    });
     const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
 
     const daySchedule = schedule[todayName] || {};
