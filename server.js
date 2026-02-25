@@ -1424,6 +1424,8 @@ app.post('/api/admin/refresh-courses', async (req, res) => {
           if (!token) throw new Error('Decryption returned null');
         } catch (e) {
           console.log(`  ✗ User ${user.id}: failed to decrypt token - ${e.message}`);
+          console.log(`    token value: ${user.canvas_api_token ? user.canvas_api_token.substring(0, 20) + '...' : 'NULL'}`);
+          console.log(`    iv value: ${user.canvas_api_token_iv ? user.canvas_api_token_iv.substring(0, 20) + '...' : 'NULL'}`);
           failed++;
           continue;
         }
@@ -1469,7 +1471,8 @@ app.post('/api/admin/refresh-courses', async (req, res) => {
         console.log(`  ✓ User ${user.id}: refreshed ${response.data.length} courses`);
         success++;
       } catch (err) {
-        console.error(`  ✗ User ${user.id}:`, err.message);
+        console.error(`  ✗ User ${user.id}: outer error -`, err.message);
+        console.error(err.stack);
         failed++;
       }
     }
