@@ -1748,9 +1748,9 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
     const { courseId } = req.params;
     
     const result = await pool.query(
-      `SELECT AVG(current_score) as avg_score, COUNT(DISTINCT user_id) as student_count
+      `SELECT AVG(COALESCE(current_period_score, current_score)) as avg_score, COUNT(DISTINCT user_id) as student_count
        FROM courses
-       WHERE course_id = $1 AND current_score IS NOT NULL`,
+       WHERE course_id = $1 AND COALESCE(current_period_score, current_score) IS NOT NULL`,
       [courseId]
     );
     
@@ -2485,7 +2485,7 @@ async function cleanupSessionState(userId) {
     // Return in a shape compatible with what callers expect
     return {
       ...session,
-      day: new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }),
+      day: new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' }),
     };
   } catch (error) {
     console.error('Session state cleanup error:', error);
@@ -2532,7 +2532,9 @@ app.get('/api/sessions/today', authenticateToken, async (req, res) => {
       if (!schedule[row.day]) schedule[row.day] = {};
       schedule[row.day][row.period] = row.type;
     });
-    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+    // Use America/New_York timezone — covers all NA OneSchool campuses (EST/CST/MST/PST
+    // all send children home before midnight ET, so ET is safe for day boundary detection)
+    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
 
     const daySchedule = schedule[todayName] || {};
     const studyPeriods = Object.entries(daySchedule)
