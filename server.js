@@ -2603,6 +2603,7 @@ app.post('/api/sessions/today', authenticateToken, async (req, res) => {
     );
     const scheduledIds = scheduledResult.rows.map(r => r.task_id);
 
+    // Fetch enough candidates to fill the session (fetch up to 20, apply 60-min cap same as auto-generator)
     const tasksResult = await pool.query(
       `SELECT id, estimated_time, user_estimated_time
        FROM tasks
@@ -2610,11 +2611,28 @@ app.post('/api/sessions/today', authenticateToken, async (req, res) => {
          AND LOWER(class) NOT LIKE '%homeroom%'
          ${scheduledIds.length > 0 ? `AND id != ALL($2)` : ''}
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC
-       LIMIT 5`,
+       LIMIT 20`,
       scheduledIds.length > 0 ? [req.user.id, scheduledIds] : [req.user.id]
     );
 
-    const taskIds = tasksResult.rows.map(r => r.id);
+    // Apply same 60-min fill logic as auto-generator: fill up to 60 min, one overflow task allowed
+    const taskIds = [];
+    let totalTime = 0;
+    let overflowAdded = false;
+    for (const task of tasksResult.rows) {
+      const taskTime = task.user_estimated_time || task.estimated_time || 30;
+      if (totalTime + taskTime <= 60) {
+        taskIds.push(task.id);
+        totalTime += taskTime;
+      } else if (!overflowAdded && totalTime < 60) {
+        // One overflow task (Make a Start / Wrap it Up)
+        taskIds.push(task.id);
+        overflowAdded = true;
+        break;
+      } else {
+        break;
+      }
+    }
 
     const result = await pool.query(
       `INSERT INTO user_sessions (user_id, session_date, period, task_ids, is_extra)
