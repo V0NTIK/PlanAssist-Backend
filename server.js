@@ -2175,7 +2175,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
-       SET deleted = true 
+       SET deleted = true, session_active = false
        WHERE user_id = $1 
          AND completed = false 
          AND deleted = false 
@@ -2383,7 +2383,7 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
     // Mark task as deleted and clear priority_order
     // This preserves the URL in the database so it won't be re-imported during sync
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -2433,366 +2433,70 @@ app.patch('/api/tasks/:id/uncomplete', authenticateToken, async (req, res) => {
 // SESSION AND COMPLETION ROUTES
 // ============================================================================
 
-// Helper function to validate and clean session state
-async function cleanupSessionState(userId) {
-  try {
-    // Find the in-progress session for today
-    const today = new Date().toISOString().split('T')[0];
-    const sessionResult = await pool.query(
-      `SELECT * FROM user_sessions
-       WHERE user_id = $1 AND session_date = $2 AND in_progress = true
-       ORDER BY saved_at DESC LIMIT 1`,
-      [userId, today]
-    );
-
-    if (sessionResult.rows.length === 0) return null;
-
-    const session = sessionResult.rows[0];
-
-    // Validate current task still exists and isn't deleted
-    const currentTaskResult = await pool.query(
-      'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
-      [session.current_task_index, userId]
-    );
-
-    if (currentTaskResult.rows.length === 0 || currentTaskResult.rows[0].deleted) {
-      // Clear in-progress state — task no longer valid
-      await pool.query(
-        'UPDATE user_sessions SET in_progress = false WHERE id = $1',
-        [session.id]
-      );
-      return null;
-    }
-
-    // Clean completed_task_ids — remove any deleted/missing tasks
-    const completedIds = session.completed_task_ids || [];
-    const cleanedIds = [];
-    for (const taskId of completedIds) {
-      const t = await pool.query(
-        'SELECT id, deleted FROM tasks WHERE id = $1 AND user_id = $2',
-        [taskId, userId]
-      );
-      if (t.rows.length > 0 && !t.rows[0].deleted) cleanedIds.push(taskId);
-    }
-    if (cleanedIds.length !== completedIds.length) {
-      await pool.query(
-        'UPDATE user_sessions SET completed_task_ids = $1 WHERE id = $2',
-        [cleanedIds, session.id]
-      );
-      session.completed_task_ids = cleanedIds;
-    }
-
-    // Return in a shape compatible with what callers expect
-    return {
-      ...session,
-      day: new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' }),
-    };
-  } catch (error) {
-    console.error('Session state cleanup error:', error);
-    return null;
-  }
-}
-
-// Save session state
 // ============================================================================
-// SESSION ENDPOINTS (Redesigned - DB-backed, today-only)
+// SESSION ROUTES (v2 — single-task, task-table-backed)
 // ============================================================================
 
-// GET /api/sessions/today — load or generate today's sessions
-app.get('/api/sessions/today', authenticateToken, async (req, res) => {
+// GET /api/sessions/tasks — return all incomplete, non-deleted, non-homeroom tasks
+// in priority order for the Sessions page
+app.get('/api/sessions/tasks', authenticateToken, async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
-
-    // Load existing active sessions for today (exclude completed and deleted)
-    const existing = await pool.query(
-      `SELECT * FROM user_sessions
-       WHERE user_id = $1 AND session_date = $2
-         AND is_deleted = false AND completed = false
-       ORDER BY period ASC`,
-      [req.user.id, today]
-    );
-
-    // Check if ANY sessions exist today (including completed/deleted) to avoid re-generating
-    const anyExist = await pool.query(
-      `SELECT id FROM user_sessions WHERE user_id = $1 AND session_date = $2 LIMIT 1`,
-      [req.user.id, today]
-    );
-
-    if (anyExist.rows.length > 0) {
-      return res.json({ sessions: existing.rows, generated: false });
-    }
-
-    // No sessions for today yet — auto-generate from schedule + priority-ordered tasks
-    const scheduleResult = await pool.query(
-      'SELECT day, period, type FROM schedules WHERE user_id = $1',
-      [req.user.id]
-    );
-    const schedule = {};
-    scheduleResult.rows.forEach(row => {
-      if (!schedule[row.day]) schedule[row.day] = {};
-      schedule[row.day][row.period] = row.type;
-    });
-    // Use America/New_York timezone — covers all NA OneSchool campuses (EST/CST/MST/PST
-    // all send children home before midnight ET, so ET is safe for day boundary detection)
-    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
-
-    const daySchedule = schedule[todayName] || {};
-    const studyPeriods = Object.entries(daySchedule)
-      .filter(([, type]) => type === 'Study')
-      .map(([period]) => parseInt(period))
-      .sort((a, b) => a - b);
-
-    if (studyPeriods.length === 0) {
-      return res.json({ sessions: [], generated: true });
-    }
-
-    // Get priority-ordered incomplete tasks — exclude Homeroom tasks
-    const tasksResult = await pool.query(
-      `SELECT id, estimated_time, user_estimated_time
+    const result = await pool.query(
+      `SELECT id, title, segment, class, url, deadline_date, deadline_time,
+              estimated_time, user_estimated_time, accumulated_time, session_active,
+              priority_order, points_possible
        FROM tasks
-       WHERE user_id = $1 AND completed = false AND deleted = false
+       WHERE user_id = $1
+         AND completed = false
+         AND deleted = false
          AND LOWER(class) NOT LIKE '%homeroom%'
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC`,
       [req.user.id]
     );
-    const taskQueue = [...tasksResult.rows];
-
-    // Fill each study period
-    const newSessions = [];
-    let queueIndex = 0;
-
-    for (const period of studyPeriods) {
-      const sessionTaskIds = [];
-      let totalTime = 0;
-
-      while (queueIndex < taskQueue.length) {
-        const task = taskQueue[queueIndex];
-        const taskTime = task.user_estimated_time || task.estimated_time || 30;
-        if (totalTime + taskTime <= 60) {
-          sessionTaskIds.push(task.id);
-          totalTime += taskTime;
-          queueIndex++;
-        } else break;
-      }
-
-      // Add overflow task if time remains
-      if (queueIndex < taskQueue.length && totalTime < 60) {
-        sessionTaskIds.push(taskQueue[queueIndex].id);
-        queueIndex++;
-      }
-
-      if (sessionTaskIds.length > 0) {
-        const result = await pool.query(
-          `INSERT INTO user_sessions (user_id, session_date, period, task_ids, is_extra)
-           VALUES ($1, $2, $3, $4, false)
-           ON CONFLICT (user_id, session_date, period) DO UPDATE
-             SET task_ids = EXCLUDED.task_ids
-           RETURNING *`,
-          [req.user.id, today, period, sessionTaskIds]
-        );
-        newSessions.push(result.rows[0]);
-      }
-
-      if (queueIndex >= taskQueue.length) break;
-    }
-
-    res.json({ sessions: newSessions, generated: true });
+    res.json(result.rows);
   } catch (error) {
-    console.error('Get today sessions error:', error);
-    res.status(500).json({ error: 'Failed to load sessions' });
+    console.error('Get session tasks error:', error);
+    res.status(500).json({ error: 'Failed to get session tasks' });
   }
 });
 
-// POST /api/sessions/today — add a manual session for today
-app.post('/api/sessions/today', authenticateToken, async (req, res) => {
+// POST /api/sessions/start/:taskId — mark a task as actively in session
+app.post('/api/sessions/start/:taskId', authenticateToken, async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
-    const { period } = req.body;
-
-    // Get tasks not yet scheduled in any session today
-    const scheduledResult = await pool.query(
-      `SELECT unnest(task_ids) as task_id FROM user_sessions
-       WHERE user_id = $1 AND session_date = $2 AND is_deleted = false`,
-      [req.user.id, today]
-    );
-    const scheduledIds = scheduledResult.rows.map(r => r.task_id);
-
-    // Fetch enough candidates to fill the session (fetch up to 20, apply 60-min cap same as auto-generator)
-    const tasksResult = await pool.query(
-      `SELECT id, estimated_time, user_estimated_time
-       FROM tasks
-       WHERE user_id = $1 AND completed = false AND deleted = false
-         AND LOWER(class) NOT LIKE '%homeroom%'
-         ${scheduledIds.length > 0 ? `AND id != ALL($2)` : ''}
-       ORDER BY priority_order ASC NULLS LAST, deadline_date ASC
-       LIMIT 20`,
-      scheduledIds.length > 0 ? [req.user.id, scheduledIds] : [req.user.id]
-    );
-
-    // Apply same 60-min fill logic as auto-generator: fill up to 60 min, one overflow task allowed
-    const taskIds = [];
-    let totalTime = 0;
-    let overflowAdded = false;
-    for (const task of tasksResult.rows) {
-      const taskTime = task.user_estimated_time || task.estimated_time || 30;
-      if (totalTime + taskTime <= 60) {
-        taskIds.push(task.id);
-        totalTime += taskTime;
-      } else if (!overflowAdded && totalTime < 60) {
-        // One overflow task (Make a Start / Wrap it Up)
-        taskIds.push(task.id);
-        overflowAdded = true;
-        break;
-      } else {
-        break;
-      }
-    }
-
-    const result = await pool.query(
-      `INSERT INTO user_sessions (user_id, session_date, period, task_ids, is_extra)
-       VALUES ($1, $2, $3, $4, true)
-       ON CONFLICT (user_id, session_date, period) DO UPDATE
-         SET task_ids = EXCLUDED.task_ids, is_deleted = false, is_extra = true
-       RETURNING *`,
-      [req.user.id, today, period, taskIds]
-    );
-
-    res.json({ session: result.rows[0] });
-  } catch (error) {
-    console.error('Add session error:', error);
-    res.status(500).json({ error: 'Failed to add session' });
-  }
-});
-
-// PATCH /api/sessions/:id — update a session (delete, complete, update tasks, save partial times)
-app.patch('/api/sessions/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updates = req.body;
-
-    // Build dynamic SET clause from provided fields
-    const allowed = ['is_deleted', 'completed', 'task_ids', 'partial_task_times'];
-    const setClauses = [];
-    const values = [];
-    let paramIdx = 1;
-
-    for (const key of allowed) {
-      if (updates[key] !== undefined) {
-        setClauses.push(`${key} = $${paramIdx}`);
-        values.push(key === 'partial_task_times' ? JSON.stringify(updates[key]) : updates[key]);
-        paramIdx++;
-      }
-    }
-
-    if (setClauses.length === 0) {
-      return res.status(400).json({ error: 'No valid fields to update' });
-    }
-
-    setClauses.push(`updated_at = NOW()`);
-    values.push(id, req.user.id);
-
-    const result = await pool.query(
-      `UPDATE user_sessions SET ${setClauses.join(', ')}
-       WHERE id = $${paramIdx} AND user_id = $${paramIdx + 1}
-       RETURNING *`,
-      values
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    res.json({ session: result.rows[0] });
-  } catch (error) {
-    console.error('Update session error:', error);
-    res.status(500).json({ error: 'Failed to update session' });
-  }
-});
-
-// GET /api/sessions/saved-state — in-progress session state (for resume)
-app.get('/api/sessions/saved-state', authenticateToken, async (req, res) => {
-  try {
-    const cleanedSession = await cleanupSessionState(req.user.id);
-    if (cleanedSession) {
-      res.json({
-        sessionId: `today-${cleanedSession.period}`,
-        day: cleanedSession.day,
-        period: cleanedSession.period,
-        remainingTime: cleanedSession.remaining_time,
-        currentTaskIndex: cleanedSession.current_task_index,
-        taskStartTime: cleanedSession.task_start_time,
-        completedTaskIds: cleanedSession.completed_task_ids || [],
-        partialTaskTimes: cleanedSession.partial_task_times || {},
-        savedAt: cleanedSession.saved_at
-      });
-    } else {
-      res.json({});
-    }
-  } catch (error) {
-    console.error('Get session state error:', error);
-    res.json({});
-  }
-});
-
-// POST /api/sessions/saved-state — save in-progress session state into user_sessions
-app.post('/api/sessions/saved-state', authenticateToken, async (req, res) => {
-  try {
-    const { period, remainingTime, currentTaskIndex, taskStartTime, completedTaskIds, partialTaskTimes } = req.body;
-    const today = new Date().toISOString().split('T')[0];
-
-    // Validate current task still exists and is active
-    const taskResult = await pool.query(
-      'SELECT id, deleted, completed FROM tasks WHERE id = $1 AND user_id = $2',
-      [currentTaskIndex, req.user.id]
-    );
-    if (taskResult.rows.length === 0 || taskResult.rows[0].deleted || taskResult.rows[0].completed) {
-      // Clear in-progress state on the matching session
-      await pool.query(
-        `UPDATE user_sessions SET in_progress = false
-         WHERE user_id = $1 AND session_date = $2 AND period = $3`,
-        [req.user.id, today, period]
-      );
-      return res.json({ success: true, message: 'Session cleared (current task complete)' });
-    }
-
+    const { taskId } = req.params;
+    // Clear any other active sessions for this user first
     await pool.query(
-      `UPDATE user_sessions SET
-         in_progress = true,
-         remaining_time = $1,
-         current_task_index = $2,
-         task_start_time = $3,
-         completed_task_ids = $4,
-         partial_task_times = $5,
-         saved_at = NOW()
-       WHERE user_id = $6 AND session_date = $7 AND period = $8`,
-      [remainingTime, currentTaskIndex, taskStartTime,
-       completedTaskIds || [], JSON.stringify(partialTaskTimes || {}),
-       req.user.id, today, period]
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
+      [req.user.id]
     );
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Save session state error:', error);
-    res.status(500).json({ error: 'Failed to save session state' });
-  }
-});
-
-// DELETE /api/sessions/saved-state — clear in-progress flag
-app.delete('/api/sessions/saved-state', authenticateToken, async (req, res) => {
-  try {
-    const today = new Date().toISOString().split('T')[0];
     await pool.query(
-      `UPDATE user_sessions SET in_progress = false
-       WHERE user_id = $1 AND session_date = $2 AND in_progress = true`,
-      [req.user.id, today]
+      'UPDATE tasks SET session_active = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
     res.json({ success: true });
   } catch (error) {
-    console.error('Delete session state error:', error);
-    res.status(500).json({ error: 'Failed to delete session state' });
+    console.error('Start session error:', error);
+    res.status(500).json({ error: 'Failed to start session' });
   }
 });
 
+// POST /api/sessions/pause/:taskId — save elapsed time and clear active flag
+app.post('/api/sessions/pause/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { accumulatedTime } = req.body;
+    await pool.query(
+      'UPDATE tasks SET session_active = false, accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      [accumulatedTime, taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Pause session error:', error);
+    res.status(500).json({ error: 'Failed to pause session' });
+  }
+});
+
+// ============================================================================
 // Complete a task
 app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
   try {
@@ -2830,7 +2534,7 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     // Mark task as deleted instead of removing from database
     // This preserves the URL in the database so it won't be re-imported during sync
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
