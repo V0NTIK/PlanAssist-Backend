@@ -44,6 +44,9 @@ pool.on('connect', client => {
 });
 
 
+// Canvas API base URL
+const CANVAS_API_BASE = 'https://canvas.oneschoolglobal.com/api/v1';
+
 // Resend email client (optional — only initialized if RESEND_API_KEY is set)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
@@ -1051,7 +1054,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     console.log('✓ Canvas API token decrypted successfully');
     
     // Canvas API base URL
-    const CANVAS_API_BASE = 'https://canvas.oneschoolglobal.com/api/v1';
+    // CANVAS_API_BASE is defined at module level
     const headers = {
       'Authorization': `Bearer ${canvasToken}`,
       'Accept': 'application/json'
