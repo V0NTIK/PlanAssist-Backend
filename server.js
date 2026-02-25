@@ -153,7 +153,7 @@ const isValidOneSchoolEmail = (email) => {
 
 // Validate grade (must be 7-12)
 const isValidGrade = (grade) => {
-  const validGrades = ['7', '8', '9', '10', '11', '12'];
+  const validGrades = ['3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
   return validGrades.includes(String(grade));
 };
 
@@ -745,7 +745,7 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
-      return res.status(400).json({ error: 'Grade must be one of: 7, 8, 9, 10, 11, or 12' });
+      return res.status(400).json({ error: 'Grade must be one of: 3 through 12' });
     }
     
     // Encrypt Canvas API token if provided
