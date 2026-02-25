@@ -2503,13 +2503,22 @@ app.get('/api/sessions/today', authenticateToken, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
 
-    // Load existing sessions for today
+    // Load existing active sessions for today (exclude completed and deleted)
     const existing = await pool.query(
-      `SELECT * FROM user_sessions WHERE user_id = $1 AND session_date = $2 ORDER BY period ASC`,
+      `SELECT * FROM user_sessions
+       WHERE user_id = $1 AND session_date = $2
+         AND is_deleted = false AND completed = false
+       ORDER BY period ASC`,
       [req.user.id, today]
     );
 
-    if (existing.rows.length > 0) {
+    // Check if ANY sessions exist today (including completed/deleted) to avoid re-generating
+    const anyExist = await pool.query(
+      `SELECT id FROM user_sessions WHERE user_id = $1 AND session_date = $2 LIMIT 1`,
+      [req.user.id, today]
+    );
+
+    if (anyExist.rows.length > 0) {
       return res.json({ sessions: existing.rows, generated: false });
     }
 
