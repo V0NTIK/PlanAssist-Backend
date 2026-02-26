@@ -2886,6 +2886,102 @@ async function addToCompletionFeed(userId, taskTitle, taskClass) {
   }
 }
 
+// ============================================================================
+// AGENDAS
+// ============================================================================
+
+// GET /api/agendas — list all unfinished agendas for the user, with task data
+app.get('/api/agendas', authenticateToken, async (req, res) => {
+  try {
+    const agendasResult = await pool.query(
+      `SELECT id, name, task_ids, finished, created_at
+       FROM agendas
+       WHERE user_id = $1 AND finished = false
+       ORDER BY created_at ASC`,
+      [req.user.id]
+    );
+
+    // For each agenda, fetch the current task data
+    const agendas = await Promise.all(agendasResult.rows.map(async (agenda) => {
+      const taskIds = agenda.task_ids || [];
+      if (taskIds.length === 0) return { ...agenda, tasks: [] };
+
+      const tasksResult = await pool.query(
+        `SELECT id, title, segment, class, url, deadline_date,
+                estimated_time, user_estimated_time, accumulated_time,
+                session_active, priority_order, completed, deleted
+         FROM tasks
+         WHERE id = ANY($1) AND user_id = $2`,
+        [taskIds, req.user.id]
+      );
+
+      // Preserve original ordering from task_ids array
+      const taskMap = {};
+      tasksResult.rows.forEach(t => { taskMap[t.id] = t; });
+      const tasks = taskIds.map(id => taskMap[id]).filter(Boolean);
+
+      return { ...agenda, tasks };
+    }));
+
+    res.json(agendas);
+  } catch (error) {
+    console.error('Get agendas error:', error);
+    res.status(500).json({ error: 'Failed to get agendas' });
+  }
+});
+
+// POST /api/agendas — create a new agenda
+app.post('/api/agendas', authenticateToken, async (req, res) => {
+  try {
+    const { name, taskIds } = req.body;
+    if (!name || !taskIds || taskIds.length === 0 || taskIds.length > 3) {
+      return res.status(400).json({ error: 'Name and 1-3 task IDs are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO agendas (user_id, name, task_ids)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, task_ids, finished, created_at`,
+      [req.user.id, name.trim(), taskIds]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Create agenda error:', error);
+    res.status(500).json({ error: 'Failed to create agenda' });
+  }
+});
+
+// DELETE /api/agendas/:agendaId — delete an agenda
+app.delete('/api/agendas/:agendaId', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    await pool.query(
+      'DELETE FROM agendas WHERE id = $1 AND user_id = $2',
+      [agendaId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete agenda error:', error);
+    res.status(500).json({ error: 'Failed to delete agenda' });
+  }
+});
+
+// PATCH /api/agendas/:agendaId/finish — mark agenda as finished
+app.patch('/api/agendas/:agendaId/finish', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    await pool.query(
+      'UPDATE agendas SET finished = true, updated_at = NOW() WHERE id = $1 AND user_id = $2',
+      [agendaId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Finish agenda error:', error);
+    res.status(500).json({ error: 'Failed to finish agenda' });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
