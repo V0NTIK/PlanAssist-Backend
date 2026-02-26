@@ -771,20 +771,33 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
        req.user.id]
     );
 
-    await pool.query('DELETE FROM schedules WHERE user_id = $1', [req.user.id]);
-
-    const insertPromises = [];
+    // Upsert schedule rows — preserves course_id/course_name from enhanced schedule
+    const schedulePromises = [];
+    const allSlots = [];
     for (const [day, periods] of Object.entries(schedule)) {
       for (const [period, type] of Object.entries(periods)) {
-        insertPromises.push(
+        const p = parseInt(period);
+        allSlots.push({ day, period: p });
+        schedulePromises.push(
           pool.query(
-            'INSERT INTO schedules (user_id, day, period, type) VALUES ($1, $2, $3, $4)',
-            [req.user.id, day, parseInt(period), type]
+            `INSERT INTO schedules (user_id, day, period, type)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (user_id, day, period)
+             DO UPDATE SET type = EXCLUDED.type`,
+            [req.user.id, day, p, type]
           )
         );
       }
     }
-    await Promise.all(insertPromises);
+    await Promise.all(schedulePromises);
+    // Remove slots that no longer exist in the updated schedule
+    if (allSlots.length > 0) {
+      const slotValues = allSlots.map(sl => `('${sl.day}',${sl.period})`).join(',');
+      await pool.query(
+        `DELETE FROM schedules WHERE user_id = $1 AND (day, period) NOT IN (${slotValues})`,
+        [req.user.id]
+      );
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -2979,6 +2992,121 @@ app.patch('/api/agendas/:agendaId/finish', authenticateToken, async (req, res) =
   } catch (error) {
     console.error('Finish agenda error:', error);
     res.status(500).json({ error: 'Failed to finish agenda' });
+  }
+});
+
+// ============================================================================
+// ENHANCE SCHEDULE — save lesson-course mappings + zoom numbers
+// ============================================================================
+
+// POST /api/schedule/enhance
+// Body: { lessons: [{day, period, courseId, courseName}], zoomNumbers: [{courseId, zoomNumber}] }
+app.post('/api/schedule/enhance', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { lessons, zoomNumbers } = req.body;
+    await client.query('BEGIN');
+
+    // Update course_id/course_name on existing schedules rows for Lesson slots
+    for (const lesson of (lessons || [])) {
+      await client.query(
+        `UPDATE schedules
+         SET course_id = $1, course_name = $2
+         WHERE user_id = $3 AND day = $4 AND period = $5`,
+        [lesson.courseId || null, lesson.courseName || null, req.user.id, lesson.day, lesson.period]
+      );
+    }
+
+    // Update zoom numbers on courses
+    for (const z of (zoomNumbers || [])) {
+      if (z.zoomNumber) {
+        await client.query(
+          `UPDATE courses SET zoom_number = $1 WHERE id = $2 AND user_id = $3`,
+          [z.zoomNumber, z.courseId, req.user.id]
+        );
+      }
+    }
+
+    // Mark user as enhanced
+    await client.query(
+      `UPDATE users SET schedule_enhanced = true WHERE id = $1`,
+      [req.user.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Enhance schedule error:', error);
+    res.status(500).json({ error: 'Failed to enhance schedule' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/schedule/lessons — get lesson-course mappings for this user
+app.get('/api/schedule/lessons', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.day, s.period, s.course_id, s.course_name, c.zoom_number
+       FROM schedules s
+       LEFT JOIN courses c ON c.id = s.course_id AND c.user_id = $1
+       WHERE s.user_id = $1 AND s.type = 'Lesson' AND s.course_id IS NOT NULL`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get schedule lessons error:', error);
+    res.status(500).json({ error: 'Failed to get schedule lessons' });
+  }
+});
+
+// ============================================================================
+// ITINERARY SLOTS
+// ============================================================================
+
+// GET /api/itinerary — get today's itinerary slots (day param from client)
+app.get('/api/itinerary', authenticateToken, async (req, res) => {
+  try {
+    const { day } = req.query; // e.g. 'Monday'
+    const result = await pool.query(
+      `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.task_ids, a.finished
+       FROM itinerary_slots is2
+       LEFT JOIN agendas a ON a.id = is2.agenda_id
+       WHERE is2.user_id = $1 AND is2.day = $2`,
+      [req.user.id, day]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get itinerary error:', error);
+    res.status(500).json({ error: 'Failed to get itinerary' });
+  }
+});
+
+// PUT /api/itinerary — assign (or clear) an agenda to a period slot
+// Body: { day, period, agendaId } — agendaId: null to clear
+app.put('/api/itinerary', authenticateToken, async (req, res) => {
+  try {
+    const { day, period, agendaId } = req.body;
+    if (agendaId === null || agendaId === undefined) {
+      // Clear the slot
+      await pool.query(
+        `DELETE FROM itinerary_slots WHERE user_id = $1 AND day = $2 AND period = $3`,
+        [req.user.id, day, period]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO itinerary_slots (user_id, day, period, agenda_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, day, period)
+         DO UPDATE SET agenda_id = $4`,
+        [req.user.id, day, period, agendaId]
+      );
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update itinerary error:', error);
+    res.status(500).json({ error: 'Failed to update itinerary' });
   }
 });
 
