@@ -689,7 +689,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -724,6 +724,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
     });
 
     res.json({
+      name: user.name || '',
       grade: user.grade || '',
       canvasApiToken: canvasApiToken,
       presentPeriods: user.present_periods || '2-6',
@@ -1237,7 +1238,6 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
 
     console.log('\n🔄 Formatting assignments and estimating times...');
     const tasks = [];
-    const osgAccelerateTasks = []; // Collect OSGAccelerate tasks for condensing
     
     for (const assignment of allAssignments) {
       const dueDate = new Date(assignment.due_at);
@@ -1256,21 +1256,6 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
       
 
-      
-      // Check if this is an OSGAccelerate task that should be condensed
-      const isOSGCourse = assignment.course_name.includes('OSGAccelerate') || 
-                          assignment.course_name.includes('OSG Accelerate');
-      if (isOSGCourse) {
-        osgAccelerateTasks.push({
-          assignment,
-          dueDate,
-          deadlineDate,
-          deadlineTime,
-          submission,
-          isSubmitted
-        });
-        continue; // Don't process individually, we'll condense later
-      }
       
       // Create base task object for estimation
       const taskForEstimation = {
@@ -1313,80 +1298,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         });
     }
     
-    // Process OSGAccelerate tasks - condense by deadline date
-    console.log('\n🎓 Processing OSGAccelerate tasks for condensing...');
-    const osgDayGroups = {};
-    
-    for (const osgTask of osgAccelerateTasks) {
-      const key = osgTask.deadlineDate; // Group by due date only
-      if (!osgDayGroups[key]) {
-        osgDayGroups[key] = [];
-      }
-      osgDayGroups[key].push(osgTask);
-    }
-    
-    // Create condensed tasks for each day group
-    for (const [deadlineDate, groupTasks] of Object.entries(osgDayGroups)) {
-      if (groupTasks.length === 0) continue;
-      
-      const firstTask = groupTasks[0];
-      
-      // Count by type: Assessment = contains "Assessment", Quiz = contains "Quiz"
-      let assessmentCount = 0;
-      let quizCount = 0;
-      
-      for (const task of groupTasks) {
-        const title = task.assignment.name;
-        if (title.includes('Assessment')) assessmentCount++;
-        if (title.includes('Quiz')) quizCount++;
-      }
-      
-      // Build title: "OSG Accelerate (2 Assessments) (7 Quizzes)"
-      const titleParts = [];
-      if (assessmentCount > 0) titleParts.push(`${assessmentCount} Assessment${assessmentCount !== 1 ? 's' : ''}`);
-      if (quizCount > 0) titleParts.push(`${quizCount} ${quizCount !== 1 ? 'Quizzes' : 'Quiz'}`);
-      const condensedTitle = `OSG Accelerate (${titleParts.join(') (')})`;
-      
-      // Time formula: (Assessments * 30) + (Quizzes * 5) + 15
-      const condensedTime = (assessmentCount * 30) + (quizCount * 5) + 15;
-      
-      // Check if all tasks in group are submitted
-      const allSubmitted = groupTasks.every(t => t.isSubmitted);
-      
-      // URL: OSG Accelerate course assignments page, unique per day via query param
-      const osgCourseId = firstTask.assignment.course_id;
-      const condensedUrl = `https://canvas.oneschoolglobal.com/courses/${osgCourseId}/modules?week=${deadlineDate}`;
-      
-      console.log(`  ✓ Condensed OSG ${deadlineDate}: ${groupTasks.length} tasks (${assessmentCount} assessments, ${quizCount} quizzes) → ${condensedTime} min`);
-      
-      const condensedTaskBase = {
-        title: condensedTitle,
-        class: firstTask.assignment.course_name,
-        description: `OSG Accelerate condensed tasks for ${deadlineDate} | Assignment IDs: ${groupTasks.map(t => t.assignment.id).join(',')}`,
-        url: condensedUrl,
-        deadlineDate: firstTask.deadlineDate,
-        deadlineTime: firstTask.deadlineTime,
-        courseId: firstTask.assignment.course_id,
-        assignmentId: null,
-        pointsPossible: null,
-        assignmentGroupId: firstTask.assignment.assignment_group_id,
-        currentScore: null,
-        currentGrade: null,
-        gradingType: 'points',
-        unlockAt: null,
-        lockAt: null,
-        submittedAt: allSubmitted ? new Date().toISOString() : null,
-        isMissing: false,
-        isLate: false,
-        completed: allSubmitted
-      };
-      
-      tasks.push({ ...condensedTaskBase, segment: null, estimatedTime: condensedTime });
-    }
-    
-    console.log(`✓ Formatted ${tasks.length} tasks for database (with auto-segmentation and OSG condensing)`);
-    console.log(`  - Regular tasks: ${tasks.length - Object.keys(osgDayGroups).length}`);
-    console.log(`  - Condensed OSG days: ${Object.keys(osgDayGroups).length}`);
+    console.log(`✓ Formatted ${tasks.length} tasks for database`);
     console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
     
     res.json({ 
@@ -1888,45 +1800,11 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           );
         }
       } else {
-        // No assignment_id (e.g. OSG condensed tasks) - match by title+deadline_date first,
-        // which is more reliable than URL since URL format can change
-        if (incomingTask.title && incomingTask.deadlineDate) {
-          existingTasksResult = await pool.query(
-            `SELECT * FROM tasks WHERE user_id = $1 AND title = $2 AND deadline_date = $3
-             ORDER BY id ASC`,
-            [req.user.id, incomingTask.title, incomingTask.deadlineDate]
-          );
-          if (existingTasksResult.rows.length > 0) {
-            console.log(`[OSG MATCH] Found by title+date: "${incomingTask.title}" on ${incomingTask.deadlineDate}`);
-            // Update URL to current format while we're here
-            const existRow = existingTasksResult.rows[0];
-            if (existRow.url !== incomingTask.url) {
-              await pool.query('UPDATE tasks SET url = $1 WHERE id = $2', [incomingTask.url, existRow.id]);
-              existingTasksResult.rows[0].url = incomingTask.url;
-            }
-            // If multiple rows found (old duplicates), soft-delete extras
-            if (existingTasksResult.rows.length > 1) {
-              const extraIds = existingTasksResult.rows.slice(1).map(r => r.id);
-              await pool.query(
-                `UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = ANY($1)`,
-                [extraIds]
-              );
-              console.log(`[OSG CLEANUP] Soft-deleted ${extraIds.length} duplicate(s): ids ${extraIds.join(',')}`);
-              existingTasksResult = { rows: [existingTasksResult.rows[0]] };
-            }
-          } else {
-            // Fall back to URL
-            existingTasksResult = await pool.query(
-              'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
-              [req.user.id, incomingTask.url]
-            );
-          }
-        } else {
-          existingTasksResult = await pool.query(
-            'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
-            [req.user.id, incomingTask.url]
-          );
-        }
+        // No assignment_id - fall back to URL matching
+        existingTasksResult = await pool.query(
+          'SELECT * FROM tasks WHERE user_id = $1 AND url = $2',
+          [req.user.id, incomingTask.url]
+        );
       }
 
       if (existingTasksResult.rows.length > 0) {
@@ -1934,6 +1812,11 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         console.log(`\n[UPDATE] Found ${existingTasksResult.rows.length} existing task(s) with URL: ${incomingTask.url}`);
         
         // Detect if this is a Canvas sync (has canvas fields) vs a plan reorder (no canvas fields)
+        // Skip Canvas sync updates for manually created tasks
+        if (existingTask.manually_created) {
+          console.log(`[SKIP] Manually created task, skipping sync: ${existingTask.title}`);
+          continue;
+        }
         const hasCanvasData = incomingTask.courseId !== undefined || incomingTask.assignmentId !== undefined;
         
         for (const existingTask of existingTasksResult.rows) {
@@ -2078,26 +1961,18 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           continue;
         }
 
-        // SAFETY NET for OSG condensed tasks (assignmentId=null):
-        // Check if a non-deleted task with same title + deadline_date already exists.
-        // This prevents duplicates when URL format changes or URL lookup misses.
-        if (!incomingTask.assignmentId && incomingTask.title && incomingTask.deadlineDate) {
-          const osgDuplicate = await pool.query(
-            `SELECT id FROM tasks
-             WHERE user_id = $1 AND title = $2 AND deadline_date = $3 AND deleted = false`,
-            [req.user.id, incomingTask.title, incomingTask.deadlineDate]
-          );
-          if (osgDuplicate.rows.length > 0) {
-            console.log(`\n[SKIP] Duplicate OSG task detected (title+date match): ${incomingTask.title} on ${incomingTask.deadlineDate}`);
-            // Update the URL on the existing row to new format
-            await pool.query(
-              'UPDATE tasks SET url = $1 WHERE id = $2',
-              [incomingTask.url, osgDuplicate.rows[0].id]
-            );
-            continue;
-          }
+        // URL DOESN'T EXIST - check if this was soft-deleted (e.g. split into segments)
+        // If a deleted row exists with same assignment_id, skip re-import
+        const deletedCheck = await pool.query(
+          'SELECT id FROM tasks WHERE user_id = $1 AND assignment_id = $2 AND deleted = true LIMIT 1',
+          [req.user.id, incomingTask.assignmentId]
+        );
+        if (deletedCheck.rows.length > 0 && incomingTask.assignmentId) {
+          // Original was split - update the deleted row's canvas fields but don't resurrect
+          console.log(`[SPLIT] Skipping re-import of split task: ${incomingTask.title}`);
+          continue;
         }
-        
+
         // URL DOESN'T EXIST - Import as new task
         console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
         console.log(`  courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, pointsPossible=${incomingTask.pointsPossible}`);
@@ -2175,6 +2050,21 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         newCount++;
         console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
       }
+    }
+
+    // === MIGRATE: Remove old OSG Accelerate condensed tasks ===
+    // Old condensed tasks had title starting with "OSG Accelerate (" and no assignment_id
+    // These will be re-synced as individual normal tasks
+    const osgCleanup = await pool.query(
+      `UPDATE tasks SET deleted = true, priority_order = NULL
+       WHERE user_id = $1
+         AND deleted = false
+         AND assignment_id IS NULL
+         AND (title LIKE 'OSG Accelerate (%' OR title LIKE 'OSGAccelerate (%')`,
+      [req.user.id]
+    );
+    if (osgCleanup.rowCount > 0) {
+      console.log(`[OSG MIGRATE] Cleaned up ${osgCleanup.rowCount} old condensed OSG task(s)`);
     }
 
     // === CLEANUP PAST DUE TASKS ===
@@ -2274,33 +2164,39 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
       
       const result = await pool.query(
         `INSERT INTO tasks 
-         (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         (user_id, title, segment, class, description, url, deadline_date, deadline_time,
+          estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed,
+          course_id, assignment_id, points_possible, assignment_group_id, grading_type,
+          deleted, manually_created)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 $15, NULL, NULL, NULL, 'points', false, false)
          RETURNING *`,
         [
           req.user.id,
-          originalTask.title, // Keep same title
+          originalTask.title,
           fullSegment,
           originalTask.class,
           originalTask.description,
           originalTask.url,
           originalTask.deadline_date,
           originalTask.deadline_time,
-          Math.floor(originalTask.estimated_time / segments.length), // Divide estimate
+          Math.floor(originalTask.estimated_time / segments.length),
           originalTask.user_estimated_time ? Math.floor(originalTask.user_estimated_time / segments.length) : null,
-          0, // Reset accumulated time
-          null, // Let priority sort naturally - will be set when user adds from sidebar
-          true, // Mark as NEW so it appears in sidebar for prioritization
-          false
+          0,
+          null, // priority set when user adds from sidebar
+          true, // is_new so it appears in sidebar
+          false,
+          originalTask.course_id   // keep course association, but NO assignment_id
         ]
       );
       
       newSegments.push(result.rows[0]);
     }
 
-    // Delete the original task
+    // Soft-delete the original task so Sync doesn't re-import it as a new task
+    // The Sync will find the segments by assignment_id and update them
     await pool.query(
-      'DELETE FROM tasks WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -3166,6 +3062,70 @@ app.delete('/api/tutorials', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Delete tutorial error:', error);
     res.status(500).json({ error: 'Failed to delete tutorial' });
+  }
+});
+
+
+// POST /api/tasks/normalize — compact priority_order to remove gaps after deletions
+app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE tasks SET priority_order = NULL
+       WHERE user_id = $1 AND (completed = true OR deleted = true)`,
+      [req.user.id]
+    );
+    await pool.query(
+      `WITH ordered AS (
+         SELECT id,
+           ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
+         FROM tasks
+         WHERE user_id = $1 AND deleted = false AND completed = false AND priority_order IS NOT NULL
+       )
+       UPDATE tasks SET priority_order = ordered.new_order
+       FROM ordered WHERE tasks.id = ordered.id`,
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Normalize priority error:', error);
+    res.status(500).json({ error: 'Failed to normalize priority' });
+  }
+});
+
+
+// POST /api/tasks/manual — create a user-defined task
+app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
+  try {
+    const { title, deadlineDate, deadlineTime, estimatedTime, description, url } = req.body;
+    if (!title || !deadlineDate || !estimatedTime) {
+      return res.status(400).json({ error: 'title, deadlineDate, and estimatedTime are required' });
+    }
+    // Get next priority
+    const maxP = await pool.query(
+      'SELECT MAX(priority_order) as max_p FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false',
+      [req.user.id]
+    );
+    const nextPriority = (maxP.rows[0].max_p || 0) + 1;
+
+    const result = await pool.query(
+      `INSERT INTO tasks
+         (user_id, title, segment, class, description, url, deadline_date, deadline_time,
+          estimated_time, user_estimated_time, accumulated_time, priority_order,
+          is_new, completed, deleted, manually_created,
+          course_id, assignment_id, points_possible, assignment_group_id, grading_type)
+       VALUES ($1, $2, NULL, 'Personal', $3, $4, $5, $6, $7, $7, 0, $8,
+               true, false, false, true,
+               NULL, NULL, NULL, NULL, 'not_graded')
+       RETURNING *`,
+      [
+        req.user.id, title, description || '', url || null,
+        deadlineDate, deadlineTime || null, estimatedTime, nextPriority
+      ]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Create manual task error:', error);
+    res.status(500).json({ error: 'Failed to create task' });
   }
 });
 
