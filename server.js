@@ -689,7 +689,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed FROM users WHERE id = $1',
+      'SELECT grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -730,7 +730,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       schedule,
       calendarTodayCentered: user.calendar_today_centered ?? false,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
-      calendarShowCompleted: user.calendar_show_completed ?? true
+      calendarShowCompleted: user.calendar_show_completed ?? true,
+      schedule_enhanced: user.schedule_enhanced || false
     });
   } catch (error) {
     console.error('Get account setup error:', error);
