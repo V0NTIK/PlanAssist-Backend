@@ -3110,6 +3110,64 @@ app.put('/api/itinerary', authenticateToken, async (req, res) => {
   }
 });
 
+
+// ============================================================================
+// TUTORIALS
+// ============================================================================
+
+// GET /api/tutorials?day=Monday — get tutorials for a specific day
+app.get('/api/tutorials', authenticateToken, async (req, res) => {
+  try {
+    const { day } = req.query;
+    const query = day
+      ? 'SELECT * FROM tutorials WHERE user_id = $1 AND day = $2 ORDER BY period ASC'
+      : 'SELECT * FROM tutorials WHERE user_id = $1 ORDER BY day, period ASC';
+    const params = day ? [req.user.id, day] : [req.user.id];
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get tutorials error:', error);
+    res.status(500).json({ error: 'Failed to get tutorials' });
+  }
+});
+
+// PUT /api/tutorials — upsert a tutorial for a day/period
+app.put('/api/tutorials', authenticateToken, async (req, res) => {
+  try {
+    const { day, period, zoomNumber, topic } = req.body;
+    if (!day || !period) {
+      return res.status(400).json({ error: 'Day and period are required' });
+    }
+    const result = await pool.query(
+      `INSERT INTO tutorials (user_id, day, period, zoom_number, topic)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_id, day, period)
+       DO UPDATE SET zoom_number = $4, topic = $5
+       RETURNING *`,
+      [req.user.id, day, period, zoomNumber || null, topic || null]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Upsert tutorial error:', error);
+    res.status(500).json({ error: 'Failed to save tutorial' });
+  }
+});
+
+// DELETE /api/tutorials — remove a tutorial for a day/period
+app.delete('/api/tutorials', authenticateToken, async (req, res) => {
+  try {
+    const { day, period } = req.body;
+    await pool.query(
+      'DELETE FROM tutorials WHERE user_id = $1 AND day = $2 AND period = $3',
+      [req.user.id, day, period]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete tutorial error:', error);
+    res.status(500).json({ error: 'Failed to delete tutorial' });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
