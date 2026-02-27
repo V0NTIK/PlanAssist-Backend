@@ -1811,15 +1811,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         // Task EXISTS - Update, but only overwrite Canvas fields if they're actually provided
         console.log(`\n[UPDATE] Found ${existingTasksResult.rows.length} existing task(s) with URL: ${incomingTask.url}`);
         
-        // Detect if this is a Canvas sync (has canvas fields) vs a plan reorder (no canvas fields)
-        // Skip Canvas sync updates for manually created tasks
-        if (existingTask.manually_created) {
-          console.log(`[SKIP] Manually created task, skipping sync: ${existingTask.title}`);
-          continue;
-        }
         const hasCanvasData = incomingTask.courseId !== undefined || incomingTask.assignmentId !== undefined;
         
         for (const existingTask of existingTasksResult.rows) {
+          // Skip Canvas sync updates for manually created tasks
+          if (existingTask.manually_created) {
+            console.log(`[SKIP] Manually created task, skipping sync: ${existingTask.title}`);
+            continue;
+          }
           if (hasCanvasData) {
             // Full Canvas sync update — overwrite canvas fields with fresh data
             // For split segments, skip canvas field update entirely to avoid
