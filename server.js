@@ -2162,11 +2162,17 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
     
     // Create new segment tasks
     const newSegments = [];
-    for (const segmentName of segments) {
+    for (let si = 0; si < segments.length; si++) {
+      const segmentName = segments[si];
+      const isFirst = si === 0;
+
       // Build full segment path
       const fullSegment = originalTask.segment 
         ? `${originalTask.segment} - ${segmentName}`
         : segmentName;
+
+      // Carry ALL accumulated_time onto the first segment; others start at 0
+      const segAccumulatedTime = isFirst ? (originalTask.accumulated_time || 0) : 0;
       
       const result = await pool.query(
         `INSERT INTO tasks 
@@ -2188,7 +2194,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
           originalTask.deadline_time,
           Math.floor(originalTask.estimated_time / segments.length),
           originalTask.user_estimated_time ? Math.floor(originalTask.user_estimated_time / segments.length) : null,
-          0,
+          segAccumulatedTime, // first segment inherits all prior partial time
           null, // priority set when user adds from sidebar
           true, // is_new so it appears in sidebar
           false,
@@ -2430,22 +2436,53 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     
     const task = taskResult.rows[0];
     
-    await pool.query(
-      `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
-      [
-        task.id,
-        req.user.id,
-        task.title,
-        task.class,
-        task.description,
-        task.url,
-        task.deadline_date,
-        task.deadline_time,
-        task.user_estimated_time || task.estimated_time,
-        timeSpent
-      ]
-    );
+    // For segment tasks: check if another segment of the same task already exists
+    // in tasks_completed. If so, merge by accumulating estimated_time + actual_time.
+    // Always fire leaderboard + feed regardless (each segment is real work done).
+    if (task.segment && task.url) {
+      const existingCompletion = await pool.query(
+        'SELECT id, estimated_time, actual_time FROM tasks_completed WHERE user_id = $1 AND url = $2',
+        [req.user.id, task.url]
+      );
+
+      if (existingCompletion.rows.length > 0) {
+        // Merge: add this segment's time onto the existing entry
+        const existing = existingCompletion.rows[0];
+        const newEstimated = (existing.estimated_time || 0) + (task.user_estimated_time || task.estimated_time || 0);
+        const newActual = (existing.actual_time || 0) + (timeSpent || 0);
+        await pool.query(
+          `UPDATE tasks_completed
+           SET estimated_time = $1, actual_time = $2, completed_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [newEstimated, newActual, existing.id]
+        );
+        console.log(`[SEGMENT MERGE] Updated tasks_completed for "${task.title}" (+${timeSpent}min actual, +${task.user_estimated_time || task.estimated_time}min est)`);
+      } else {
+        // First segment to complete — insert normally
+        await pool.query(
+          `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
+          [
+            task.id, req.user.id, task.title, task.class, task.description, task.url,
+            task.deadline_date, task.deadline_time,
+            task.user_estimated_time || task.estimated_time,
+            timeSpent
+          ]
+        );
+      }
+    } else {
+      // Non-segment task: insert normally
+      await pool.query(
+        `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
+        [
+          task.id, req.user.id, task.title, task.class, task.description, task.url,
+          task.deadline_date, task.deadline_time,
+          task.user_estimated_time || task.estimated_time,
+          timeSpent
+        ]
+      );
+    }
     
     // Mark task as deleted instead of removing from database
     // This preserves the URL in the database so it won't be re-imported during sync
