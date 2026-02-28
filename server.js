@@ -2054,16 +2054,23 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // === MIGRATE: Remove old OSG Accelerate condensed tasks ===
     // Old condensed tasks had title starting with "OSG Accelerate (" and no assignment_id
     // These will be re-synced as individual normal tasks
+    // Clean up ALL old OSG Accelerate condensed tasks:
+    // - assignment_id IS NULL (condensed tasks never had a real Canvas assignment_id)
+    // - manually_created IS NOT TRUE (don't touch user-created tasks)
+    // - class contains OSGAccelerate or OSG Accelerate (identifies the course)
+    // Real individual OSG tasks from Canvas will have assignment_id set so are unaffected.
     const osgCleanup = await pool.query(
-      `UPDATE tasks SET deleted = true, priority_order = NULL
+      `UPDATE tasks SET deleted = true, priority_order = NULL, is_new = false
        WHERE user_id = $1
          AND deleted = false
          AND assignment_id IS NULL
-         AND (title LIKE 'OSG Accelerate (%' OR title LIKE 'OSGAccelerate (%')`,
+         AND (manually_created = false OR manually_created IS NULL)
+         AND (class ILIKE '%osgaccelerate%' OR class ILIKE '%osg accelerate%'
+              OR title LIKE 'OSG Accelerate (%' OR title LIKE 'OSGAccelerate (%')`,
       [req.user.id]
     );
     if (osgCleanup.rowCount > 0) {
-      console.log(`[OSG MIGRATE] Cleaned up ${osgCleanup.rowCount} old condensed OSG task(s)`);
+      console.log(\`[OSG MIGRATE] Soft-deleted \${osgCleanup.rowCount} old condensed OSG task(s)\`);
     }
 
     // === CLEANUP PAST DUE TASKS ===
