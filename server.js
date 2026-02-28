@@ -2070,7 +2070,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       [req.user.id]
     );
     if (osgCleanup.rowCount > 0) {
-      console.log(\`[OSG MIGRATE] Soft-deleted \${osgCleanup.rowCount} old condensed OSG task(s)\`);
+      console.log(`[OSG MIGRATE] Soft-deleted ${osgCleanup.rowCount} old condensed OSG task(s)`);
     }
 
     // === CLEANUP PAST DUE TASKS ===
