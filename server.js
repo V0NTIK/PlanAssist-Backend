@@ -2823,7 +2823,7 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
       if (taskIds.length === 0) return { ...agenda, tasks: [] };
 
       const tasksResult = await pool.query(
-        `SELECT id, title, segment, class, url, deadline_date,
+        `SELECT id, title, segment, class, url, deadline_date, deadline_time,
                 estimated_time, user_estimated_time, accumulated_time,
                 session_active, priority_order, completed, deleted
          FROM tasks
