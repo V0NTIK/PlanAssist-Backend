@@ -3307,8 +3307,10 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
               u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
+              COUNT(DISTINCT t.id) FILTER (WHERE t.is_new = true AND t.deleted = false) AS new_tasks,
               MAX(tc.completed_at) AS last_completion,
-              COUNT(DISTINCT tc.id) AS total_completed
+              COUNT(DISTINCT tc.id) AS total_completed,
+              EXISTS(SELECT 1 FROM tasks st WHERE st.user_id = u.id AND st.session_active = true) AS in_session
        FROM users u
        LEFT JOIN tasks t ON t.user_id = u.id
        LEFT JOIN tasks_completed tc ON tc.user_id = u.id
@@ -3337,12 +3339,18 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
        FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
       [req.params.id]
     );
+    const newTasksRes = await pool.query(
+      `SELECT id, title, segment, class, deadline_date, manually_created
+       FROM tasks WHERE user_id = $1 AND is_new = true AND deleted = false
+       ORDER BY deadline_date ASC`,
+      [req.params.id]
+    );
     const completedRes = await pool.query(
       `SELECT title, class, actual_time, estimated_time, completed_at
        FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 20`,
       [req.params.id]
     );
-    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, recentCompletions: completedRes.rows });
+    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, newTasks: newTasksRes.rows, recentCompletions: completedRes.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user detail' });
   }
@@ -3432,6 +3440,57 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
   }
 });
 
+
+// POST /api/admin/users/:id/tasks-scan — clear all is_new flags and reassign priority_order
+app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const targetId = parseInt(req.params.id);
+    await client.query('BEGIN');
+
+    // Step 1: Clear all is_new flags for this user
+    await client.query(
+      `UPDATE tasks SET is_new = false WHERE user_id = $1 AND is_new = true AND deleted = false`,
+      [targetId]
+    );
+
+    // Step 2: Reassign priority_order sequentially for all active, non-new tasks
+    // preserving their existing relative order (by current priority_order then deadline)
+    await client.query(
+      `WITH ordered AS (
+         SELECT id, ROW_NUMBER() OVER (
+           ORDER BY priority_order ASC NULLS LAST, deadline_date ASC NULLS LAST
+         ) AS new_order
+         FROM tasks
+         WHERE user_id = $1 AND deleted = false AND completed = false
+       )
+       UPDATE tasks SET priority_order = ordered.new_order
+       FROM ordered WHERE tasks.id = ordered.id`,
+      [targetId]
+    );
+
+    await client.query('COMMIT');
+
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'TASKS_SCAN', targetId, targetRes.rows[0]?.name, {});
+
+    // Return updated task list for the user
+    const tasksRes = await pool.query(
+      `SELECT id, title, segment, class, deadline_date, priority_order, completed, deleted, is_new, manually_created
+       FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
+      [targetId]
+    );
+    res.json({ success: true, tasks: tasksRes.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Tasks scan error:', err);
+    res.status(500).json({ error: 'Tasks scan failed' });
+  } finally {
+    client.release();
+  }
+});
+
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
 app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -3487,6 +3546,7 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
       `SELECT u.name as user_name, t.url, COUNT(*) as count
        FROM tasks t JOIN users u ON u.id = t.user_id
        WHERE t.deleted = false AND t.completed = false AND t.url IS NOT NULL
+         AND t.segment IS NULL
        GROUP BY u.name, t.url HAVING COUNT(*) > 1
        ORDER BY count DESC LIMIT 20`
     );
@@ -3501,14 +3561,14 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
        FROM users u
        LEFT JOIN tasks_completed tc ON tc.user_id = u.id
        WHERE u.grade IS NOT NULL AND u.grade != ''
-       GROUP BY u.grade ORDER BY u.grade ASC`
+       GROUP BY u.grade ORDER BY NULLIF(regexp_replace(u.grade, '[^0-9]', '', 'g'), '')::int ASC NULLS LAST`
     );
 
     // f) New user signups (last 14 days)
     const newUsersRes = await pool.query(
       `SELECT id, name, email, grade, created_at, is_new_user
        FROM users
-       WHERE created_at > NOW() - INTERVAL '14 days'
+       WHERE created_at > NOW() - INTERVAL '3 days'
        ORDER BY created_at DESC`
     );
 
