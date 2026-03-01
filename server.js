@@ -624,6 +624,14 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     const user = result.rows[0];
+    // Credential ban check
+    if (user.is_banned) {
+      return res.status(403).json({ 
+        error: 'ACCOUNT_BLOCKED',
+        message: user.ban_reason || 'This account has been temporarily blocked. Please contact your administrator.'
+      });
+    }
+
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({ 
@@ -632,7 +640,8 @@ app.post('/api/auth/register', async (req, res) => {
         id: user.id, 
         email: user.email, 
         name: user.name,
-        isNewUser: user.is_new_user
+        isNewUser: user.is_new_user,
+        isAdmin: user.is_admin || false
       } 
     });
   } catch (error) {
@@ -689,7 +698,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced, is_admin FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -732,7 +741,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       calendarTodayCentered: user.calendar_today_centered ?? false,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true,
-      schedule_enhanced: user.schedule_enhanced || false
+      schedule_enhanced: user.schedule_enhanced || false,
+      is_admin: user.is_admin || false
     });
   } catch (error) {
     console.error('Get account setup error:', error);
@@ -3169,6 +3179,365 @@ app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Create manual task error:', error);
     res.status(500).json({ error: 'Failed to create task' });
+  }
+});
+
+
+// ============================================================================
+// ADMIN MIDDLEWARE + AUDIT HELPER
+// ============================================================================
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    const result = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+    if (!result.rows[0]?.is_admin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+};
+
+const auditLog = async (adminId, adminName, action, targetUserId, targetUserName, details = {}) => {
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_log (admin_id, admin_name, action, target_user_id, target_user_name, details)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [adminId, adminName, action, targetUserId || null, targetUserName || null, JSON.stringify(details)]
+    );
+  } catch (err) {
+    console.error('[AUDIT] Failed to write audit log:', err.message);
+  }
+};
+
+// ============================================================================
+// ADMIN: ANNOUNCEMENTS
+// ============================================================================
+
+// GET /api/admin/announcements — all active (and recent inactive) for admin view
+app.get('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT a.*, u.name as author_name
+       FROM announcements a
+       LEFT JOIN users u ON u.id = a.author_id
+       ORDER BY a.created_at DESC LIMIT 50`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch announcements' });
+  }
+});
+
+// GET /api/announcements — active announcements for current user (with dismissal state)
+app.get('/api/announcements', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT a.*,
+         EXISTS(
+           SELECT 1 FROM announcement_dismissals d
+           WHERE d.announcement_id = a.id AND d.user_id = $1
+         ) as dismissed
+       FROM announcements a
+       WHERE a.is_active = true
+       ORDER BY a.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch announcements' });
+  }
+});
+
+// POST /api/admin/announcements — create announcement
+app.post('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { message, type } = req.body;
+    if (!message || !type) return res.status(400).json({ error: 'message and type required' });
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name || 'Admin';
+    const result = await pool.query(
+      `INSERT INTO announcements (author_id, author_name, message, type) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [req.user.id, adminName, message, type]
+    );
+    await auditLog(req.user.id, adminName, 'CREATE_ANNOUNCEMENT', null, null, { message, type });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create announcement' });
+  }
+});
+
+// PATCH /api/admin/announcements/:id/deactivate
+app.patch('/api/admin/announcements/:id/deactivate', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE announcements SET is_active = false, deactivated_at = NOW() WHERE id = $1`,
+      [req.params.id]
+    );
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'DEACTIVATE_ANNOUNCEMENT', null, null, { announcement_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to deactivate' });
+  }
+});
+
+// POST /api/announcements/:id/dismiss — user dismisses a dismissible banner
+app.post('/api/announcements/:id/dismiss', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO announcement_dismissals (user_id, announcement_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [req.user.id, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to dismiss' });
+  }
+});
+
+// ============================================================================
+// ADMIN: USER MANAGEMENT
+// ============================================================================
+
+// GET /api/admin/users — list all users with stats
+app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
+              u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at,
+              COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
+              MAX(tc.completed_at) AS last_completion,
+              COUNT(DISTINCT tc.id) AS total_completed
+       FROM users u
+       LEFT JOIN tasks t ON t.user_id = u.id
+       LEFT JOIN tasks_completed tc ON tc.user_id = u.id
+       GROUP BY u.id
+       ORDER BY u.created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// GET /api/admin/users/:id — single user detail + tasks
+app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const userRes = await pool.query(
+      `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
+              present_periods, schedule_enhanced, created_at FROM users WHERE id = $1`,
+      [req.params.id]
+    );
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const tasksRes = await pool.query(
+      `SELECT id, title, segment, class, deadline_date, priority_order, completed, deleted, is_new, manually_created
+       FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
+      [req.params.id]
+    );
+    const completedRes = await pool.query(
+      `SELECT title, class, actual_time, estimated_time, completed_at
+       FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 20`,
+      [req.params.id]
+    );
+    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, recentCompletions: completedRes.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user detail' });
+  }
+});
+
+// PATCH /api/admin/users/:id — edit user fields (name, grade, present_periods, is_admin)
+app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, grade, present_periods, is_admin } = req.body;
+    const targetId = parseInt(req.params.id);
+
+    // Prevent self-demotion
+    if (is_admin === false && targetId === req.user.id) {
+      return res.status(400).json({ error: 'You cannot remove your own admin status.' });
+    }
+
+    const fields = [];
+    const vals = [];
+    let idx = 1;
+    if (name !== undefined)            { fields.push(`name = $${idx++}`);            vals.push(name); }
+    if (grade !== undefined)           { fields.push(`grade = $${idx++}`);           vals.push(grade); }
+    if (present_periods !== undefined) { fields.push(`present_periods = $${idx++}`); vals.push(present_periods); }
+    if (is_admin !== undefined)        { fields.push(`is_admin = $${idx++}`);        vals.push(is_admin); }
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    vals.push(targetId);
+    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx}`, vals);
+
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, req.body);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// POST /api/admin/users/:id/ban
+app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const targetId = parseInt(req.params.id);
+    if (targetId === req.user.id) return res.status(400).json({ error: 'You cannot ban yourself.' });
+
+    await pool.query(
+      `UPDATE users SET is_banned = true, ban_reason = $1 WHERE id = $2`,
+      [reason || 'This account has been temporarily blocked. Please contact your administrator.', targetId]
+    );
+    // Invalidate sessions by clearing their token can't be done in JWT without a blacklist,
+    // but next login attempt will be rejected.
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'BAN_USER', targetId, targetRes.rows[0]?.name, { reason });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to ban user' });
+  }
+});
+
+// POST /api/admin/users/:id/unban
+app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    await pool.query(`UPDATE users SET is_banned = false, ban_reason = NULL WHERE id = $1`, [targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'UNBAN_USER', targetId, targetRes.rows[0]?.name, {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to unban user' });
+  }
+});
+
+// POST /api/admin/users/:id/clear-token — clear Canvas API token
+app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    await pool.query(
+      `UPDATE users SET canvas_api_token = NULL, canvas_api_token_iv = NULL WHERE id = $1`, [targetId]
+    );
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'CLEAR_CANVAS_TOKEN', parseInt(targetId), targetRes.rows[0]?.name, {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to clear token' });
+  }
+});
+
+// DELETE /api/admin/tasks/:taskId — admin delete a specific task
+app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const taskRes = await pool.query('SELECT title, user_id FROM tasks WHERE id = $1', [req.params.taskId]);
+    if (taskRes.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskRes.rows[0];
+    await pool.query('UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1', [req.params.taskId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [task.user_id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'DELETE_TASK', task.user_id, targetRes.rows[0]?.name, { task_title: task.title, task_id: req.params.taskId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete task' });
+  }
+});
+
+// ============================================================================
+// ADMIN: DIAGNOSTICS
+// ============================================================================
+
+// GET /api/admin/diagnostics
+app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    // a) Users who haven't synced recently (no tasks updated in 7 days)
+    const staleSyncRes = await pool.query(
+      `SELECT u.id, u.name, u.email, u.grade, MAX(t.created_at) as last_task_import
+       FROM users u
+       LEFT JOIN tasks t ON t.user_id = u.id
+       WHERE u.is_new_user = false
+       GROUP BY u.id
+       HAVING MAX(t.created_at) < NOW() - INTERVAL '7 days' OR MAX(t.created_at) IS NULL
+       ORDER BY last_task_import ASC NULLS FIRST LIMIT 20`
+    );
+
+    // b) Users with no Canvas token set
+    const noTokenRes = await pool.query(
+      `SELECT id, name, email, grade FROM users
+       WHERE (canvas_api_token IS NULL OR canvas_api_token = '')
+         AND is_new_user = false
+       ORDER BY name ASC`
+    );
+
+    // c) Tasks with missing/null deadlines
+    const badTasksRes = await pool.query(
+      `SELECT t.id, t.title, t.class, u.name as user_name, u.grade
+       FROM tasks t JOIN users u ON u.id = t.user_id
+       WHERE t.deleted = false AND t.completed = false AND t.deadline_date IS NULL
+       ORDER BY u.name ASC LIMIT 30`
+    );
+
+    // d) Duplicate tasks (same url + user, multiple active)
+    const dupRes = await pool.query(
+      `SELECT u.name as user_name, t.url, COUNT(*) as count
+       FROM tasks t JOIN users u ON u.id = t.user_id
+       WHERE t.deleted = false AND t.completed = false AND t.url IS NOT NULL
+       GROUP BY u.name, t.url HAVING COUNT(*) > 1
+       ORDER BY count DESC LIMIT 20`
+    );
+
+    // e) Completion stats by grade
+    const statsRes = await pool.query(
+      `SELECT u.grade,
+              COUNT(DISTINCT u.id) as user_count,
+              COUNT(tc.id) as total_completions,
+              ROUND(AVG(tc.actual_time)::numeric, 1) as avg_actual_min,
+              ROUND(AVG(tc.estimated_time)::numeric, 1) as avg_estimated_min
+       FROM users u
+       LEFT JOIN tasks_completed tc ON tc.user_id = u.id
+       WHERE u.grade IS NOT NULL AND u.grade != ''
+       GROUP BY u.grade ORDER BY u.grade ASC`
+    );
+
+    // f) New user signups (last 14 days)
+    const newUsersRes = await pool.query(
+      `SELECT id, name, email, grade, created_at, is_new_user
+       FROM users
+       WHERE created_at > NOW() - INTERVAL '14 days'
+       ORDER BY created_at DESC`
+    );
+
+    res.json({
+      staleSyncs: staleSyncRes.rows,
+      noToken: noTokenRes.rows,
+      badTasks: badTasksRes.rows,
+      duplicates: dupRes.rows,
+      gradeStats: statsRes.rows,
+      newUsers: newUsersRes.rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch diagnostics' });
+  }
+});
+
+// ============================================================================
+// ADMIN: AUDIT LOG
+// ============================================================================
+
+app.get('/api/admin/audit-log', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM admin_audit_log ORDER BY created_at DESC LIMIT 200`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch audit log' });
   }
 });
 
