@@ -1754,7 +1754,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM tasks 
-       WHERE user_id = $1
+       WHERE user_id = $1 AND deleted = false
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
@@ -3150,8 +3150,8 @@ app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
 app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
   try {
     const { title, deadlineDate, deadlineTime, estimatedTime, description, url } = req.body;
-    if (!title || !deadlineDate || !estimatedTime) {
-      return res.status(400).json({ error: 'title, deadlineDate, and estimatedTime are required' });
+    if (!title || !deadlineDate || !deadlineTime || !estimatedTime) {
+      return res.status(400).json({ error: 'title, deadlineDate, deadlineTime, and estimatedTime are required' });
     }
     // Get next priority
     const maxP = await pool.query(
@@ -3171,7 +3171,7 @@ app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
                NULL, NULL, NULL, NULL, 'not_graded')
        RETURNING *`,
       [
-        req.user.id, title, description || '', url || null,
+        req.user.id, title, description || null, url || 'https://planassist.onrender.com/',
         deadlineDate, deadlineTime || null, estimatedTime, nextPriority
       ]
     );
