@@ -2878,10 +2878,10 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
         [taskIds, req.user.id]
       );
 
-      // Preserve original ordering from task_ids array
+      // Preserve original ordering; exclude deleted tasks (completed agenda tasks are soft-deleted)
       const taskMap = {};
       tasksResult.rows.forEach(t => { taskMap[t.id] = t; });
-      const tasks = taskIds.map(id => taskMap[id]).filter(Boolean);
+      const tasks = taskIds.map(id => taskMap[id]).filter(t => t && !t.deleted);
 
       return { ...agenda, tasks };
     }));
