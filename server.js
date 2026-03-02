@@ -624,14 +624,6 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     const user = result.rows[0];
-    // Credential ban check
-    if (user.is_banned) {
-      return res.status(403).json({ 
-        error: 'ACCOUNT_BLOCKED',
-        message: user.ban_reason || 'This account has been temporarily blocked. Please contact your administrator.'
-      });
-    }
-
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({ 
@@ -671,6 +663,14 @@ app.post('/api/auth/login', async (req, res) => {
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
       return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    // Credential ban check — after password verified so we don't leak that account exists
+    if (user.is_banned) {
+      return res.status(403).json({
+        error: 'ACCOUNT_BLOCKED',
+        message: user.ban_reason || 'This account has been temporarily blocked. Please contact your administrator.'
+      });
     }
 
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
