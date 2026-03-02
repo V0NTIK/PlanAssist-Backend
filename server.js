@@ -1753,8 +1753,9 @@ app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM tasks 
-       WHERE user_id = $1 AND deleted = false
+      `SELECT * FROM tasks
+       WHERE user_id = $1
+         AND (split_origin = false OR split_origin IS NULL)
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
@@ -2218,7 +2219,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
     // Soft-delete the original task so Sync doesn't re-import it as a new task
     // The Sync will find the segments by assignment_id and update them
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, split_origin = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
