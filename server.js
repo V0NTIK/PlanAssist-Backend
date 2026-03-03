@@ -3336,12 +3336,12 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const tasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, priority_order, completed, deleted, is_new, manually_created
+      `SELECT id, title, segment, class, deadline_date, deadline_time, priority_order, completed, deleted, is_new, manually_created
        FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
       [req.params.id]
     );
     const newTasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, manually_created
+      `SELECT id, title, segment, class, deadline_date, deadline_time, manually_created
        FROM tasks WHERE user_id = $1 AND is_new = true AND deleted = false
        ORDER BY deadline_date ASC`,
       [req.params.id]
