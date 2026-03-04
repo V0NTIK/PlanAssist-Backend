@@ -2502,9 +2502,28 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       [taskId, req.user.id]
     );
     
-    // Update leaderboard and completion feed (async, don't await)
-    updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
-    addToCompletionFeed(req.user.id, task.title, task.class).catch(err => console.error('Feed update failed:', err));
+    // Update leaderboard and completion feed only when appropriate:
+    // - Non-segment tasks: always fire
+    // - Segment tasks with canonical URL: only fire when this is the LAST remaining segment
+    // - Tasks with planassist URL (manual tasks): always fire (they don't share URL meaningfully)
+    const PLANASSIST_URL = 'https://planassist.onrender.com/';
+    let shouldFireFeed = true;
+    if (task.segment && task.url && task.url !== PLANASSIST_URL) {
+      // Check if any other non-completed, non-deleted segment siblings remain
+      const remainingSegments = await pool.query(
+        `SELECT id FROM tasks
+         WHERE user_id = $1 AND url = $2 AND segment IS NOT NULL
+           AND deleted = false AND completed = false AND id != $3`,
+        [req.user.id, task.url, taskId]
+      );
+      if (remainingSegments.rows.length > 0) {
+        shouldFireFeed = false; // more segments still to go
+      }
+    }
+    if (shouldFireFeed) {
+      updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
+      addToCompletionFeed(req.user.id, task.title, task.class).catch(err => console.error('Feed update failed:', err));
+    }
     
     res.json({ success: true });
   } catch (error) {
