@@ -1278,9 +1278,22 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         gradingType: assignment.grading_type || 'points',
         description: assignment.description || ''
       };
-      
-      // Estimate time using new intelligent algorithm
-      const estimatedTime = await estimateTaskTime(taskForEstimation, req.user.id);
+
+      // Only estimate if this task doesn't already have an estimate in the DB.
+      // This prevents re-calling AI (Haiku) on every sync for existing tasks.
+      const existingEstimate = await pool.query(
+        'SELECT estimated_time, user_estimated_time FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
+        [req.user.id, assignment.id]
+      );
+      let estimatedTime;
+      if (existingEstimate.rows.length > 0 && existingEstimate.rows[0].estimated_time != null) {
+        // Reuse the existing estimate — no API call needed
+        estimatedTime = existingEstimate.rows[0].estimated_time;
+        console.log(`  ↩ Reusing existing estimate: ${estimatedTime} min`);
+      } else {
+        // New task — run full estimation algorithm
+        estimatedTime = await estimateTaskTime(taskForEstimation, req.user.id);
+      }
       
       tasks.push({
           title: assignment.name,
@@ -2006,7 +2019,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
            ON CONFLICT (user_id, assignment_id) DO UPDATE SET
              title = EXCLUDED.title,
              description = EXCLUDED.description,
-             estimated_time = EXCLUDED.estimated_time,
+             estimated_time = COALESCE(tasks.estimated_time, EXCLUDED.estimated_time),
              completed = EXCLUDED.completed,
              class = EXCLUDED.class,
              url = EXCLUDED.url,
@@ -2140,7 +2153,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
       stats: { 
         updated: updatedCount, 
         new: newCount,
-        cleaned: cleanedUpCount
+        cleaned: cleanedUpCount,
+        firstSync: updatedCount === 0 && newCount > 0
       } 
     });
   } catch (error) {
