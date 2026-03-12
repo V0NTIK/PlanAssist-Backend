@@ -3824,7 +3824,7 @@ app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
     const submissionResults = await Promise.allSettled(
       courses.map(course =>
         axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/submissions/self?include[]=assignment&per_page=100`,
+          `${CANVAS_API_BASE}/courses/${course.id}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
           { headers, timeout: 15000 }
         ).then(r => r.data.map(s => ({ ...s, _courseName: course.name, _courseId: course.id })))
       )
