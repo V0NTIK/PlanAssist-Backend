@@ -1199,12 +1199,22 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     const courseAssignmentResults = await Promise.all(
       courses.map(async (course) => {
         try {
-          const assignmentsResponse = await axios.get(
-            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
-            { headers, timeout: 15000 }
-          );
-          console.log(`  ✓ Course: ${course.name} - ${assignmentsResponse.data.length} total assignments`);
-          return assignmentsResponse.data
+          // Paginate through all assignments — Canvas caps per_page at 100
+          let allCourseAssignments = [];
+          let page = 1;
+          while (true) {
+            const assignmentsResponse = await axios.get(
+              `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&page=${page}`,
+              { headers, timeout: 15000 }
+            );
+            const batch = assignmentsResponse.data;
+            if (!Array.isArray(batch) || batch.length === 0) break;
+            allCourseAssignments = allCourseAssignments.concat(batch);
+            if (batch.length < 100) break; // last page
+            page++;
+          }
+          console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} total assignments (${page} page(s))`);
+          return allCourseAssignments
             .filter(a => {
               if (!a.due_at) return false;
               const dueDate = new Date(a.due_at);
