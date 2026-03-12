@@ -2561,10 +2561,9 @@ app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
     
-    // Mark task as deleted and remove from priority order
-    // This prevents it from showing in task list and from being re-imported during sync
+    // Mark task as deleted/ignored and remove from priority order
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, ignored = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
@@ -3636,6 +3635,210 @@ app.get('/api/admin/audit-log', authenticateToken, requireAdmin, async (req, res
 });
 
 // Start server
+
+
+// ── ACCOUNT & ANALYTICS ENDPOINTS ────────────────────────────────────────────
+
+// GET resolved tasks (completed OR deleted-and-ignored, excluding split_origin)
+app.get('/api/tasks/resolved', authenticateToken, async (req, res) => {
+  try {
+    const { sort = 'created_at', search = '' } = req.query;
+    const orderCol = sort === 'deadline' ? 'deadline_date, deadline_time' : 'created_at';
+    const searchParam = search ? `%${search}%` : '%';
+    const result = await pool.query(
+      `SELECT t.*,
+              tc.completed_at, tc.actual_time AS session_actual_time
+       FROM tasks t
+       LEFT JOIN tasks_completed tc ON tc.id = t.id AND tc.user_id = t.user_id
+       WHERE t.user_id = $1
+         AND (t.split_origin IS NOT TRUE)
+         AND (t.completed = TRUE OR (t.deleted = TRUE AND t.ignored = TRUE))
+         AND (t.title ILIKE $2 OR t.class ILIKE $2)
+       ORDER BY ${orderCol} DESC NULLS LAST`,
+      [req.user.id, searchParam]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get resolved tasks error:', error);
+    res.status(500).json({ error: 'Failed to get resolved tasks' });
+  }
+});
+
+// PATCH actual_time for a completed task in tasks_completed
+app.patch('/api/tasks/:taskId/actual-time', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { actualTime } = req.body;
+    if (typeof actualTime !== 'number' || actualTime < 0) {
+      return res.status(400).json({ error: 'actualTime must be a non-negative number' });
+    }
+    await pool.query(
+      'UPDATE tasks_completed SET actual_time = $1 WHERE id = $2 AND user_id = $3',
+      [actualTime, taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update actual time error:', error);
+    res.status(500).json({ error: 'Failed to update actual time' });
+  }
+});
+
+// POST restore a resolved task back to the task list
+app.post('/api/tasks/:taskId/restore', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+
+    const taskResult = await pool.query(
+      'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    const task = taskResult.rows[0];
+
+    // Delete any tasks_completed entry
+    await pool.query(
+      'DELETE FROM tasks_completed WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+
+    // Determine insertion position by deadline (same algorithm as Add All to List)
+    const activeTasks = await pool.query(
+      `SELECT id, deadline_date, deadline_time, priority_order
+       FROM tasks WHERE user_id = $1 AND deleted = FALSE AND completed = FALSE
+       AND split_origin IS NOT TRUE
+       ORDER BY priority_order ASC NULLS LAST`,
+      [req.user.id]
+    );
+
+    const taskDeadline = new Date(
+      `${task.deadline_date}T${task.deadline_time || '23:59:00'}Z`
+    );
+
+    let insertPosition = activeTasks.rows.length + 1;
+    for (const t of activeTasks.rows) {
+      const d = new Date(`${t.deadline_date}T${t.deadline_time || '23:59:00'}Z`);
+      if (taskDeadline < d) {
+        insertPosition = t.priority_order || activeTasks.rows.indexOf(t) + 1;
+        break;
+      }
+    }
+
+    // Shift tasks at or after insertPosition up by 1
+    await pool.query(
+      `UPDATE tasks SET priority_order = priority_order + 1
+       WHERE user_id = $1 AND deleted = FALSE AND completed = FALSE
+       AND split_origin IS NOT TRUE
+       AND priority_order >= $2`,
+      [req.user.id, insertPosition]
+    );
+
+    // Restore the task
+    await pool.query(
+      `UPDATE tasks SET completed = FALSE, deleted = FALSE, ignored = FALSE,
+        is_new = FALSE, priority_order = $1
+       WHERE id = $2 AND user_id = $3`,
+      [insertPosition, taskId, req.user.id]
+    );
+
+    // Renormalize to clean up any gaps
+    await reprioritizeTasks(req.user.id, pool);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Restore task error:', error);
+    res.status(500).json({ error: 'Failed to restore task' });
+  }
+});
+
+// PATCH course enabled toggle
+app.patch('/api/courses/:courseId/enabled', authenticateToken, async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const { enabled } = req.body;
+    await pool.query(
+      'UPDATE courses SET enabled = $1 WHERE id = $2 AND user_id = $3',
+      [enabled, courseId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Toggle course enabled error:', error);
+    res.status(500).json({ error: 'Failed to update course' });
+  }
+});
+
+// GET help content (public — any authenticated user)
+app.get('/api/help', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT content, updated_at FROM help_content WHERE id = 1');
+    res.json(result.rows[0] || { content: '', updated_at: null });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get help content' });
+  }
+});
+
+// PUT help content (admin only)
+app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { content } = req.body;
+    await pool.query(
+      'UPDATE help_content SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
+      [content, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update help content' });
+  }
+});
+
+// GET recently graded Canvas submissions (proxied through server to protect token)
+app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) {
+      return res.status(400).json({ error: 'No Canvas token configured' });
+    }
+    const token = decryptToken(userRow.canvas_api_token, userRow.canvas_api_token_iv);
+    const headers = { Authorization: `Bearer ${token}` };
+
+    const since = new Date();
+    since.setDate(since.getDate() - 10);
+    const sinceISO = since.toISOString();
+
+    const response = await axios.get(
+      `${CANVAS_API_BASE}/users/self/submissions?include[]=assignment&order=graded_at&order_direction=descending&per_page=50`,
+      { headers, timeout: 15000 }
+    );
+
+    const graded = response.data
+      .filter(s => s.graded_at && new Date(s.graded_at) >= since)
+      .map(s => ({
+        id: s.id,
+        assignmentId: s.assignment_id,
+        assignmentName: s.assignment?.name || 'Unknown Assignment',
+        courseId: s.assignment?.course_id,
+        score: s.score,
+        pointsPossible: s.assignment?.points_possible,
+        grade: s.grade,
+        gradingType: s.assignment?.grading_type || 'points',
+        gradedAt: s.graded_at,
+        submittedAt: s.submitted_at,
+        workflowState: s.workflow_state,
+        htmlUrl: s.assignment?.html_url,
+      }));
+
+    res.json(graded);
+  } catch (error) {
+    console.error('Canvas graded submissions error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch graded submissions' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`\n==============================================`);
   console.log(`  PlanAssist API v2.0 - REDESIGNED`);
