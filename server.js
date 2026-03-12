@@ -1861,7 +1861,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   current_grade = $8,
                   submitted_at = $9,
                   is_missing = $10,
-                  is_late = $11
+                  is_late = $11,
+                  ignored = false
                  WHERE id = $12 AND user_id = $13`,
                 [
                   incomingTask.title,
@@ -1903,6 +1904,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   submitted_at = $18,
                   is_missing = $19,
                   is_late = $20,
+                  ignored = false,
                   priority_order = CASE WHEN $4 THEN NULL ELSE priority_order END
                  WHERE id = $21 AND user_id = $22`,
                 [
@@ -1959,6 +1961,25 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             );
           }
           
+          // ── Grade change detection ──────────────────────────────────────────
+          const scoreChanged = incomingTask.currentScore != null &&
+            String(incomingTask.currentScore) !== String(existingTask.current_score);
+          const gradeChanged = incomingTask.currentGrade != null &&
+            incomingTask.currentGrade !== existingTask.current_grade;
+          if (hasCanvasData && (scoreChanged || gradeChanged)) {
+            // Get next grade_id for this user
+            const gradeIdResult = await pool.query(
+              'SELECT COALESCE(MAX(grade_id), 0) + 1 AS next_id FROM tasks WHERE user_id = $1',
+              [req.user.id]
+            );
+            const nextGradeId = gradeIdResult.rows[0].next_id;
+            await pool.query(
+              'UPDATE tasks SET grade_id = $1 WHERE id = $2 AND user_id = $3',
+              [nextGradeId, existingTask.id, req.user.id]
+            );
+            console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
+          }
+
           console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
           console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible} (hasCanvasData=${hasCanvasData})`);
           console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
@@ -2072,6 +2093,44 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         insertedTasks.push(result.rows[0]);
         newCount++;
         console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
+      }
+    }
+
+    // === DISABLED COURSE SUPPRESSION ===
+    // Tasks from courses marked enabled=false: ignore them (and delete if 10+ days old)
+    {
+      const disabledCoursesResult = await pool.query(
+        'SELECT course_id FROM courses WHERE user_id = $1 AND enabled = false',
+        [req.user.id]
+      );
+      if (disabledCoursesResult.rows.length > 0) {
+        const disabledCourseIds = disabledCoursesResult.rows.map(r => r.course_id);
+        const tenDaysAgo = new Date();
+        tenDaysAgo.setDate(tenDaysAgo.getDate() - 10);
+
+        // Old tasks (10+ days): hard suppress with deleted=true
+        const deleteOld = await pool.query(
+          `UPDATE tasks SET deleted = true, ignored = true, is_new = false, priority_order = NULL
+           WHERE user_id = $1
+             AND deleted = false
+             AND course_id = ANY($2::int[])
+             AND deadline_date <= $3`,
+          [req.user.id, disabledCourseIds, tenDaysAgo.toISOString().slice(0, 10)]
+        );
+
+        // Recent tasks: just ignore (don't delete, not old enough)
+        const ignoreRecent = await pool.query(
+          `UPDATE tasks SET ignored = true, is_new = false, priority_order = NULL
+           WHERE user_id = $1
+             AND deleted = false
+             AND course_id = ANY($2::int[])
+             AND deadline_date > $3`,
+          [req.user.id, disabledCourseIds, tenDaysAgo.toISOString().slice(0, 10)]
+        );
+
+        if (deleteOld.rowCount > 0 || ignoreRecent.rowCount > 0) {
+          console.log(`[DISABLED COURSES] Deleted ${deleteOld.rowCount} old tasks, ignored ${ignoreRecent.rowCount} recent tasks from disabled courses`);
+        }
       }
     }
 
@@ -3789,6 +3848,247 @@ app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update help content' });
+  }
+});
+
+// GET grade_id-ordered grades from DB (last 20 graded tasks by grade_id)
+app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, assignment_id, title, class, url, points_possible,
+              current_score, current_grade, grading_type, submitted_at, grade_id
+       FROM tasks
+       WHERE user_id = $1
+         AND grade_id IS NOT NULL
+         AND deleted = false
+       ORDER BY grade_id DESC
+       LIMIT 20`,
+      [req.user.id]
+    );
+
+    const graded = result.rows.map(t => ({
+      id: t.id,
+      assignmentId: t.assignment_id,
+      assignmentName: t.title,
+      courseName: t.class,
+      score: t.current_score != null ? parseFloat(t.current_score) : null,
+      pointsPossible: t.points_possible != null ? parseFloat(t.points_possible) : null,
+      grade: t.current_grade,
+      gradingType: t.grading_type || 'points',
+      gradedAt: t.submitted_at,
+      htmlUrl: t.url,
+      gradeId: t.grade_id,
+    }));
+
+    res.json(graded);
+  } catch (error) {
+    console.error('Grades fetch error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch grades' });
+  }
+});
+
+// POST grade mini-sync — checks only tasks due in the last 30 days for grade changes
+app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) return res.status(400).json({ error: 'No Canvas token' });
+
+    const encryptedParts = userRow.canvas_api_token.split(':');
+    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
+    if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
+
+    const headers = { Authorization: `Bearer ${token}` };
+    const canvasBase = userRow.canvas_url
+      ? `${userRow.canvas_url}/api/v1`
+      : CANVAS_API_BASE;
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    // Get distinct course_ids with tasks due in last 30 days
+    const coursesResult = await pool.query(
+      `SELECT DISTINCT course_id FROM tasks
+       WHERE user_id = $1 AND course_id IS NOT NULL AND deleted = false
+         AND deadline_date >= $2`,
+      [req.user.id, thirtyDaysAgo.toISOString().slice(0, 10)]
+    );
+    const courseIds = coursesResult.rows.map(r => r.course_id);
+
+    if (courseIds.length === 0) return res.json({ updated: 0 });
+
+    // Fetch assignment submissions for those courses
+    const submissionResults = await Promise.allSettled(
+      courseIds.map(cid =>
+        axios.get(
+          `${canvasBase}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
+          { headers, timeout: 10000 }
+        ).then(r => r.data.map(s => ({ ...s, _courseId: cid })))
+      )
+    );
+
+    const allSubs = submissionResults
+      .filter(r => r.status === 'fulfilled')
+      .flatMap(r => r.value);
+
+    if (allSubs.length === 0) return res.json({ updated: 0 });
+
+    // Get max grade_id for this user
+    const maxResult = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [req.user.id]
+    );
+    let nextGradeId = parseInt(maxResult.rows[0].max_id) + 1;
+    let updatedCount = 0;
+
+    for (const sub of allSubs) {
+      if (sub.score == null && !sub.grade) continue;
+
+      // Find matching task in DB
+      const taskResult = await pool.query(
+        `SELECT id, current_score, current_grade FROM tasks
+         WHERE user_id = $1 AND assignment_id = $2 AND deleted = false LIMIT 1`,
+        [req.user.id, sub.assignment_id]
+      );
+      if (taskResult.rows.length === 0) continue;
+
+      const task = taskResult.rows[0];
+      const scoreChanged = sub.score != null && String(sub.score) !== String(task.current_score);
+      const gradeChanged = sub.grade != null && sub.grade !== task.current_grade;
+
+      if (scoreChanged || gradeChanged) {
+        await pool.query(
+          `UPDATE tasks SET current_score = $1, current_grade = $2, grade_id = $3
+           WHERE id = $4 AND user_id = $5`,
+          [sub.score, sub.grade, nextGradeId, task.id, req.user.id]
+        );
+        nextGradeId++;
+        updatedCount++;
+      }
+    }
+
+    console.log(`[GRADE MINI-SYNC] user=${req.user.id}, updated=${updatedCount}`);
+    res.json({ updated: updatedCount });
+  } catch (error) {
+    console.error('Grade mini-sync error:', error.message);
+    res.status(500).json({ error: 'Failed to run grade mini-sync' });
+  }
+});
+
+// GET Canvas announcements (all active courses, last 20 total)
+app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) return res.status(400).json({ error: 'No Canvas token' });
+    const encryptedParts = userRow.canvas_api_token.split(':');
+    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
+    if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
+    const headers = { Authorization: `Bearer ${token}` };
+    const canvasBase = userRow.canvas_url ? `${userRow.canvas_url}/api/v1` : CANVAS_API_BASE;
+
+    // Get distinct course_ids from user's tasks
+    const coursesResult = await pool.query(
+      'SELECT DISTINCT course_id FROM tasks WHERE user_id = $1 AND course_id IS NOT NULL AND deleted = false',
+      [req.user.id]
+    );
+    const courseIds = coursesResult.rows.map(r => r.course_id);
+
+    const results = await Promise.allSettled(
+      courseIds.map(cid =>
+        axios.get(`${canvasBase}/courses/${cid}/discussion_topics?only_announcements=true&per_page=10`,
+          { headers, timeout: 10000 })
+          .then(r => r.data.map(a => ({ ...a, _courseId: cid })))
+      )
+    );
+
+    // Get course names
+    const courseNames = {};
+    (await pool.query('SELECT course_id, name FROM courses WHERE user_id = $1', [req.user.id]))
+      .rows.forEach(r => { courseNames[r.course_id] = r.name; });
+
+    const announcements = results
+      .filter(r => r.status === 'fulfilled')
+      .flatMap(r => r.value)
+      .sort((a, b) => new Date(b.posted_at || b.created_at) - new Date(a.posted_at || a.created_at))
+      .slice(0, 20)
+      .map(a => ({
+        id: a.id,
+        title: a.title,
+        body: a.message ? a.message.replace(/<[^>]*>/g, '').trim().slice(0, 300) : null,
+        courseId: a._courseId,
+        courseName: courseNames[a._courseId] || `Course ${a._courseId}`,
+        postedAt: a.posted_at || a.created_at,
+        htmlUrl: a.html_url,
+      }));
+
+    res.json(announcements);
+  } catch (error) {
+    console.error('Announcements error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch announcements' });
+  }
+});
+
+// GET Canvas discussions (all active courses, last 20 total, excluding announcements)
+app.get('/api/canvas/discussions', authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) return res.status(400).json({ error: 'No Canvas token' });
+    const encryptedParts = userRow.canvas_api_token.split(':');
+    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
+    if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
+    const headers = { Authorization: `Bearer ${token}` };
+    const canvasBase = userRow.canvas_url ? `${userRow.canvas_url}/api/v1` : CANVAS_API_BASE;
+
+    const coursesResult = await pool.query(
+      'SELECT DISTINCT course_id FROM tasks WHERE user_id = $1 AND course_id IS NOT NULL AND deleted = false',
+      [req.user.id]
+    );
+    const courseIds = coursesResult.rows.map(r => r.course_id);
+
+    const results = await Promise.allSettled(
+      courseIds.map(cid =>
+        axios.get(`${canvasBase}/courses/${cid}/discussion_topics?per_page=10`,
+          { headers, timeout: 10000 })
+          .then(r => r.data.filter(d => !d.is_announcement).map(d => ({ ...d, _courseId: cid })))
+      )
+    );
+
+    const courseNames = {};
+    (await pool.query('SELECT course_id, name FROM courses WHERE user_id = $1', [req.user.id]))
+      .rows.forEach(r => { courseNames[r.course_id] = r.name; });
+
+    const discussions = results
+      .filter(r => r.status === 'fulfilled')
+      .flatMap(r => r.value)
+      .sort((a, b) => new Date(b.last_reply_at || b.posted_at || b.created_at) - new Date(a.last_reply_at || a.posted_at || a.created_at))
+      .slice(0, 20)
+      .map(d => ({
+        id: d.id,
+        title: d.title,
+        body: d.message ? d.message.replace(/<[^>]*>/g, '').trim().slice(0, 300) : null,
+        courseId: d._courseId,
+        courseName: courseNames[d._courseId] || `Course ${d._courseId}`,
+        postedAt: d.posted_at || d.created_at,
+        lastReplyAt: d.last_reply_at || null,
+        unreadCount: d.unread_count || 0,
+        htmlUrl: d.html_url,
+      }));
+
+    res.json(discussions);
+  } catch (error) {
+    console.error('Discussions error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch discussions' });
   }
 });
 
