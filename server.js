@@ -3792,8 +3792,8 @@ app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => 
   }
 });
 
-// GET recently graded Canvas submissions (proxied through server to protect token)
-app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
+// GET Canvas activity stream (grades, announcements, discussions, etc.)
+app.get('/api/canvas/activity', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
       'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
@@ -3810,67 +3810,35 @@ app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
     }
     const headers = { Authorization: `Bearer ${token}` };
 
-    const since = new Date();
-    since.setDate(since.getDate() - 10);
-
-    // Fetch active courses first, then pull submissions per course
-    const coursesResp = await axios.get(
-      `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
+    const response = await axios.get(
+      `${CANVAS_API_BASE}/users/self/activity_stream?per_page=50`,
       { headers, timeout: 15000 }
     );
-    const courses = Array.isArray(coursesResp.data) ? coursesResp.data : [];
 
-    // Fetch submissions for each course in parallel
-    const submissionResults = await Promise.allSettled(
-      courses.map(course =>
-        axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
-          { headers, timeout: 15000 }
-        ).then(r => r.data.map(s => ({ ...s, _courseName: course.name, _courseId: course.id })))
-      )
-    );
+    const items = (Array.isArray(response.data) ? response.data : []).map(item => ({
+      id: item.id,
+      type: item.type,                          // 'Grade', 'Announcement', 'DiscussionTopic', 'Message', 'Submission', 'Conversation', 'Conference', 'Collaboration'
+      title: item.title || item.subject || null,
+      body: item.message || item.body || null,
+      courseId: item.course_id || null,
+      courseName: item.context_name || null,
+      createdAt: item.created_at,
+      updatedAt: item.updated_at,
+      htmlUrl: item.html_url || null,
+      // Grade-specific
+      score: item.score ?? null,
+      pointsPossible: item.assignment?.points_possible ?? null,
+      grade: item.grade ?? null,
+      gradingType: item.assignment?.grading_type ?? null,
+      assignmentName: item.assignment?.title ?? item.title ?? null,
+      // Unread
+      unread: item.unread_count > 0 || false,
+    }));
 
-    const allSubmissions = submissionResults
-      .filter(r => r.status === 'fulfilled')
-      .flatMap(r => r.value);
-
-    const failedCourses = submissionResults.filter(r => r.status === 'rejected');
-    if (failedCourses.length > 0) {
-      console.log(`[graded] ${failedCourses.length} course(s) failed, first error: ${failedCourses[0].reason?.message}`);
-    }
-    console.log(`[graded] courses: ${courses.length}, total submissions: ${allSubmissions.length}`);
-    const withGradedAt = allSubmissions.filter(s => s.graded_at);
-    console.log(`[graded] have graded_at: ${withGradedAt.length}, within 10 days: ${withGradedAt.filter(s => new Date(s.graded_at) >= since).length}`);
-    if (allSubmissions.length > 0) {
-      const sample = allSubmissions[0];
-      console.log(`[graded] sample submission keys:`, Object.keys(sample).join(', '));
-      console.log(`[graded] sample graded_at: ${sample.graded_at}, workflow_state: ${sample.workflow_state}, score: ${sample.score}`);
-    }
-
-    const graded = allSubmissions
-      .filter(s => s.graded_at && new Date(s.graded_at) >= since)
-      .sort((a, b) => new Date(b.graded_at) - new Date(a.graded_at))
-      .slice(0, 50)
-      .map(s => ({
-        id: s.id,
-        assignmentId: s.assignment_id,
-        assignmentName: s.assignment?.name || 'Unknown Assignment',
-        courseId: s._courseId,
-        courseName: s._courseName,
-        score: s.score,
-        pointsPossible: s.assignment?.points_possible,
-        grade: s.grade,
-        gradingType: s.assignment?.grading_type || 'points',
-        gradedAt: s.graded_at,
-        submittedAt: s.submitted_at,
-        workflowState: s.workflow_state,
-        htmlUrl: s.assignment?.html_url,
-      }));
-
-    res.json(graded);
+    res.json(items);
   } catch (error) {
-    console.error('Canvas graded submissions error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch graded submissions' });
+    console.error('Canvas activity stream error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch activity stream' });
   }
 });
 
