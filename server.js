@@ -1863,7 +1863,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   submitted_at = $9,
                   is_missing = $10,
                   is_late = $11,
-                  ignored = false
+                  ignored = false,
+                  is_new = CASE WHEN ignored = true THEN true ELSE is_new END,
+                  priority_order = CASE WHEN ignored = true THEN NULL ELSE priority_order END
                  WHERE id = $12 AND user_id = $13`,
                 [
                   incomingTask.title,
@@ -1906,7 +1908,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   is_missing = $19,
                   is_late = $20,
                   ignored = false,
-                  priority_order = CASE WHEN $4 THEN NULL ELSE priority_order END
+                  is_new = CASE WHEN ignored = true THEN true ELSE is_new END,
+                  priority_order = CASE WHEN ignored = true THEN NULL WHEN $4 THEN NULL ELSE priority_order END
                  WHERE id = $21 AND user_id = $22`,
                 [
                   incomingTask.title,
