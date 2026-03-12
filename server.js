@@ -1864,9 +1864,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   is_missing = $10,
                   is_late = $11,
                   ignored = false,
-                  is_new = CASE WHEN ignored = true THEN true ELSE is_new END,
-                  priority_order = CASE WHEN ignored = true THEN NULL ELSE priority_order END
-                 WHERE id = $12 AND user_id = $13`,
+                  is_new = $12,
+                  priority_order = $13
+                 WHERE id = $14 AND user_id = $15`,
                 [
                   incomingTask.title,
                   incomingTask.class,
@@ -1879,6 +1879,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   incomingTask.submittedAt ?? null,
                   incomingTask.isMissing ?? false,
                   incomingTask.isLate ?? false,
+                  existingTask.ignored ? true : existingTask.is_new,       // re-sidebar if was ignored
+                  existingTask.ignored ? null : existingTask.priority_order, // strip priority if was ignored
                   existingTask.id,
                   req.user.id
                 ]
@@ -1908,9 +1910,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   is_missing = $19,
                   is_late = $20,
                   ignored = false,
-                  is_new = CASE WHEN ignored = true THEN true ELSE is_new END,
-                  priority_order = CASE WHEN ignored = true THEN NULL WHEN $4 THEN NULL ELSE priority_order END
-                 WHERE id = $21 AND user_id = $22`,
+                  is_new = $21,
+                  priority_order = $22
+                 WHERE id = $23 AND user_id = $24`,
                 [
                   incomingTask.title,
                   incomingTask.description || '',
@@ -1932,6 +1934,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   incomingTask.submittedAt ?? null,
                   incomingTask.isMissing ?? false,
                   incomingTask.isLate ?? false,
+                  existingTask.ignored ? true : existingTask.is_new,        // re-sidebar if was ignored
+                  existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order), // strip priority if was ignored or completed
                   existingTask.id,
                   req.user.id
                 ]
@@ -1984,10 +1988,16 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
           }
 
-          console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
-          console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible} (hasCanvasData=${hasCanvasData})`);
-          console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
-          updatedCount++;
+          // If task was previously ignored, treat it as a new task for sidebar/count purposes
+          if (existingTask.ignored) {
+            newCount++;
+            console.log(`  ↩ Re-queued ignored task ID ${existingTask.id}: "${existingTask.title}" → sidebar`);
+          } else {
+            console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
+            console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible} (hasCanvasData=${hasCanvasData})`);
+            console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
+            updatedCount++;
+          }
         }
 
         // Fetch the updated tasks to return (only non-deleted ones)
