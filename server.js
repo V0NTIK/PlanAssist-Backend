@@ -3803,25 +3803,47 @@ app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
     if (!userRow?.canvas_api_token) {
       return res.status(400).json({ error: 'No Canvas token configured' });
     }
-    const token = decryptToken(userRow.canvas_api_token, userRow.canvas_api_token_iv);
+    const encryptedParts = userRow.canvas_api_token.split(':');
+    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
+    if (!token) {
+      return res.status(500).json({ error: 'Failed to decrypt Canvas token' });
+    }
     const headers = { Authorization: `Bearer ${token}` };
 
     const since = new Date();
     since.setDate(since.getDate() - 10);
-    const sinceISO = since.toISOString();
 
-    const response = await axios.get(
-      `${CANVAS_API_BASE}/users/self/submissions?include[]=assignment&order=graded_at&order_direction=descending&per_page=50`,
+    // Fetch active courses first, then pull submissions per course
+    const coursesResp = await axios.get(
+      `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
       { headers, timeout: 15000 }
     );
+    const courses = Array.isArray(coursesResp.data) ? coursesResp.data : [];
 
-    const graded = response.data
+    // Fetch submissions for each course in parallel
+    const submissionResults = await Promise.allSettled(
+      courses.map(course =>
+        axios.get(
+          `${CANVAS_API_BASE}/courses/${course.id}/submissions?include[]=assignment&workflow_state=graded&order=graded_at&order_direction=descending&per_page=50`,
+          { headers, timeout: 15000 }
+        ).then(r => r.data.map(s => ({ ...s, _courseName: course.name, _courseId: course.id })))
+      )
+    );
+
+    const allSubmissions = submissionResults
+      .filter(r => r.status === 'fulfilled')
+      .flatMap(r => r.value);
+
+    const graded = allSubmissions
       .filter(s => s.graded_at && new Date(s.graded_at) >= since)
+      .sort((a, b) => new Date(b.graded_at) - new Date(a.graded_at))
+      .slice(0, 50)
       .map(s => ({
         id: s.id,
         assignmentId: s.assignment_id,
         assignmentName: s.assignment?.name || 'Unknown Assignment',
-        courseId: s.assignment?.course_id,
+        courseId: s._courseId,
+        courseName: s._courseName,
         score: s.score,
         pointsPossible: s.assignment?.points_possible,
         grade: s.grade,
