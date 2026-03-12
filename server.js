@@ -3834,6 +3834,15 @@ app.get('/api/canvas/graded', authenticateToken, async (req, res) => {
       .filter(r => r.status === 'fulfilled')
       .flatMap(r => r.value);
 
+    console.log(`[graded] courses: ${courses.length}, total submissions: ${allSubmissions.length}`);
+    const withGradedAt = allSubmissions.filter(s => s.graded_at);
+    console.log(`[graded] have graded_at: ${withGradedAt.length}, within 10 days: ${withGradedAt.filter(s => new Date(s.graded_at) >= since).length}`);
+    if (allSubmissions.length > 0) {
+      const sample = allSubmissions[0];
+      console.log(`[graded] sample submission keys:`, Object.keys(sample).join(', '));
+      console.log(`[graded] sample graded_at: ${sample.graded_at}, workflow_state: ${sample.workflow_state}, score: ${sample.score}`);
+    }
+
     const graded = allSubmissions
       .filter(s => s.graded_at && new Date(s.graded_at) >= since)
       .sort((a, b) => new Date(b.graded_at) - new Date(a.graded_at))
