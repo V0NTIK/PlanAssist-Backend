@@ -3894,7 +3894,7 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
 app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
       [req.user.id]
     );
     const userRow = userResult.rows[0];
@@ -3905,9 +3905,7 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
     if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
 
     const headers = { Authorization: `Bearer ${token}` };
-    const canvasBase = userRow.canvas_url
-      ? `${userRow.canvas_url}/api/v1`
-      : CANVAS_API_BASE;
+    const canvasBase = CANVAS_API_BASE;
 
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
@@ -3985,7 +3983,7 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
 app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
       [req.user.id]
     );
     const userRow = userResult.rows[0];
@@ -3994,7 +3992,7 @@ app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
     const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
     if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
     const headers = { Authorization: `Bearer ${token}` };
-    const canvasBase = userRow.canvas_url ? `${userRow.canvas_url}/api/v1` : CANVAS_API_BASE;
+    const canvasBase = CANVAS_API_BASE;
 
     // Get distinct course_ids from user's tasks
     const coursesResult = await pool.query(
@@ -4065,7 +4063,7 @@ app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
 app.get('/api/canvas/discussions', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT canvas_api_token, canvas_api_token_iv, canvas_url FROM users WHERE id = $1',
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
       [req.user.id]
     );
     const userRow = userResult.rows[0];
@@ -4074,7 +4072,7 @@ app.get('/api/canvas/discussions', authenticateToken, async (req, res) => {
     const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
     if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
     const headers = { Authorization: `Bearer ${token}` };
-    const canvasBase = userRow.canvas_url ? `${userRow.canvas_url}/api/v1` : CANVAS_API_BASE;
+    const canvasBase = CANVAS_API_BASE;
 
     const coursesResult = await pool.query(
       'SELECT DISTINCT course_id FROM tasks WHERE user_id = $1 AND course_id IS NOT NULL AND deleted = false',
