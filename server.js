@@ -1631,10 +1631,10 @@ app.post('/api/cron/daily-email', async (req, res) => {
 // ============================================================================
 
 async function reprioritizeTasks(userId, pool) {
-  // Step 1: Null out priority_order for completed or deleted tasks
+  // Step 1: Null out priority_order for completed, deleted, or ignored tasks
   await pool.query(
     `UPDATE tasks SET priority_order = NULL
-     WHERE user_id = $1 AND (completed = true OR deleted = true)`,
+     WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
     [userId]
   );
 
@@ -1644,7 +1644,7 @@ async function reprioritizeTasks(userId, pool) {
       SELECT id,
              ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
       FROM tasks
-      WHERE user_id = $1 AND completed = false AND deleted = false
+      WHERE user_id = $1 AND completed = false AND deleted = false AND (ignored = false OR ignored IS NULL)
     )
     UPDATE tasks SET priority_order = ordered.new_order
     FROM ordered
@@ -1769,6 +1769,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       `SELECT * FROM tasks
        WHERE user_id = $1
          AND (split_origin = false OR split_origin IS NULL)
+         AND (ignored = false OR ignored IS NULL)
        ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
@@ -2333,7 +2334,7 @@ app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
     // Update priority orders, but only for non-deleted, non-completed tasks
     const updatePromises = taskOrder.map((taskId, index) =>
       pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false AND completed = false',
+        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false AND completed = false AND (ignored = false OR ignored IS NULL)',
         [index + 1, taskId, req.user.id]
       )
     );
@@ -4002,22 +4003,45 @@ app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
     );
     const courseIds = coursesResult.rows.map(r => r.course_id);
 
-    const results = await Promise.allSettled(
-      courseIds.map(cid =>
-        axios.get(`${canvasBase}/courses/${cid}/discussion_topics?only_announcements=true&per_page=10`,
-          { headers, timeout: 10000 })
-          .then(r => r.data.map(a => ({ ...a, _courseId: cid })))
-      )
-    );
+    // Try the dedicated announcements endpoint first (works on some Canvas instances),
+    // fall back to discussion_topics?only_announcements=true if it 404s
+    let announcementData = [];
+    try {
+      const contextCodes = courseIds.map(cid => `course_${cid}`).join('&context_codes[]=');
+      const announcementsResp = await axios.get(
+        `${canvasBase}/announcements?context_codes[]=${contextCodes}&per_page=20`,
+        { headers, timeout: 10000 }
+      );
+      announcementData = Array.isArray(announcementsResp.data)
+        ? announcementsResp.data.map(a => {
+            // context_code is like "course_12345" — extract course id
+            const cid = a.context_code ? parseInt(a.context_code.replace('course_', '')) : null;
+            return { ...a, _courseId: cid };
+          })
+        : [];
+      console.log(`[announcements] dedicated endpoint: ${announcementData.length} items`);
+    } catch (e) {
+      console.log(`[announcements] dedicated endpoint failed (${e.response?.status}), trying per-course fallback`);
+      const results = await Promise.allSettled(
+        courseIds.map(cid =>
+          axios.get(`${canvasBase}/courses/${cid}/discussion_topics?only_announcements=true&per_page=10`,
+            { headers, timeout: 10000 })
+            .then(r => r.data.map(a => ({ ...a, _courseId: cid })))
+        )
+      );
+      announcementData = results.filter(r => r.status === 'fulfilled').flatMap(r => r.value);
+      console.log(`[announcements] per-course fallback: ${announcementData.length} items`);
+    }
+    const results = { fulfilled: true, data: announcementData };
+    // Wrap so the sort/map below works uniformly
+    const allAnnouncements = announcementData;
 
     // Get course names
     const courseNames = {};
     (await pool.query('SELECT course_id, name FROM courses WHERE user_id = $1', [req.user.id]))
       .rows.forEach(r => { courseNames[r.course_id] = r.name; });
 
-    const announcements = results
-      .filter(r => r.status === 'fulfilled')
-      .flatMap(r => r.value)
+    const announcements = allAnnouncements
       .sort((a, b) => new Date(b.posted_at || b.created_at) - new Date(a.posted_at || a.created_at))
       .slice(0, 20)
       .map(a => ({
@@ -4058,7 +4082,7 @@ app.get('/api/canvas/discussions', authenticateToken, async (req, res) => {
     );
     const courseIds = coursesResult.rows.map(r => r.course_id);
 
-    const results = await Promise.allSettled(
+    const discussionResults = await Promise.allSettled(
       courseIds.map(cid =>
         axios.get(`${canvasBase}/courses/${cid}/discussion_topics?per_page=10`,
           { headers, timeout: 10000 })
@@ -4066,11 +4090,17 @@ app.get('/api/canvas/discussions', authenticateToken, async (req, res) => {
       )
     );
 
+    const failedDiscussions = discussionResults.filter(r => r.status === 'rejected');
+    if (failedDiscussions.length > 0) {
+      console.log(`[discussions] ${failedDiscussions.length} course(s) failed, first: ${failedDiscussions[0].reason?.message}`);
+    }
+    console.log(`[discussions] ${discussionResults.filter(r => r.status === 'fulfilled').length} courses succeeded`);
+
     const courseNames = {};
     (await pool.query('SELECT course_id, name FROM courses WHERE user_id = $1', [req.user.id]))
       .rows.forEach(r => { courseNames[r.course_id] = r.name; });
 
-    const discussions = results
+    const discussions = discussionResults
       .filter(r => r.status === 'fulfilled')
       .flatMap(r => r.value)
       .sort((a, b) => new Date(b.last_reply_at || b.posted_at || b.created_at) - new Date(a.last_reply_at || a.posted_at || a.created_at))
