@@ -2620,13 +2620,15 @@ app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
     
-    // Mark task as deleted/ignored and remove from priority order
+    // Mark task as ignored: is_new=false so it leaves the sidebar, ignored=true so
+    // it won't re-enter the sidebar until the next sync resets ignored, deleted stays FALSE
+    // so the task remains in the DB and can be reviewed in Resolved Tasks.
     await pool.query(
-      'UPDATE tasks SET deleted = true, ignored = true, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET ignored = true, is_new = false, priority_order = NULL WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
-    console.log(`✓ Task ${taskId} marked as ignored/deleted by user ${req.user.id}`);
+    console.log(`✓ Task ${taskId} marked as ignored by user ${req.user.id}`);
     res.json({ success: true });
   } catch (error) {
     console.error('Ignore task error:', error);
@@ -3711,7 +3713,7 @@ app.get('/api/tasks/resolved', authenticateToken, async (req, res) => {
        LEFT JOIN tasks_completed tc ON tc.id = t.id AND tc.user_id = t.user_id
        WHERE t.user_id = $1
          AND (t.split_origin IS NOT TRUE)
-         AND (t.completed = TRUE OR (t.deleted = TRUE AND t.ignored = TRUE))
+         AND (t.completed = TRUE OR t.ignored = TRUE)
          AND (t.title ILIKE $2 OR t.class ILIKE $2)
        ORDER BY ${orderCol} DESC NULLS LAST`,
       [req.user.id, searchParam]
