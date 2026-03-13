@@ -1320,7 +1320,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           pointsPossible: assignment.points_possible || null,
           assignmentGroupId: assignment.assignment_group_id || null,
           currentScore: submission.score || null,
-          currentGrade: submission.grade || null,
+          currentGrade: submission.grade ? String(submission.grade).slice(0, 50) : null,
           gradingType: (assignment.grading_type || 'points').slice(0, 50),
           unlockAt: assignment.unlock_at || null,
           lockAt: assignment.lock_at || null,
