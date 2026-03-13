@@ -1285,7 +1285,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         assignmentId: assignment.id,
         pointsPossible: assignment.points_possible || null,
         assignmentGroupId: assignment.assignment_group_id || null,
-        gradingType: assignment.grading_type || 'points',
+        gradingType: (assignment.grading_type || 'points').slice(0, 50),
         description: assignment.description || ''
       };
 
@@ -1321,7 +1321,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           assignmentGroupId: assignment.assignment_group_id || null,
           currentScore: submission.score || null,
           currentGrade: submission.grade || null,
-          gradingType: assignment.grading_type || 'points',
+          gradingType: (assignment.grading_type || 'points').slice(0, 50),
           unlockAt: assignment.unlock_at || null,
           lockAt: assignment.lock_at || null,
           submittedAt: submission.submitted_at || null,
