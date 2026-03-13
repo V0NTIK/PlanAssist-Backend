@@ -1860,96 +1860,124 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             // duplicate assignment_id constraint violations across multiple segments
             if (existingTask.segment) {
               // This is a user-created segment - only update non-canvas display fields
-              await pool.query(
-                `UPDATE tasks SET 
-                  title = $1,
-                  class = $2,
-                  url = $3,
-                  deadline_date = $4,
-                  deadline_time = $5,
-                  points_possible = $6,
-                  current_score = $7,
-                  current_grade = $8,
-                  submitted_at = $9,
-                  is_missing = $10,
-                  is_late = $11,
-                  ignored = false,
-                  is_new = $12,
-                  priority_order = $13
-                 WHERE id = $14 AND user_id = $15`,
-                [
-                  incomingTask.title,
-                  incomingTask.class,
-                  incomingTask.url,
-                  incomingTask.deadlineDate,
-                  incomingTask.deadlineTime,
-                  incomingTask.pointsPossible ?? null,
-                  incomingTask.currentScore ?? null,
-                  incomingTask.currentGrade ?? null,
-                  incomingTask.submittedAt ?? null,
-                  incomingTask.isMissing ?? false,
-                  incomingTask.isLate ?? false,
-                  existingTask.ignored ? true : existingTask.is_new,       // re-sidebar if was ignored
-                  existingTask.ignored ? null : existingTask.priority_order, // strip priority if was ignored
-                  existingTask.id,
-                  req.user.id
-                ]
-              );
+              // Only update if something actually changed
+              const segChanged =
+                existingTask.title !== incomingTask.title ||
+                existingTask.class !== incomingTask.class ||
+                (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
+                String(existingTask.current_score ?? '') !== String(incomingTask.currentScore ?? '') ||
+                (existingTask.current_grade ?? null) !== (incomingTask.currentGrade ?? null) ||
+                (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
+                (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
+                (existingTask.is_late ?? false) !== (incomingTask.isLate ?? false) ||
+                existingTask.ignored === true;
+              if (segChanged) {
+                await pool.query(
+                  `UPDATE tasks SET \
+                    title = $1,
+                    class = $2,
+                    url = $3,
+                    deadline_date = $4,
+                    deadline_time = $5,
+                    points_possible = $6,
+                    current_score = $7,
+                    current_grade = $8,
+                    submitted_at = $9,
+                    is_missing = $10,
+                    is_late = $11,
+                    ignored = false,
+                    is_new = $12,
+                    priority_order = $13
+                   WHERE id = $14 AND user_id = $15`,
+                  [
+                    incomingTask.title,
+                    incomingTask.class,
+                    incomingTask.url,
+                    incomingTask.deadlineDate,
+                    incomingTask.deadlineTime,
+                    incomingTask.pointsPossible ?? null,
+                    incomingTask.currentScore ?? null,
+                    incomingTask.currentGrade ?? null,
+                    incomingTask.submittedAt ?? null,
+                    incomingTask.isMissing ?? false,
+                    incomingTask.isLate ?? false,
+                    existingTask.ignored ? true : existingTask.is_new,
+                    // null priority_order if ignored OR task is now completed
+                    existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order),
+                    existingTask.id,
+                    req.user.id
+                  ]
+                );
+              }
             } else {
               // Non-segment task: full canvas field update
-              await pool.query(
-                `UPDATE tasks SET 
-                  title = $1,
-                  description = $2,
-                  estimated_time = $3,
-                  completed = $4,
-                  class = $5,
-                  url = $6,
-                  deadline_date = $7,
-                  deadline_time = $8,
-                  course_id = $9,
-                  assignment_id = $10,
-                  points_possible = $11,
-                  assignment_group_id = $12,
-                  current_score = $13,
-                  current_grade = $14,
-                  grading_type = $15,
-                  unlock_at = $16,
-                  lock_at = $17,
-                  submitted_at = $18,
-                  is_missing = $19,
-                  is_late = $20,
-                  ignored = false,
-                  is_new = $21,
-                  priority_order = $22
-                 WHERE id = $23 AND user_id = $24`,
-                [
-                  incomingTask.title,
-                  incomingTask.description || '',
-                  incomingTask.estimatedTime,
-                  incomingTask.completed ?? false,
-                  incomingTask.class,
-                  incomingTask.url,
-                  incomingTask.deadlineDate,
-                  incomingTask.deadlineTime,
-                  incomingTask.courseId ?? null,
-                  incomingTask.assignmentId ?? null,
-                  incomingTask.pointsPossible ?? null,
-                  incomingTask.assignmentGroupId ?? null,
-                  incomingTask.currentScore ?? null,
-                  incomingTask.currentGrade ?? null,
-                  incomingTask.gradingType || 'points',
-                  incomingTask.unlockAt ?? null,
-                  incomingTask.lockAt ?? null,
-                  incomingTask.submittedAt ?? null,
-                  incomingTask.isMissing ?? false,
-                  incomingTask.isLate ?? false,
-                  existingTask.ignored ? true : existingTask.is_new,        // re-sidebar if was ignored
-                  existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order), // strip priority if was ignored or completed
-                  existingTask.id,
-                  req.user.id
-                ]
-              );
+              // Only update if something actually changed
+              const taskChanged =
+                existingTask.title !== incomingTask.title ||
+                existingTask.class !== incomingTask.class ||
+                (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
+                existingTask.completed !== (incomingTask.completed ?? false) ||
+                String(existingTask.current_score ?? '') !== String(incomingTask.currentScore ?? '') ||
+                (existingTask.current_grade ?? null) !== (incomingTask.currentGrade ?? null) ||
+                (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
+                (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
+                (existingTask.is_late ?? false) !== (incomingTask.isLate ?? false) ||
+                existingTask.ignored === true;
+              if (taskChanged) {
+                await pool.query(
+                  `UPDATE tasks SET 
+                    title = $1,
+                    description = $2,
+                    estimated_time = $3,
+                    completed = $4,
+                    class = $5,
+                    url = $6,
+                    deadline_date = $7,
+                    deadline_time = $8,
+                    course_id = $9,
+                    assignment_id = $10,
+                    points_possible = $11,
+                    assignment_group_id = $12,
+                    current_score = $13,
+                    current_grade = $14,
+                    grading_type = $15,
+                    unlock_at = $16,
+                    lock_at = $17,
+                    submitted_at = $18,
+                    is_missing = $19,
+                    is_late = $20,
+                    ignored = false,
+                    is_new = $21,
+                    priority_order = $22
+                   WHERE id = $23 AND user_id = $24`,
+                  [
+                    incomingTask.title,
+                    incomingTask.description || '',
+                    incomingTask.estimatedTime,
+                    incomingTask.completed ?? false,
+                    incomingTask.class,
+                    incomingTask.url,
+                    incomingTask.deadlineDate,
+                    incomingTask.deadlineTime,
+                    incomingTask.courseId ?? null,
+                    incomingTask.assignmentId ?? null,
+                    incomingTask.pointsPossible ?? null,
+                    incomingTask.assignmentGroupId ?? null,
+                    incomingTask.currentScore ?? null,
+                    incomingTask.currentGrade ?? null,
+                    incomingTask.gradingType || 'points',
+                    incomingTask.unlockAt ?? null,
+                    incomingTask.lockAt ?? null,
+                    incomingTask.submittedAt ?? null,
+                    incomingTask.isMissing ?? false,
+                    incomingTask.isLate ?? false,
+                    existingTask.ignored ? true : existingTask.is_new,
+                    existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order),
+                    existingTask.id,
+                    req.user.id
+                  ]
+                );
+              }
             }
           } else {
             // Plan reorder / save — only update non-canvas fields, preserve all canvas data
@@ -1998,15 +2026,35 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
           }
 
+          // If Canvas now marks the task completed and it wasn't before, write tasks_completed row
+          if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
+            await pool.query(
+              `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+               ON CONFLICT (id) DO NOTHING`,
+              [
+                existingTask.id, req.user.id, existingTask.title, existingTask.class,
+                existingTask.description || '', existingTask.url,
+                existingTask.deadline_date, existingTask.deadline_time,
+                existingTask.user_estimated_time || existingTask.estimated_time,
+                null  // no actual_time — completed externally via Canvas
+              ]
+            );
+            console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
+          }
+
           // If task was previously ignored, treat it as a new task for sidebar/count purposes
           if (existingTask.ignored) {
             newCount++;
             console.log(`  ↩ Re-queued ignored task ID ${existingTask.id}: "${existingTask.title}" → sidebar`);
           } else {
-            console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
-            console.log(`    Canvas data: courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, points=${incomingTask.pointsPossible} (hasCanvasData=${hasCanvasData})`);
-            console.log(`    Preserved: priority_order=${existingTask.priority_order}, segment="${existingTask.segment}", user_estimated_time=${existingTask.user_estimated_time}, accumulated_time=${existingTask.accumulated_time}, deleted=${existingTask.deleted}`);
-            updatedCount++;
+            const didChange = existingTask.segment ? segChanged : taskChanged;
+            if (didChange) {
+              console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
+              updatedCount++;
+            } else {
+              console.log(`  — No change: task ID ${existingTask.id}: "${existingTask.title}"`);
+            }
           }
         }
 
@@ -2539,10 +2587,16 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     );
     
     if (taskResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Task not found' });
+      // Task may have already been completed/deleted — treat as success
+      return res.json({ success: true, alreadyCompleted: true });
     }
     
     const task = taskResult.rows[0];
+
+    // If already completed, just return success (idempotent)
+    if (task.completed || task.deleted) {
+      return res.json({ success: true, alreadyCompleted: true });
+    }
     
     // For segment tasks: check if another segment of the same task already exists
     // in tasks_completed. If so, merge by accumulating estimated_time + actual_time.
@@ -2569,7 +2623,10 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
         // First segment to complete — insert normally
         await pool.query(
           `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+           ON CONFLICT (id) DO UPDATE SET
+             actual_time = COALESCE(EXCLUDED.actual_time, tasks_completed.actual_time),
+             completed_at = CURRENT_TIMESTAMP`,
           [
             task.id, req.user.id, task.title, task.class, task.description, task.url,
             task.deadline_date, task.deadline_time,
@@ -2579,10 +2636,13 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
         );
       }
     } else {
-      // Non-segment task: insert normally
+      // Non-segment task: upsert — safe if already completed via another path
       await pool.query(
         `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           actual_time = COALESCE(EXCLUDED.actual_time, tasks_completed.actual_time),
+           completed_at = CURRENT_TIMESTAMP`,
         [
           task.id, req.user.id, task.title, task.class, task.description, task.url,
           task.deadline_date, task.deadline_time,
@@ -3295,7 +3355,7 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
   try {
     const { day } = req.query; // e.g. 'Monday'
     const result = await pool.query(
-      `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.task_ids, a.finished
+      `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.rows, a.current_row, a.finished
        FROM itinerary_slots is2
        LEFT JOIN agendas a ON a.id = is2.agenda_id
        WHERE is2.user_id = $1 AND is2.day = $2`,
