@@ -1849,6 +1849,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         const hasCanvasData = incomingTask.courseId !== undefined || incomingTask.assignmentId !== undefined;
         
         for (const existingTask of existingTasksResult.rows) {
+          let segChanged = false;
+          let taskChanged = false;
           // Skip Canvas sync updates for manually created tasks
           if (existingTask.manually_created) {
             console.log(`[SKIP] Manually created task, skipping sync: ${existingTask.title}`);
@@ -1861,7 +1863,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             if (existingTask.segment) {
               // This is a user-created segment - only update non-canvas display fields
               // Only update if something actually changed
-              const segChanged =
+              segChanged =
                 existingTask.title !== incomingTask.title ||
                 existingTask.class !== incomingTask.class ||
                 (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
@@ -1912,7 +1914,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             } else {
               // Non-segment task: full canvas field update
               // Only update if something actually changed
-              const taskChanged =
+              taskChanged =
                 existingTask.title !== incomingTask.title ||
                 existingTask.class !== incomingTask.class ||
                 (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
