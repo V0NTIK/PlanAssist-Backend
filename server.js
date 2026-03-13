@@ -2987,7 +2987,11 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
     const agendas = await Promise.all(agendasResult.rows.map(async (agenda) => {
       const rows = agenda.rows || [];
       const taskIds = [...new Set(rows.map(r => r.taskId).filter(Boolean))];
-      if (taskIds.length === 0) return { ...agenda, rows };
+      if (taskIds.length === 0) {
+        // No tasks at all — delete this agenda
+        await pool.query('DELETE FROM agendas WHERE id = $1 AND user_id = $2', [agenda.id, req.user.id]);
+        return null;
+      }
 
       const tasksResult = await pool.query(
         `SELECT id, title, segment, class, url, deadline_date, deadline_time,
@@ -2999,15 +3003,40 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
       const taskMap = {};
       tasksResult.rows.forEach(t => { taskMap[t.id] = t; });
 
-      const hydratedRows = rows.map(r => ({
+      // Strip rows whose task is gone, completed, or deleted
+      const validRows = rows.filter(r => {
+        const t = taskMap[r.taskId];
+        return t && !t.completed && !t.deleted;
+      });
+
+      // If all rows wiped out, delete the agenda entirely
+      if (validRows.length === 0) {
+        await pool.query('DELETE FROM agendas WHERE id = $1 AND user_id = $2', [agenda.id, req.user.id]);
+        return null;
+      }
+
+      // Re-index rowIndex values after any removals
+      const reindexed = validRows.map((r, i) => ({ ...r, rowIndex: i }));
+
+      // Clamp current_row to new length
+      const newCurrentRow = Math.min(agenda.current_row || 0, reindexed.length - 1);
+      const rowsChanged = reindexed.length !== rows.length || newCurrentRow !== (agenda.current_row || 0);
+      if (rowsChanged) {
+        await pool.query(
+          'UPDATE agendas SET rows = $1, current_row = $2, updated_at = NOW() WHERE id = $3 AND user_id = $4',
+          [JSON.stringify(reindexed), newCurrentRow, agenda.id, req.user.id]
+        );
+      }
+
+      const hydratedRows = reindexed.map(r => ({
         ...r,
         task: taskMap[r.taskId] || null
       }));
 
-      return { ...agenda, rows: hydratedRows };
+      return { ...agenda, rows: hydratedRows, current_row: newCurrentRow };
     }));
 
-    res.json(agendas);
+    res.json(agendas.filter(a => a !== null));
   } catch (error) {
     console.error('Get agendas error:', error);
     res.status(500).json({ error: 'Failed to get agendas' });
@@ -3023,11 +3052,13 @@ app.post('/api/agendas', authenticateToken, async (req, res) => {
     }
 
     // Normalise rows: enforce schema, default action, clamp timeMins
+    const VALID_ZONES = ['focus', 'semi', 'collab'];
     const cleanRows = rows.map((r, i) => ({
       rowIndex: i,
       taskId: r.taskId,
       action: (r.action || '').trim().slice(0, 100) || 'Work on Task',
       timeMins: Math.max(1, parseInt(r.timeMins) || 25),
+      zone: VALID_ZONES.includes(r.zone) ? r.zone : null,
     }));
 
     const result = await pool.query(
@@ -3064,11 +3095,13 @@ app.patch('/api/agendas/:agendaId/rows', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'Cannot exceed 10 rows' });
     }
 
+    const VALID_ZONES = ['focus', 'semi', 'collab'];
     const cleanEditable = editableIncoming.map((r, i) => ({
       rowIndex: lockedRows.length + i,
       taskId: r.taskId,
       action: (r.action || '').trim().slice(0, 100) || 'Work on Task',
       timeMins: Math.max(1, parseInt(r.timeMins) || 25),
+      zone: VALID_ZONES.includes(r.zone) ? r.zone : null,
     }));
 
     const merged = [...lockedRows, ...cleanEditable];
