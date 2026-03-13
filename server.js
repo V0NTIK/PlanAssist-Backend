@@ -2972,36 +2972,39 @@ async function addToCompletionFeed(userId, taskTitle, taskClass) {
 // ============================================================================
 
 // GET /api/agendas — list all unfinished agendas for the user, with task data
+// GET /api/agendas — list active agendas with hydrated row task data
 app.get('/api/agendas', authenticateToken, async (req, res) => {
   try {
     const agendasResult = await pool.query(
-      `SELECT id, name, task_ids, finished, created_at
+      `SELECT id, name, rows, current_row, current_row_elapsed, current_row_countdown,
+              finished, created_at
        FROM agendas
        WHERE user_id = $1 AND finished = false
        ORDER BY created_at ASC`,
       [req.user.id]
     );
 
-    // For each agenda, fetch the current task data
     const agendas = await Promise.all(agendasResult.rows.map(async (agenda) => {
-      const taskIds = agenda.task_ids || [];
-      if (taskIds.length === 0) return { ...agenda, tasks: [] };
+      const rows = agenda.rows || [];
+      const taskIds = [...new Set(rows.map(r => r.taskId).filter(Boolean))];
+      if (taskIds.length === 0) return { ...agenda, rows };
 
       const tasksResult = await pool.query(
         `SELECT id, title, segment, class, url, deadline_date, deadline_time,
                 estimated_time, user_estimated_time, accumulated_time,
                 session_active, priority_order, completed, deleted
-         FROM tasks
-         WHERE id = ANY($1) AND user_id = $2`,
+         FROM tasks WHERE id = ANY($1) AND user_id = $2`,
         [taskIds, req.user.id]
       );
-
-      // Preserve original ordering; exclude deleted tasks (completed agenda tasks are soft-deleted)
       const taskMap = {};
       tasksResult.rows.forEach(t => { taskMap[t.id] = t; });
-      const tasks = taskIds.map(id => taskMap[id]).filter(t => t && !t.deleted);
 
-      return { ...agenda, tasks };
+      const hydratedRows = rows.map(r => ({
+        ...r,
+        task: taskMap[r.taskId] || null
+      }));
+
+      return { ...agenda, rows: hydratedRows };
     }));
 
     res.json(agendas);
@@ -3014,18 +3017,25 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
 // POST /api/agendas — create a new agenda
 app.post('/api/agendas', authenticateToken, async (req, res) => {
   try {
-    const { name, taskIds } = req.body;
-    if (!name || !taskIds || taskIds.length === 0 || taskIds.length > 3) {
-      return res.status(400).json({ error: 'Name and 1-3 task IDs are required' });
+    const { name, rows } = req.body;
+    if (!name || !Array.isArray(rows) || rows.length === 0 || rows.length > 10) {
+      return res.status(400).json({ error: 'Name and 1–10 rows are required' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO agendas (user_id, name, task_ids)
-       VALUES ($1, $2, $3)
-       RETURNING id, name, task_ids, finished, created_at`,
-      [req.user.id, name.trim(), taskIds]
-    );
+    // Normalise rows: enforce schema, default action, clamp timeMins
+    const cleanRows = rows.map((r, i) => ({
+      rowIndex: i,
+      taskId: r.taskId,
+      action: (r.action || '').trim().slice(0, 100) || 'Work on Task',
+      timeMins: Math.max(1, parseInt(r.timeMins) || 25),
+    }));
 
+    const result = await pool.query(
+      `INSERT INTO agendas (user_id, name, rows)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, rows, current_row, current_row_elapsed, current_row_countdown, finished, created_at`,
+      [req.user.id, name.trim(), JSON.stringify(cleanRows)]
+    );
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Create agenda error:', error);
@@ -3033,14 +3043,132 @@ app.post('/api/agendas', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /api/agendas/:agendaId — delete an agenda
+// PATCH /api/agendas/:agendaId/rows — edit future rows (current_row+1 and beyond only)
+app.patch('/api/agendas/:agendaId/rows', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    const { rows } = req.body;
+
+    const agendaResult = await pool.query(
+      'SELECT rows, current_row FROM agendas WHERE id = $1 AND user_id = $2',
+      [agendaId, req.user.id]
+    );
+    if (agendaResult.rows.length === 0) return res.status(404).json({ error: 'Agenda not found' });
+
+    const existing = agendaResult.rows[0];
+    const lockedRows = (existing.rows || []).filter(r => r.rowIndex <= existing.current_row);
+
+    // Incoming rows must only be for indices > current_row
+    const editableIncoming = (rows || []).filter(r => r.rowIndex > existing.current_row);
+    if (lockedRows.length + editableIncoming.length > 10) {
+      return res.status(400).json({ error: 'Cannot exceed 10 rows' });
+    }
+
+    const cleanEditable = editableIncoming.map((r, i) => ({
+      rowIndex: lockedRows.length + i,
+      taskId: r.taskId,
+      action: (r.action || '').trim().slice(0, 100) || 'Work on Task',
+      timeMins: Math.max(1, parseInt(r.timeMins) || 25),
+    }));
+
+    const merged = [...lockedRows, ...cleanEditable];
+
+    await pool.query(
+      'UPDATE agendas SET rows = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3',
+      [JSON.stringify(merged), agendaId, req.user.id]
+    );
+    res.json({ success: true, rows: merged });
+  } catch (error) {
+    console.error('Edit agenda rows error:', error);
+    res.status(500).json({ error: 'Failed to update agenda rows' });
+  }
+});
+
+// POST /api/agendas/:agendaId/proceed — save progress and advance to next row
+app.post('/api/agendas/:agendaId/proceed', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    const { taskId, elapsedSeconds } = req.body;
+
+    const agendaResult = await pool.query(
+      'SELECT rows, current_row FROM agendas WHERE id = $1 AND user_id = $2',
+      [agendaId, req.user.id]
+    );
+    if (agendaResult.rows.length === 0) return res.status(404).json({ error: 'Agenda not found' });
+
+    const { rows, current_row } = agendaResult.rows[0];
+    const nextRow = current_row + 1;
+    const isLastRow = nextRow >= rows.length;
+
+    // Save accumulated time for the task
+    if (taskId && elapsedSeconds > 0) {
+      const mins = Math.round(elapsedSeconds / 60);
+      await pool.query(
+        `UPDATE tasks SET accumulated_time = COALESCE(accumulated_time, 0) + $1
+         WHERE id = $2 AND user_id = $3`,
+        [mins, taskId, req.user.id]
+      );
+    }
+
+    if (isLastRow) {
+      // Last row proceeded — mark finished
+      await pool.query(
+        `UPDATE agendas SET finished = true, current_row = $1,
+          current_row_elapsed = 0, current_row_countdown = NULL, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3`,
+        [current_row, agendaId, req.user.id]
+      );
+      return res.json({ success: true, finished: true });
+    }
+
+    await pool.query(
+      `UPDATE agendas SET current_row = $1,
+        current_row_elapsed = 0, current_row_countdown = NULL, updated_at = NOW()
+       WHERE id = $2 AND user_id = $3`,
+      [nextRow, agendaId, req.user.id]
+    );
+    res.json({ success: true, finished: false, nextRow });
+  } catch (error) {
+    console.error('Proceed agenda error:', error);
+    res.status(500).json({ error: 'Failed to proceed' });
+  }
+});
+
+// POST /api/agendas/:agendaId/save-exit — save timer state and exit
+app.post('/api/agendas/:agendaId/save-exit', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    const { taskId, elapsedSeconds, countdownSecondsRemaining } = req.body;
+
+    if (taskId && elapsedSeconds > 0) {
+      const mins = Math.round(elapsedSeconds / 60);
+      await pool.query(
+        `UPDATE tasks SET accumulated_time = COALESCE(accumulated_time, 0) + $1
+         WHERE id = $2 AND user_id = $3`,
+        [mins, taskId, req.user.id]
+      );
+    }
+
+    await pool.query(
+      `UPDATE agendas SET
+        current_row_elapsed = $1,
+        current_row_countdown = $2,
+        updated_at = NOW()
+       WHERE id = $3 AND user_id = $4`,
+      [elapsedSeconds || 0, countdownSecondsRemaining ?? null, agendaId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save-exit agenda error:', error);
+    res.status(500).json({ error: 'Failed to save agenda state' });
+  }
+});
+
+// DELETE /api/agendas/:agendaId
 app.delete('/api/agendas/:agendaId', authenticateToken, async (req, res) => {
   try {
     const { agendaId } = req.params;
-    await pool.query(
-      'DELETE FROM agendas WHERE id = $1 AND user_id = $2',
-      [agendaId, req.user.id]
-    );
+    await pool.query('DELETE FROM agendas WHERE id = $1 AND user_id = $2', [agendaId, req.user.id]);
     res.json({ success: true });
   } catch (error) {
     console.error('Delete agenda error:', error);
@@ -3048,7 +3176,7 @@ app.delete('/api/agendas/:agendaId', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /api/agendas/:agendaId/finish — mark agenda as finished
+// PATCH /api/agendas/:agendaId/finish
 app.patch('/api/agendas/:agendaId/finish', authenticateToken, async (req, res) => {
   try {
     const { agendaId } = req.params;
@@ -3062,10 +3190,6 @@ app.patch('/api/agendas/:agendaId/finish', authenticateToken, async (req, res) =
     res.status(500).json({ error: 'Failed to finish agenda' });
   }
 });
-
-// ============================================================================
-// ENHANCE SCHEDULE — save lesson-course mappings + zoom numbers
-// ============================================================================
 
 // POST /api/schedule/enhance
 // Body: { lessons: [{day, period, courseId, courseName}], zoomNumbers: [{courseId, zoomNumber}] }
