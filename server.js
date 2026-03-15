@@ -2029,7 +2029,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           }
 
           // If Canvas now marks the task completed and it wasn't before, write tasks_completed row
-          if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
+          // Skip if already deleted/manually resolved by the user — they handled it themselves
+          if (!existingTask.segment && incomingTask.completed && !existingTask.completed && !existingTask.deleted) {
             await pool.query(
               `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
@@ -2039,7 +2040,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 existingTask.description || '', existingTask.url,
                 existingTask.deadline_date, existingTask.deadline_time,
                 existingTask.user_estimated_time || existingTask.estimated_time,
-                null  // no actual_time — completed externally via Canvas
+                existingTask.accumulated_time || 0  // use logged time, or 0 if completed externally via Canvas
               ]
             );
             console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
