@@ -444,29 +444,325 @@ ALTER TABLE tasks_completed
 ADD COLUMN IF NOT EXISTS deadline_date DATE,
 ADD COLUMN IF NOT EXISTS deadline_time TIME;
 
-UPDATE tasks_completed
-SET 
-  deadline_date = CASE 
-    WHEN deadline IS NOT NULL THEN DATE(deadline)
-    ELSE NULL
-  END,
-  deadline_time = CASE 
-    WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
-      CASE 
-        WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
+-- Only migrate if the old deadline column still exists
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'tasks_completed' AND column_name = 'deadline'
+  ) THEN
+    UPDATE tasks_completed
+    SET 
+      deadline_date = CASE 
+        WHEN deadline IS NOT NULL THEN DATE(deadline)
+        ELSE NULL
+      END,
+      deadline_time = CASE 
+        WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
+          CASE 
+            WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
+            ELSE NULL
+          END
         ELSE NULL
       END
-    ELSE NULL
-  END
-WHERE deadline IS NOT NULL;
+    WHERE deadline IS NOT NULL;
 
-ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
+    ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
+  END IF;
+END $$;
+
 ALTER TABLE tasks_completed ALTER COLUMN deadline_date SET NOT NULL;
 
 DROP INDEX IF EXISTS idx_tasks_completed_deadline;
 CREATE INDEX IF NOT EXISTS idx_tasks_completed_deadline_date ON tasks_completed(deadline_date);
 
--- Verification
+-- Migration: Add calendar preference columns to users table
+-- Safe: IF NOT EXISTS is idempotent, existing rows get the defaults
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_today_centered BOOLEAN DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom  BOOLEAN DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed BOOLEAN DEFAULT true;
+
+ALTER TABLE session_state 
+  ADD COLUMN IF NOT EXISTS partial_task_times JSONB DEFAULT NULL;
+
+-- Add current grading period score columns to courses table
+ALTER TABLE courses
+  ADD COLUMN IF NOT EXISTS current_period_score NUMERIC,
+  ADD COLUMN IF NOT EXISTS current_period_grade TEXT,
+  ADD COLUMN IF NOT EXISTS grading_period_id INTEGER,
+  ADD COLUMN IF NOT EXISTS grading_period_title TEXT;
+
+
+-- Add session_active flag to tasks table
+-- Tracks whether a task currently has an in-progress timer session
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_active BOOLEAN DEFAULT false;
+
+-- Drop old sessions infrastructure (no longer needed)
+DROP TABLE IF EXISTS user_sessions;
+
+-- Agendas table
+CREATE TABLE IF NOT EXISTS agendas (
+  id            SERIAL PRIMARY KEY,
+  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL,
+  task_ids      INTEGER[] NOT NULL,          -- ordered list of 1-3 task IDs
+  finished      BOOLEAN NOT NULL DEFAULT false,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS agendas_user_id_idx ON agendas(user_id);
+
+COMMENT ON TABLE agendas IS 'User-created agenda blocks grouping 1-3 tasks for a focused work session.';
+COMMENT ON COLUMN agendas.task_ids IS 'Ordered array of task IDs (max 3). Tasks can appear in multiple agendas.';
+COMMENT ON COLUMN agendas.finished IS 'True once all tasks in the agenda have been marked complete.';
+
+-- ============================================================
+-- Migration: Itinerary feature (uses existing schedules table)
+-- ============================================================
+
+-- 1. Add unique constraint to schedules so ON CONFLICT works for upserts
+ALTER TABLE schedules
+  ADD CONSTRAINT schedules_user_day_period_unique UNIQUE (user_id, day, period);
+
+-- 2. Add course columns to existing schedules table
+ALTER TABLE schedules
+  ADD COLUMN IF NOT EXISTS course_id   INTEGER REFERENCES courses(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS course_name TEXT;
+
+-- 3. Add schedule_enhanced flag to users
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS schedule_enhanced BOOLEAN NOT NULL DEFAULT false;
+
+-- 4. Add zoom_number to courses
+ALTER TABLE courses
+  ADD COLUMN IF NOT EXISTS zoom_number TEXT;
+
+-- 5. Itinerary slots table: maps each Study period slot to an agenda for a given day
+CREATE TABLE IF NOT EXISTS itinerary_slots (
+  id         SERIAL PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day        TEXT NOT NULL,
+  period     INTEGER NOT NULL,
+  agenda_id  INTEGER REFERENCES agendas(id) ON DELETE SET NULL,
+  UNIQUE (user_id, day, period)
+);
+
+CREATE INDEX IF NOT EXISTS itinerary_slots_user_idx ON itinerary_slots(user_id);
+
+COMMENT ON COLUMN schedules.course_id   IS 'Course assigned to this Lesson period (enhanced schedule).';
+COMMENT ON COLUMN schedules.course_name IS 'Denormalised course name for display.';
+COMMENT ON TABLE  itinerary_slots       IS 'Maps each Study period slot in the Itinerary to an agenda.';
+
+-- ============================================================
+-- Migration: Tutorials feature
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tutorials (
+  id          SERIAL PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day         TEXT NOT NULL,       -- 'Monday', 'Tuesday', etc.
+  period      INTEGER NOT NULL,
+  zoom_number TEXT,
+  topic       TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, day, period)    -- one tutorial per day/period slot
+);
+
+CREATE INDEX IF NOT EXISTS tutorials_user_idx ON tutorials(user_id);
+
+COMMENT ON TABLE tutorials IS 'Stores booked tutorial sessions per day/period slot.';
+
+-- ============================================================
+-- Migration: Misc fixes
+-- ============================================================
+
+-- 1. Add manually_created flag to tasks
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS manually_created BOOLEAN NOT NULL DEFAULT false;
+
+-- 2. Mark existing split-task segments as manually_created=false (default),
+--    they are handled by Sync guard logic not this flag
+-- (no data migration needed for segments)
+
+-- 3. Trigger a one-time priority reorder for all users
+--    (fixes gaps created by manual DB edits - item #4)
+WITH ordered AS (
+  SELECT id,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_id
+      ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST
+    ) AS new_order
+  FROM tasks
+  WHERE deleted = false AND completed = false AND priority_order IS NOT NULL
+)
+UPDATE tasks SET priority_order = ordered.new_order
+FROM ordered WHERE tasks.id = ordered.id;
+
+-- ============================================================
+-- Migration: Admin Console
+-- ============================================================
+
+-- 1. Add admin/ban columns to users
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS ban_reason TEXT;
+
+-- 2. Admin audit log
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id SERIAL PRIMARY KEY,
+  admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  admin_name TEXT NOT NULL,
+  action TEXT NOT NULL,          -- e.g. 'BAN_USER', 'EDIT_USER', 'DISMISS_ANNOUNCEMENT'
+  target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  target_user_name TEXT,
+  details JSONB,                 -- flexible payload for action-specific data
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 3. Announcements (persistent banners)
+CREATE TABLE IF NOT EXISTS announcements (
+  id SERIAL PRIMARY KEY,
+  author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  author_name TEXT NOT NULL,
+  message TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'info',   -- 'info' (dismissible, blue) | 'urgent' (non-dismissible, red/orange)
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deactivated_at TIMESTAMPTZ
+);
+
+-- 4. Per-user announcement dismissals (only used for dismissible announcements)
+CREATE TABLE IF NOT EXISTS announcement_dismissals (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+  dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, announcement_id)
+);
+
+-- Add split_origin column to tasks
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS split_origin BOOLEAN NOT NULL DEFAULT false;
+
+-- Backfill: mark existing split-origin tasks
+-- A split-origin task is deleted=true, has a url, and at least one segment sibling
+-- exists with the same url and user_id
+UPDATE tasks t
+SET split_origin = true
+WHERE t.deleted = true
+  AND t.completed = false
+  AND t.url IS NOT NULL
+  AND t.segment IS NULL
+  AND EXISTS (
+    SELECT 1 FROM tasks seg
+    WHERE seg.user_id = t.user_id
+      AND seg.url = t.url
+      AND seg.segment IS NOT NULL
+  );
+
+-- ============================================================
+-- PlanAssist Migration: Account & Analytics Revamp
+-- Run in Supabase SQL Editor
+-- ============================================================
+
+-- 1. Add 'ignored' column to tasks table
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ignored BOOLEAN DEFAULT FALSE;
+
+-- 2. Add 'enabled' column to courses table (controls visibility everywhere)
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE;
+
+-- 3. Add help_content table (global, admin-editable)
+CREATE TABLE IF NOT EXISTS help_content (
+  id INTEGER PRIMARY KEY DEFAULT 1,
+  content TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_by INTEGER REFERENCES users(id)
+);
+
+-- Seed a default row so there's always one to UPDATE
+INSERT INTO help_content (id, content) VALUES (1, '')
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================
+-- Done. Deploy server.js and App.jsx after running this.
+-- ============================================================
+
+-- Add grade_id column to tasks for tracking grade detection order
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grade_id INTEGER DEFAULT NULL;
+
+-- Index for efficient lookup of max grade_id per user
+CREATE INDEX IF NOT EXISTS idx_tasks_user_grade_id ON tasks (user_id, grade_id) WHERE grade_id IS NOT NULL;
+
+-- ============================================================
+-- Agendas v2 migration
+-- Replaces task_ids[] with a rows JSONB column and adds
+-- per-row progress tracking columns.
+-- ============================================================
+
+-- Add new columns
+ALTER TABLE agendas
+  ADD COLUMN IF NOT EXISTS rows        JSONB    NOT NULL DEFAULT '[]',
+  ADD COLUMN IF NOT EXISTS current_row INTEGER  NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS current_row_elapsed  INTEGER  NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS current_row_countdown INTEGER  DEFAULT NULL;
+
+-- Migrate existing agendas: convert task_ids[] → rows JSONB
+-- Each task becomes a row with action='Work on Task' and
+-- timeMins = the task's estimated_time (or 25 if null).
+UPDATE agendas a
+SET rows = (
+  SELECT jsonb_agg(
+    jsonb_build_object(
+      'rowIndex',  ordinality - 1,
+      'taskId',    tid,
+      'action',    'Work on Task',
+      'timeMins',  COALESCE(
+                     (SELECT COALESCE(user_estimated_time, estimated_time)
+                      FROM tasks
+                      WHERE id = tid AND user_id = a.user_id
+                      LIMIT 1),
+                     25
+                   )
+    )
+    ORDER BY ordinality
+  )
+  FROM unnest(a.task_ids) WITH ORDINALITY AS t(tid, ordinality)
+)
+WHERE array_length(task_ids, 1) > 0;
+
+-- Drop the old column (safe after migration)
+ALTER TABLE agendas DROP COLUMN IF EXISTS task_ids;
+
+-- Update the comment
+COMMENT ON TABLE agendas IS 'User-created agenda blocks with ordered rows of task+action+time.';
+COMMENT ON COLUMN agendas.rows IS 'JSONB array of {rowIndex, taskId, action, timeMins}. Max 10 rows.';
+COMMENT ON COLUMN agendas.current_row IS '0-based index of the row currently being worked on.';
+COMMENT ON COLUMN agendas.current_row_elapsed IS 'Seconds spent on in-session timer for current row (saved on exit).';
+COMMENT ON COLUMN agendas.current_row_countdown IS 'Seconds remaining on countdown timer when user saved and exited. NULL = full timeMins.';
+
+-- Widen grading_type column to accommodate all Canvas grading type strings
+-- Canvas values include: 'points', 'percent', 'letter_grade', 'gpa_scale', 'not_graded', 'pass_fail'
+-- Previous VARCHAR(10) was too narrow for 'letter_grade' (12 chars)
+ALTER TABLE tasks ALTER COLUMN grading_type TYPE VARCHAR(200);
+
+-- Fix VARCHAR columns that are too narrow for Canvas API data
+-- current_grade: Canvas can return values longer than 10 chars
+ALTER TABLE tasks ALTER COLUMN current_grade TYPE VARCHAR(50);
+
+-- courses table has the same issue  
+ALTER TABLE courses ALTER COLUMN current_grade TYPE VARCHAR(50);
+ALTER TABLE courses ALTER COLUMN final_grade TYPE VARCHAR(50);
+
+-- grading_type: was VARCHAR(20) in schema but VARCHAR(10) may have been applied
+-- 'letter_grade' is 12 chars, set generously
+ALTER TABLE tasks ALTER COLUMN grading_type TYPE VARCHAR(50);
+
+-- completion_feed and leaderboard grade columns (if they exist)
+ALTER TABLE weekly_leaderboard ALTER COLUMN grade TYPE VARCHAR(50);
+ALTER TABLE completion_feed ALTER COLUMN user_grade TYPE VARCHAR(50);
+
 SELECT 
   'Tasks table migration complete' as status,
   COUNT(*) as total_tasks,
