@@ -698,7 +698,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, schedule_enhanced, is_admin FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -741,6 +741,11 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       calendarTodayCentered: user.calendar_today_centered ?? false,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true,
+      calendarShowPrevWeek: user.calendar_show_prev_week ?? false,
+      calendarShowCurrentWeek: user.calendar_show_current_week ?? true,
+      calendarShowNextWeek1: user.calendar_show_next_week1 ?? false,
+      calendarShowNextWeek2: user.calendar_show_next_week2 ?? false,
+      calendarShowWeekends: user.calendar_show_weekends ?? true,
       schedule_enhanced: user.schedule_enhanced || false,
       is_admin: user.is_admin || false
     });
@@ -753,7 +758,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 // Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const { grade, canvasApiToken, presentPeriods, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted } = req.body;
+    const { grade, canvasApiToken, presentPeriods, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
+            calendarShowPrevWeek, calendarShowCurrentWeek, calendarShowNextWeek1, calendarShowNextWeek2, calendarShowWeekends } = req.body;
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -774,12 +780,20 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     await pool.query(
       `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
         present_periods = $4, is_new_user = false,
-        calendar_today_centered = $5, calendar_show_homeroom = $6, calendar_show_completed = $7
-       WHERE id = $8`,
+        calendar_today_centered = $5, calendar_show_homeroom = $6, calendar_show_completed = $7,
+        calendar_show_prev_week = $8, calendar_show_current_week = $9,
+        calendar_show_next_week1 = $10, calendar_show_next_week2 = $11,
+        calendar_show_weekends = $12
+       WHERE id = $13`,
       [grade, encryptedToken, iv, presentPeriods,
        calendarTodayCentered ?? false,
        calendarShowHomeroom ?? false,
        calendarShowCompleted ?? true,
+       calendarShowPrevWeek ?? false,
+       calendarShowCurrentWeek ?? true,
+       calendarShowNextWeek1 ?? false,
+       calendarShowNextWeek2 ?? false,
+       calendarShowWeekends ?? true,
        req.user.id]
     );
 
@@ -2101,7 +2115,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         const isAlreadyCompleted = incomingTask.completed ?? false;
         if (!isAlreadyCompleted) {
           const maxPriorityResult = await pool.query(
-            'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
+            'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false AND (ignored = false OR ignored IS NULL)',
             [req.user.id]
           );
           nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
@@ -3356,13 +3370,13 @@ app.get('/api/schedule/lessons', authenticateToken, async (req, res) => {
 // GET /api/itinerary — get today's itinerary slots (day param from client)
 app.get('/api/itinerary', authenticateToken, async (req, res) => {
   try {
-    const { day } = req.query; // e.g. 'Monday'
+    const { date } = req.query; // e.g. '2026-03-17' (local date string)
     const result = await pool.query(
       `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.rows, a.current_row, a.finished
        FROM itinerary_slots is2
        LEFT JOIN agendas a ON a.id = is2.agenda_id
-       WHERE is2.user_id = $1 AND is2.day = $2`,
-      [req.user.id, day]
+       WHERE is2.user_id = $1 AND is2.date = $2`,
+      [req.user.id, date]
     );
     res.json(result.rows);
   } catch (error) {
@@ -3371,24 +3385,27 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /api/itinerary — assign (or clear) an agenda to a period slot
-// Body: { day, period, agendaId } — agendaId: null to clear
+// PUT /api/itinerary — assign (or clear) an agenda to a period/date slot
+// Body: { date, period, agendaId } — agendaId: null to clear
 app.put('/api/itinerary', authenticateToken, async (req, res) => {
   try {
-    const { day, period, agendaId } = req.body;
+    const { date, period, agendaId } = req.body;
+    if (!date || !period) {
+      return res.status(400).json({ error: 'date and period are required' });
+    }
     if (agendaId === null || agendaId === undefined) {
       // Clear the slot
       await pool.query(
-        `DELETE FROM itinerary_slots WHERE user_id = $1 AND day = $2 AND period = $3`,
-        [req.user.id, day, period]
+        `DELETE FROM itinerary_slots WHERE user_id = $1 AND date = $2 AND period = $3`,
+        [req.user.id, date, period]
       );
     } else {
       await pool.query(
-        `INSERT INTO itinerary_slots (user_id, day, period, agenda_id)
+        `INSERT INTO itinerary_slots (user_id, date, period, agenda_id)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, day, period)
+         ON CONFLICT (user_id, date, period)
          DO UPDATE SET agenda_id = $4`,
-        [req.user.id, day, period, agendaId]
+        [req.user.id, date, period, agendaId]
       );
     }
     res.json({ success: true });
@@ -3403,14 +3420,14 @@ app.put('/api/itinerary', authenticateToken, async (req, res) => {
 // TUTORIALS
 // ============================================================================
 
-// GET /api/tutorials?day=Monday — get tutorials for a specific day
+// GET /api/tutorials?date=2026-03-17 — get tutorials for a specific date
 app.get('/api/tutorials', authenticateToken, async (req, res) => {
   try {
-    const { day } = req.query;
-    const query = day
-      ? 'SELECT * FROM tutorials WHERE user_id = $1 AND day = $2 ORDER BY period ASC'
-      : 'SELECT * FROM tutorials WHERE user_id = $1 ORDER BY day, period ASC';
-    const params = day ? [req.user.id, day] : [req.user.id];
+    const { date } = req.query;
+    const query = date
+      ? 'SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY period ASC'
+      : 'SELECT * FROM tutorials WHERE user_id = $1 ORDER BY date, period ASC';
+    const params = date ? [req.user.id, date] : [req.user.id];
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (error) {
@@ -3419,20 +3436,20 @@ app.get('/api/tutorials', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /api/tutorials — upsert a tutorial for a day/period
+// PUT /api/tutorials — upsert a tutorial for a date/period
 app.put('/api/tutorials', authenticateToken, async (req, res) => {
   try {
-    const { day, period, zoomNumber, topic } = req.body;
-    if (!day || !period) {
-      return res.status(400).json({ error: 'Day and period are required' });
+    const { date, period, zoomNumber, topic } = req.body;
+    if (!date || !period) {
+      return res.status(400).json({ error: 'Date and period are required' });
     }
     const result = await pool.query(
-      `INSERT INTO tutorials (user_id, day, period, zoom_number, topic)
+      `INSERT INTO tutorials (user_id, date, period, zoom_number, topic)
        VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (user_id, day, period)
+       ON CONFLICT (user_id, date, period)
        DO UPDATE SET zoom_number = $4, topic = $5
        RETURNING *`,
-      [req.user.id, day, period, zoomNumber || null, topic || null]
+      [req.user.id, date, period, zoomNumber || null, topic || null]
     );
     res.json(result.rows[0]);
   } catch (error) {
@@ -3441,13 +3458,13 @@ app.put('/api/tutorials', authenticateToken, async (req, res) => {
   }
 });
 
-// DELETE /api/tutorials — remove a tutorial for a day/period
+// DELETE /api/tutorials — remove a tutorial for a date/period
 app.delete('/api/tutorials', authenticateToken, async (req, res) => {
   try {
-    const { day, period } = req.body;
+    const { date, period } = req.body;
     await pool.query(
-      'DELETE FROM tutorials WHERE user_id = $1 AND day = $2 AND period = $3',
-      [req.user.id, day, period]
+      'DELETE FROM tutorials WHERE user_id = $1 AND date = $2 AND period = $3',
+      [req.user.id, date, period]
     );
     res.json({ success: true });
   } catch (error) {
@@ -3460,17 +3477,20 @@ app.delete('/api/tutorials', authenticateToken, async (req, res) => {
 // POST /api/tasks/normalize — compact priority_order to remove gaps after deletions
 app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
   try {
+    // Null out priority_order for any completed, deleted, or ignored tasks
     await pool.query(
       `UPDATE tasks SET priority_order = NULL
-       WHERE user_id = $1 AND (completed = true OR deleted = true)`,
+       WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
       [req.user.id]
     );
+    // Renumber only active (non-completed, non-deleted, non-ignored) tasks
     await pool.query(
       `WITH ordered AS (
          SELECT id,
            ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
          FROM tasks
-         WHERE user_id = $1 AND deleted = false AND completed = false AND priority_order IS NOT NULL
+         WHERE user_id = $1 AND deleted = false AND completed = false
+           AND (ignored = false OR ignored IS NULL) AND priority_order IS NOT NULL
        )
        UPDATE tasks SET priority_order = ordered.new_order
        FROM ordered WHERE tasks.id = ordered.id`,
@@ -3792,7 +3812,14 @@ app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, asy
       [targetId]
     );
 
-    // Step 2: Reassign priority_order sequentially for all active, non-new tasks
+    // Step 2: Null out priority_order for completed, deleted, or ignored tasks first
+    await client.query(
+      `UPDATE tasks SET priority_order = NULL
+       WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
+      [targetId]
+    );
+
+    // Step 3: Reassign priority_order sequentially for all active, non-new tasks
     // preserving their existing relative order (by current priority_order then deadline)
     await client.query(
       `WITH ordered AS (
@@ -3801,6 +3828,7 @@ app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, asy
          ) AS new_order
          FROM tasks
          WHERE user_id = $1 AND deleted = false AND completed = false
+           AND (ignored = false OR ignored IS NULL)
        )
        UPDATE tasks SET priority_order = ordered.new_order
        FROM ordered WHERE tasks.id = ordered.id`,
@@ -3957,7 +3985,11 @@ app.get('/api/tasks/resolved', authenticateToken, async (req, res) => {
        LEFT JOIN tasks_completed tc ON tc.id = t.id AND tc.user_id = t.user_id
        WHERE t.user_id = $1
          AND (t.split_origin IS NOT TRUE)
-         AND (t.completed = TRUE OR t.ignored = TRUE)
+         AND (
+           t.completed = TRUE
+           OR t.ignored = TRUE
+           OR (t.deleted = TRUE AND (t.ignored IS NOT TRUE))
+         )
          AND (t.title ILIKE $2 OR t.class ILIKE $2)
        ORDER BY ${orderCol} DESC NULLS LAST`,
       [req.user.id, searchParam]
