@@ -3371,12 +3371,15 @@ app.get('/api/schedule/lessons', authenticateToken, async (req, res) => {
 app.get('/api/itinerary', authenticateToken, async (req, res) => {
   try {
     const { date } = req.query; // e.g. '2026-03-17' (local date string)
+    // Derive day name for backward compat with rows that only have day set
+    const _dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const _dayName = _dayNames[new Date(date + 'T12:00:00').getDay()];
     const result = await pool.query(
       `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.rows, a.current_row, a.finished
        FROM itinerary_slots is2
        LEFT JOIN agendas a ON a.id = is2.agenda_id
-       WHERE is2.user_id = $1 AND is2.date = $2`,
-      [req.user.id, date]
+       WHERE is2.user_id = $1 AND (is2.date = $2 OR (is2.date IS NULL AND is2.day = $3))`,
+      [req.user.id, date, _dayName]
     );
     res.json(result.rows);
   } catch (error) {
@@ -3393,19 +3396,25 @@ app.put('/api/itinerary', authenticateToken, async (req, res) => {
     if (!date || !period) {
       return res.status(400).json({ error: 'date and period are required' });
     }
+    // Derive day name from date for backward compat with day NOT NULL constraint
+    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const dayName = dayNames[new Date(date + 'T12:00:00').getDay()];
+
     if (agendaId === null || agendaId === undefined) {
-      // Clear the slot
+      // Clear the slot — try date first, fall back to day+period
       await pool.query(
-        `DELETE FROM itinerary_slots WHERE user_id = $1 AND date = $2 AND period = $3`,
-        [req.user.id, date, period]
+        `DELETE FROM itinerary_slots WHERE user_id = $1 AND (date = $2 OR day = $3) AND period = $4`,
+        [req.user.id, date, dayName, period]
       );
     } else {
+      // Upsert — write both day and date so existing NOT NULL constraint is satisfied
+      // Once the migration drops the day column this still works fine
       await pool.query(
-        `INSERT INTO itinerary_slots (user_id, date, period, agenda_id)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, date, period)
-         DO UPDATE SET agenda_id = $4`,
-        [req.user.id, date, period, agendaId]
+        `INSERT INTO itinerary_slots (user_id, day, date, period, agenda_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, day, period)
+         DO UPDATE SET agenda_id = $5, date = $3`,
+        [req.user.id, dayName, date, period, agendaId]
       );
     }
     res.json({ success: true });
