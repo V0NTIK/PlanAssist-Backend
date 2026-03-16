@@ -698,7 +698,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_today_centered, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -738,7 +738,6 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       canvasApiToken: canvasApiToken,
       presentPeriods: user.present_periods || '2-6',
       schedule,
-      calendarTodayCentered: user.calendar_today_centered ?? false,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true,
       calendarShowPrevWeek: user.calendar_show_prev_week ?? false,
@@ -780,13 +779,12 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     await pool.query(
       `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
         present_periods = $4, is_new_user = false,
-        calendar_today_centered = $5, calendar_show_homeroom = $6, calendar_show_completed = $7,
-        calendar_show_prev_week = $8, calendar_show_current_week = $9,
-        calendar_show_next_week1 = $10, calendar_show_next_week2 = $11,
-        calendar_show_weekends = $12
-       WHERE id = $13`,
+        calendar_show_homeroom = $5, calendar_show_completed = $6,
+        calendar_show_prev_week = $7, calendar_show_current_week = $8,
+        calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
+        calendar_show_weekends = $11
+       WHERE id = $12`,
       [grade, encryptedToken, iv, presentPeriods,
-       calendarTodayCentered ?? false,
        calendarShowHomeroom ?? false,
        calendarShowCompleted ?? true,
        calendarShowPrevWeek ?? false,
