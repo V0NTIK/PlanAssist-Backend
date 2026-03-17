@@ -681,7 +681,8 @@ app.post('/api/auth/login', async (req, res) => {
         id: user.id, 
         email: user.email, 
         name: user.name,
-        isNewUser: user.is_new_user
+        isNewUser: user.is_new_user,
+        showInFeed: user.show_in_feed !== false
       } 
     });
   } catch (error) {
@@ -698,7 +699,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -746,7 +747,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       calendarShowNextWeek2: user.calendar_show_next_week2 ?? false,
       calendarShowWeekends: user.calendar_show_weekends ?? true,
       schedule_enhanced: user.schedule_enhanced || false,
-      is_admin: user.is_admin || false
+      is_admin: user.is_admin || false,
+      showInFeed: user.show_in_feed !== false
     });
   } catch (error) {
     console.error('Get account setup error:', error);
@@ -2573,19 +2575,70 @@ app.post('/api/sessions/start/:taskId', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/sessions/pause/:taskId — save elapsed time and clear active flag
+// POST /api/sessions/pause/:taskId — save elapsed time (session_active stays true — user is still in the session)
 app.post('/api/sessions/pause/:taskId', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
     const { accumulatedTime } = req.body;
     await pool.query(
-      'UPDATE tasks SET session_active = false, accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
       [accumulatedTime, taskId, req.user.id]
     );
     res.json({ success: true });
   } catch (error) {
     console.error('Pause session error:', error);
     res.status(500).json({ error: 'Failed to pause session' });
+  }
+});
+
+// POST /api/sessions/end/:taskId — user exits session back to Sessions page, clear active flag
+app.post('/api/sessions/end/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { accumulatedTime } = req.body;
+    await pool.query(
+      'UPDATE tasks SET session_active = false, accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      [accumulatedTime ?? 0, taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('End session error:', error);
+    res.status(500).json({ error: 'Failed to end session' });
+  }
+});
+
+// POST /api/sessions/agenda-start/:taskId — mark task active when agenda row is entered
+app.post('/api/sessions/agenda-start/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    // Clear any other active sessions first
+    await pool.query(
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
+      [req.user.id]
+    );
+    await pool.query(
+      'UPDATE tasks SET session_active = true WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Agenda start error:', error);
+    res.status(500).json({ error: 'Failed to set agenda session active' });
+  }
+});
+
+// POST /api/sessions/agenda-end/:taskId — clear active flag when leaving agenda
+app.post('/api/sessions/agenda-end/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    await pool.query(
+      'UPDATE tasks SET session_active = false WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Agenda end error:', error);
+    res.status(500).json({ error: 'Failed to clear agenda session active' });
   }
 });
 
@@ -2795,6 +2848,22 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Feedback error:', error);
     res.status(500).json({ error: 'Failed to submit feedback' });
+  }
+});
+
+// GET /api/admin/feedback — list all feedback submissions (admin only)
+app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, user_id, user_email, user_name, feedback_text, created_at
+       FROM feedback
+       ORDER BY created_at DESC
+       LIMIT 200`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get admin feedback error:', err);
+    res.status(500).json({ error: 'Failed to fetch feedback' });
   }
 });
 
@@ -3691,7 +3760,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const tasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, deadline_time, priority_order, completed, deleted, is_new, manually_created
+      `SELECT id, title, segment, class, deadline_date, deadline_time, priority_order, completed, deleted, is_new, manually_created, session_active
        FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
       [req.params.id]
     );
@@ -4136,7 +4205,6 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
        FROM tasks
        WHERE user_id = $1
          AND grade_id IS NOT NULL
-         AND deleted = false
        ORDER BY grade_id DESC
        LIMIT 20`,
       [req.user.id]
