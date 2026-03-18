@@ -1213,21 +1213,14 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     const courseAssignmentResults = await Promise.all(
       courses.map(async (course) => {
         try {
-          // Paginate through all assignments — Canvas caps per_page at 100
-          let allCourseAssignments = [];
-          let page = 1;
-          while (true) {
-            const assignmentsResponse = await axios.get(
-              `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&page=${page}`,
-              { headers, timeout: 15000 }
-            );
-            const batch = assignmentsResponse.data;
-            if (!Array.isArray(batch) || batch.length === 0) break;
-            allCourseAssignments = allCourseAssignments.concat(batch);
-            if (batch.length < 100) break; // last page
-            page++;
-          }
-          console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} total assignments (${page} page(s))`);
+          // Single-page fetch — 100 assignments per course is more than enough
+          // given the 30-day future window filter applied below
+          const assignmentsResponse = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
+            { headers, timeout: 15000 }
+          );
+          const allCourseAssignments = Array.isArray(assignmentsResponse.data) ? assignmentsResponse.data : [];
+          console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} assignments fetched`);
           return allCourseAssignments
             .filter(a => {
               if (!a.due_at) return false;
@@ -1830,6 +1823,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     let newCount = 0;
     const insertedTasks = [];
 
+    // Pre-fetch max grade_id once to avoid race conditions when multiple
+    // grade changes are detected in the same sync — increment locally
+    const gradeIdBaseResult = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [req.user.id]
+    );
+    let nextGradeId = parseInt(gradeIdBaseResult.rows[0].max_id) + 1;
+
     for (const incomingTask of sortedTasks) {
       // Check if this task already exists (match by assignment_id first, then URL)
       let existingTasksResult;
@@ -2029,17 +2030,12 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           const gradeChanged = incomingTask.currentGrade != null &&
             incomingTask.currentGrade !== existingTask.current_grade;
           if (hasCanvasData && (scoreChanged || gradeChanged)) {
-            // Get next grade_id for this user
-            const gradeIdResult = await pool.query(
-              'SELECT COALESCE(MAX(grade_id), 0) + 1 AS next_id FROM tasks WHERE user_id = $1',
-              [req.user.id]
-            );
-            const nextGradeId = gradeIdResult.rows[0].next_id;
             await pool.query(
               'UPDATE tasks SET grade_id = $1 WHERE id = $2 AND user_id = $3',
               [nextGradeId, existingTask.id, req.user.id]
             );
             console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
+            nextGradeId++;
           }
 
           // If Canvas now marks the task completed and it wasn't before, write tasks_completed row
