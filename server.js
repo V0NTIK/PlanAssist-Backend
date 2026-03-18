@@ -1209,8 +1209,6 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     console.log('\n📋 Fetching assignments (parallel)...');
     const today = new Date();
     const oneMonthFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
-    // Look back 60 days so grade changes on recently submitted assignments are detected
-    const sixtyDaysAgo = new Date(today.getTime() - 60 * 24 * 60 * 60 * 1000);
 
     const courseAssignmentResults = await Promise.all(
       courses.map(async (course) => {
@@ -1234,8 +1232,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
             .filter(a => {
               if (!a.due_at) return false;
               const dueDate = new Date(a.due_at);
-              // Include past 60 days (grade detection) and future 30 days (task planning)
-              return dueDate >= sixtyDaysAgo && dueDate <= oneMonthFromNow;
+              return dueDate >= today && dueDate <= oneMonthFromNow;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (error) {
@@ -1247,7 +1244,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
 
     // Flatten results from all courses into a single array
     const allAssignments = courseAssignmentResults.flat();
-    console.log(`✓ Found ${allAssignments.length} assignments within the past 60 days and next 30 days`);
+    console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
     
     // Step 5: Format assignments for database with time estimation
     // MIGRATION: Update any existing OSG condensed tasks with old URL formats to /modules?week=YYYY-MM-DD
@@ -4262,15 +4259,15 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
     const headers = { Authorization: `Bearer ${token}` };
     const canvasBase = CANVAS_API_BASE;
 
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
 
-    // Get distinct course_ids with tasks due in last 30 days
+    // Get distinct course_ids with tasks due in last 60 days (include deleted — graded tasks matter)
     const coursesResult = await pool.query(
       `SELECT DISTINCT course_id FROM tasks
-       WHERE user_id = $1 AND course_id IS NOT NULL AND deleted = false
+       WHERE user_id = $1 AND course_id IS NOT NULL
          AND deadline_date >= $2`,
-      [req.user.id, thirtyDaysAgo.toISOString().slice(0, 10)]
+      [req.user.id, sixtyDaysAgo.toISOString().slice(0, 10)]
     );
     const courseIds = coursesResult.rows.map(r => r.course_id);
 
@@ -4306,7 +4303,7 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
       // Find matching task in DB
       const taskResult = await pool.query(
         `SELECT id, current_score, current_grade FROM tasks
-         WHERE user_id = $1 AND assignment_id = $2 AND deleted = false LIMIT 1`,
+         WHERE user_id = $1 AND assignment_id = $2 LIMIT 1`,
         [req.user.id, sub.assignment_id]
       );
       if (taskResult.rows.length === 0) continue;
