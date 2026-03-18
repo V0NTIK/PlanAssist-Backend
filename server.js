@@ -2851,22 +2851,6 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/admin/feedback — list all feedback submissions (admin only)
-app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, user_id, user_email, user_name, feedback_text, created_at
-       FROM feedback
-       ORDER BY created_at DESC
-       LIMIT 200`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Get admin feedback error:', err);
-    res.status(500).json({ error: 'Failed to fetch feedback' });
-  }
-});
-
 // ============================================================================
 // HEALTH CHECK
 // ============================================================================
@@ -3639,6 +3623,22 @@ const auditLog = async (adminId, adminName, action, targetUserId, targetUserName
 // ============================================================================
 // ADMIN: ANNOUNCEMENTS
 // ============================================================================
+
+// GET /api/admin/feedback — list all feedback submissions (admin only)
+app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, user_id, user_email, user_name, feedback_text, created_at
+       FROM feedback
+       ORDER BY created_at DESC
+       LIMIT 200`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get admin feedback error:', err);
+    res.status(500).json({ error: 'Failed to fetch feedback' });
+  }
+});
 
 // GET /api/admin/announcements — all active (and recent inactive) for admin view
 app.get('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
