@@ -2596,9 +2596,15 @@ app.post('/api/sessions/end/:taskId', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
     const { accumulatedTime } = req.body;
+    // Update accumulated time for the specific task
     await pool.query(
-      'UPDATE tasks SET session_active = false, accumulated_time = $1 WHERE id = $2 AND user_id = $3',
+      'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
       [accumulatedTime ?? 0, taskId, req.user.id]
+    );
+    // Clear session_active for ALL tasks belonging to this user (belt-and-suspenders)
+    await pool.query(
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
+      [req.user.id]
     );
     res.json({ success: true });
   } catch (error) {
