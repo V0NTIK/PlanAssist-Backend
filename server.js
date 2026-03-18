@@ -2636,10 +2636,10 @@ app.post('/api/sessions/agenda-start/:taskId', authenticateToken, async (req, re
 // POST /api/sessions/agenda-end/:taskId — clear active flag when leaving agenda
 app.post('/api/sessions/agenda-end/:taskId', authenticateToken, async (req, res) => {
   try {
-    const { taskId } = req.params;
+    // Clear session_active for ALL tasks belonging to this user (belt-and-suspenders)
     await pool.query(
-      'UPDATE tasks SET session_active = false WHERE id = $1 AND user_id = $2',
-      [taskId, req.user.id]
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
+      [req.user.id]
     );
     res.json({ success: true });
   } catch (error) {
