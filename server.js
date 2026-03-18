@@ -1209,6 +1209,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     console.log('\n📋 Fetching assignments (parallel)...');
     const today = new Date();
     const oneMonthFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+    // Look back 60 days so grade changes on recently submitted assignments are detected
+    const sixtyDaysAgo = new Date(today.getTime() - 60 * 24 * 60 * 60 * 1000);
 
     const courseAssignmentResults = await Promise.all(
       courses.map(async (course) => {
@@ -1232,7 +1234,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
             .filter(a => {
               if (!a.due_at) return false;
               const dueDate = new Date(a.due_at);
-              return dueDate >= today && dueDate <= oneMonthFromNow;
+              // Include past 60 days (grade detection) and future 30 days (task planning)
+              return dueDate >= sixtyDaysAgo && dueDate <= oneMonthFromNow;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (error) {
@@ -1244,7 +1247,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
 
     // Flatten results from all courses into a single array
     const allAssignments = courseAssignmentResults.flat();
-    console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
+    console.log(`✓ Found ${allAssignments.length} assignments within the past 60 days and next 30 days`);
     
     // Step 5: Format assignments for database with time estimation
     // MIGRATION: Update any existing OSG condensed tasks with old URL formats to /modules?week=YYYY-MM-DD
@@ -2671,11 +2674,16 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     if (task.completed || task.deleted) {
       return res.json({ success: true, alreadyCompleted: true });
     }
+
+    // Only write to tasks_completed if actual time was logged (timeSpent > 0)
+    // If timeSpent is 0 or absent, skip the tasks_completed entry — task is
+    // marked done but no time record is created (avoids polluting analytics)
+    const hasTimeToLog = timeSpent && timeSpent > 0;
     
     // For segment tasks: check if another segment of the same task already exists
     // in tasks_completed. If so, merge by accumulating estimated_time + actual_time.
     // Always fire leaderboard + feed regardless (each segment is real work done).
-    if (task.segment && task.url) {
+    if (hasTimeToLog && task.segment && task.url) {
       const existingCompletion = await pool.query(
         'SELECT id, estimated_time, actual_time FROM tasks_completed WHERE user_id = $1 AND url = $2',
         [req.user.id, task.url]
@@ -2709,7 +2717,7 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
           ]
         );
       }
-    } else {
+    } else if (hasTimeToLog) {
       // Non-segment task: upsert — safe if already completed via another path
       await pool.query(
         `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
