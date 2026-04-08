@@ -1063,7 +1063,13 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
   try {
     console.log('\n=== CANVAS API SYNC START ===');
-    
+
+    // Clear any stale session_active flags — user cannot be in a session while syncing
+    await pool.query(
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
+      [req.user.id]
+    );
+
     // Get user's encrypted Canvas API token
     const userResult = await pool.query(
       'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
@@ -1734,6 +1740,48 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
 // TASK MANAGEMENT ROUTES
 // ============================================================================
 
+// GET /api/canvas/check-completed/:taskId — check if Canvas has marked this task submitted
+app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const taskResult = await pool.query(
+      'SELECT assignment_id, course_id, canvas_api_token, canvas_api_token_iv FROM tasks t JOIN users u ON u.id = t.user_id WHERE t.id = $1 AND t.user_id = $2',
+      [taskId, req.user.id]
+    );
+    if (taskResult.rows.length === 0) return res.json({ completed: false });
+    const task = taskResult.rows[0];
+    if (!task.assignment_id || !task.course_id) return res.json({ completed: false });
+    const encParts = task.canvas_api_token.split(':');
+    const token = decryptToken(encParts[0], task.canvas_api_token_iv, encParts[1]);
+    const subResp = await axios.get(
+      `${CANVAS_API_BASE}/courses/${task.course_id}/assignments/${task.assignment_id}/submissions/self`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+    );
+    const wf = subResp.data?.workflow_state;
+    res.json({ completed: wf === 'submitted' || wf === 'graded' });
+  } catch (err) {
+    console.error('Canvas check-completed error:', err.message);
+    res.json({ completed: false });
+  }
+});
+
+// POST /api/canvas/auto-sync — silent background sync check (does NOT clear session_active)
+app.post('/api/canvas/auto-sync', authenticateToken, async (req, res) => {
+  try {
+    const userResult = await pool.query(
+      'SELECT canvas_api_token FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!userResult.rows[0]?.canvas_api_token) {
+      return res.json({ shouldSync: false, reason: 'no_token' });
+    }
+    res.json({ shouldSync: true });
+  } catch (err) {
+    console.error('Auto-sync check error:', err);
+    res.json({ shouldSync: false });
+  }
+});
+
 // Get tasks (all incomplete tasks)
 // Calendar endpoint - returns ALL non-deleted tasks (including completed)
 // plus tasks_completed entries, merged for the calendar view
@@ -2050,10 +2098,12 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 existingTask.description || '', existingTask.url,
                 existingTask.deadline_date, existingTask.deadline_time,
                 existingTask.user_estimated_time || existingTask.estimated_time,
-                existingTask.accumulated_time || 0  // use logged time, or 0 if completed externally via Canvas
+                existingTask.accumulated_time || 0
               ]
             );
             console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
+            // Leaderboard: Canvas confirmed completion — fire leaderboard update
+            updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
           }
 
           // If task was previously ignored, treat it as a new task for sidebar/count purposes
@@ -2753,8 +2803,16 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       }
     }
     if (shouldFireFeed) {
-      updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
-      addToCompletionFeed(req.user.id, task.title, task.class).catch(err => console.error('Feed update failed:', err));
+      // Leaderboard: only fires when Canvas marks task completed (checked via canvasCompleted flag)
+      // Feed: only Canvas tasks done in Session/Agenda with time > 0
+      const canvasCompleted = req.body.canvasCompleted === true;
+      if (canvasCompleted) {
+        updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Leaderboard update failed:', err));
+      }
+      addToCompletionFeed(req.user.id, task.title, task.class, {
+        manuallyCreated: task.manually_created || false,
+        timeSpent: timeSpent || 0
+      }).catch(err => console.error('Feed update failed:', err));
     }
     
     res.json({ success: true });
@@ -3069,8 +3127,11 @@ async function updateLeaderboardOnCompletion(userId) {
 }
 
 // Helper function to add to completion feed
-async function addToCompletionFeed(userId, taskTitle, taskClass) {
+async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreated = false, timeSpent = 0 } = {}) {
   try {
+    // Feed rule: only Canvas tasks (not manually created) completed with time > 0
+    if (manuallyCreated || !(timeSpent > 0)) return;
+
     // Get user info
     const userResult = await pool.query(
       'SELECT name, grade, show_in_feed FROM users WHERE id = $1',
