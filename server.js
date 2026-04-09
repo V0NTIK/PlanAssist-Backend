@@ -1793,7 +1793,10 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
     const result = await pool.query(
       `SELECT AVG(COALESCE(current_period_score, current_score)) as avg_score, COUNT(DISTINCT user_id) as student_count
        FROM courses
-       WHERE course_id = $1 AND COALESCE(current_period_score, current_score) IS NOT NULL`,
+       WHERE course_id = $1
+         AND COALESCE(current_period_score, current_score) IS NOT NULL
+         AND COALESCE(current_period_score, current_score) != ''
+         AND enabled = true`,
       [courseId]
     );
     
