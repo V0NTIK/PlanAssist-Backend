@@ -1677,6 +1677,77 @@ async function reprioritizeTasks(userId, pool) {
 }
 
 // ============================================================================
+// SMART TASKS SCAN HELPER
+// Inserts is_new tasks into the active list using deadline-sorted order,
+// matching the frontend clearAllNewTasks algorithm exactly.
+// ============================================================================
+async function smartTasksScan(userId, poolOrClient) {
+  const db = poolOrClient;
+
+  // Get all new (unsorted) tasks
+  const newTasksRes = await db.query(
+    `SELECT id, deadline_date, deadline_time FROM tasks
+     WHERE user_id = $1 AND is_new = true AND deleted = false
+       AND (ignored = false OR ignored IS NULL)`,
+    [userId]
+  );
+  const newTasks = newTasksRes.rows;
+
+  // Get all active (already sorted) tasks
+  const activeRes = await db.query(
+    `SELECT id, deadline_date, deadline_time, priority_order FROM tasks
+     WHERE user_id = $1 AND is_new = false AND deleted = false AND completed = false
+       AND (ignored = false OR ignored IS NULL)
+     ORDER BY priority_order ASC NULLS LAST, deadline_date ASC NULLS LAST`,
+    [userId]
+  );
+  const activeTasks = activeRes.rows;
+
+  // Sort new tasks by deadline
+  const sortedNew = [...newTasks].sort((a, b) => {
+    const da = a.deadline_date ? new Date(`${a.deadline_date.toString().split('T')[0]}T${a.deadline_time || '23:59:00'}Z`) : null;
+    const db2 = b.deadline_date ? new Date(`${b.deadline_date.toString().split('T')[0]}T${b.deadline_time || '23:59:00'}Z`) : null;
+    if (!da && !db2) return 0;
+    if (!da) return 1;
+    if (!db2) return -1;
+    return da - db2;
+  });
+
+  // Build merged list: insert each new task before the first active task with a later deadline
+  let merged = [...activeTasks];
+  for (const nt of sortedNew) {
+    const ntDate = nt.deadline_date
+      ? new Date(`${nt.deadline_date.toString().split('T')[0]}T${nt.deadline_time || '23:59:00'}Z`)
+      : null;
+    const insertIdx = merged.findIndex(ex => {
+      if (!ntDate) return false;
+      const exDate = ex.deadline_date
+        ? new Date(`${ex.deadline_date.toString().split('T')[0]}T${ex.deadline_time || '23:59:00'}Z`)
+        : null;
+      if (!exDate) return false;
+      return exDate > ntDate;
+    });
+    if (insertIdx === -1) merged.push(nt);
+    else merged.splice(insertIdx, 0, nt);
+  }
+
+  // Assign sequential priority_order and clear is_new
+  for (let i = 0; i < merged.length; i++) {
+    await db.query(
+      'UPDATE tasks SET priority_order = $1, is_new = false WHERE id = $2 AND user_id = $3',
+      [i + 1, merged[i].id, userId]
+    );
+  }
+
+  // Null out priority_order for completed/deleted/ignored tasks
+  await db.query(
+    `UPDATE tasks SET priority_order = NULL
+     WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
+    [userId]
+  );
+}
+
+// ============================================================================
 // COURSES & GRADES ROUTES (for Marks tab)
 // ============================================================================
 
@@ -3594,6 +3665,17 @@ app.delete('/api/tutorials', authenticateToken, async (req, res) => {
 
 
 // POST /api/tasks/normalize — compact priority_order to remove gaps after deletions
+// POST /api/tasks/smart-scan — smart deadline-sorted insertion of is_new tasks for current user
+app.post('/api/tasks/smart-scan', authenticateToken, async (req, res) => {
+  try {
+    await smartTasksScan(req.user.id, pool);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Smart scan error:', err);
+    res.status(500).json({ error: 'Smart scan failed' });
+  }
+});
+
 app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
   try {
     // Null out priority_order for any completed, deleted, or ignored tasks
@@ -3934,41 +4016,15 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
 });
 
 
-// POST /api/admin/users/:id/tasks-scan — clear all is_new flags and reassign priority_order
+// POST /api/admin/users/:id/tasks-scan — smart deadline-sorted insertion of is_new tasks
 app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
     const targetId = parseInt(req.params.id);
     await client.query('BEGIN');
 
-    // Step 1: Clear all is_new flags for this user
-    await client.query(
-      `UPDATE tasks SET is_new = false WHERE user_id = $1 AND is_new = true AND deleted = false`,
-      [targetId]
-    );
-
-    // Step 2: Null out priority_order for completed, deleted, or ignored tasks first
-    await client.query(
-      `UPDATE tasks SET priority_order = NULL
-       WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
-      [targetId]
-    );
-
-    // Step 3: Reassign priority_order sequentially for all active, non-new tasks
-    // preserving their existing relative order (by current priority_order then deadline)
-    await client.query(
-      `WITH ordered AS (
-         SELECT id, ROW_NUMBER() OVER (
-           ORDER BY priority_order ASC NULLS LAST, deadline_date ASC NULLS LAST
-         ) AS new_order
-         FROM tasks
-         WHERE user_id = $1 AND deleted = false AND completed = false
-           AND (ignored = false OR ignored IS NULL)
-       )
-       UPDATE tasks SET priority_order = ordered.new_order
-       FROM ordered WHERE tasks.id = ordered.id`,
-      [targetId]
-    );
+    // Use the smart scan helper: inserts new tasks by deadline order into the active list
+    await smartTasksScan(targetId, client);
 
     await client.query('COMMIT');
 
@@ -3989,6 +4045,28 @@ app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, asy
     res.status(500).json({ error: 'Tasks scan failed' });
   } finally {
     client.release();
+  }
+});
+
+// POST /api/admin/tasks-scan-all — run smart tasks scan for every user
+app.post('/api/admin/tasks-scan-all', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const usersRes = await pool.query('SELECT id FROM users');
+    let processed = 0;
+    for (const row of usersRes.rows) {
+      try {
+        await smartTasksScan(row.id, pool);
+        processed++;
+      } catch (err) {
+        console.error(`Universal scan failed for user ${row.id}:`, err.message);
+      }
+    }
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'UNIVERSAL_TASKS_SCAN', null, null, { processed });
+    res.json({ success: true, processed });
+  } catch (err) {
+    console.error('Universal tasks scan error:', err);
+    res.status(500).json({ error: 'Universal scan failed' });
   }
 });
 
