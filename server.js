@@ -2585,7 +2585,7 @@ app.get('/api/sessions/tasks', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT id, title, segment, class, url, deadline_date, deadline_time,
               estimated_time, user_estimated_time, accumulated_time, session_active,
-              priority_order, points_possible
+              priority_order, points_possible, assignment_id, course_id, manually_created
        FROM tasks
        WHERE user_id = $1
          AND completed = false
