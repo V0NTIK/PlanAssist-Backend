@@ -4382,7 +4382,7 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
   }
 });
 
-// POST grade mini-sync — checks only tasks due in the last 30 days for grade changes
+// POST grade mini-sync — checks ALL user courses for grade changes and backfills missing grade_ids
 app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
@@ -4399,25 +4399,21 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
     const headers = { Authorization: `Bearer ${token}` };
     const canvasBase = CANVAS_API_BASE;
 
-    const sixtyDaysAgo = new Date();
-    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-
-    // Get distinct course_ids with tasks due in last 60 days (include deleted — graded tasks matter)
+    // Get ALL distinct course_ids for this user (no deadline filter — catch all graded work)
     const coursesResult = await pool.query(
       `SELECT DISTINCT course_id FROM tasks
-       WHERE user_id = $1 AND course_id IS NOT NULL
-         AND deadline_date >= $2`,
-      [req.user.id, sixtyDaysAgo.toISOString().slice(0, 10)]
+       WHERE user_id = $1 AND course_id IS NOT NULL`,
+      [req.user.id]
     );
     const courseIds = coursesResult.rows.map(r => r.course_id);
 
     if (courseIds.length === 0) return res.json({ updated: 0 });
 
-    // Fetch assignment submissions for those courses
+    // Fetch assignment submissions for all courses in parallel
     const submissionResults = await Promise.allSettled(
       courseIds.map(cid =>
         axios.get(
-          `${canvasBase}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
+          `${canvasBase}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=200`,
           { headers, timeout: 10000 }
         ).then(r => r.data.map(s => ({ ...s, _courseId: cid })))
       )
@@ -4442,7 +4438,7 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
 
       // Find matching task in DB
       const taskResult = await pool.query(
-        `SELECT id, current_score, current_grade FROM tasks
+        `SELECT id, current_score, current_grade, grade_id FROM tasks
          WHERE user_id = $1 AND assignment_id = $2 LIMIT 1`,
         [req.user.id, sub.assignment_id]
       );
@@ -4451,12 +4447,14 @@ app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => 
       const task = taskResult.rows[0];
       const scoreChanged = sub.score != null && String(sub.score) !== String(task.current_score);
       const gradeChanged = sub.grade != null && sub.grade !== task.current_grade;
+      // Backfill: task has a score/grade but was never assigned a grade_id
+      const needsBackfill = task.grade_id == null && (sub.score != null || sub.grade != null);
 
-      if (scoreChanged || gradeChanged) {
+      if (scoreChanged || gradeChanged || needsBackfill) {
         await pool.query(
           `UPDATE tasks SET current_score = $1, current_grade = $2, grade_id = $3
            WHERE id = $4 AND user_id = $5`,
-          [sub.score, sub.grade, nextGradeId, task.id, req.user.id]
+          [sub.score ?? task.current_score, sub.grade ?? task.current_grade, nextGradeId, task.id, req.user.id]
         );
         nextGradeId++;
         updatedCount++;
