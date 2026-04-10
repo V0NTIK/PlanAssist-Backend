@@ -2582,6 +2582,21 @@ app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/tasks/clear-all-new-flags — clears is_new for ALL new tasks for this user
+// Used by auto-sync to silently move new tasks into the list after smart-scan ordering
+app.post('/api/tasks/clear-all-new-flags', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE tasks SET is_new = FALSE WHERE user_id = $1 AND is_new = TRUE',
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Clear all new flags error:', error);
+    res.status(500).json({ error: 'Failed to clear all new flags' });
+  }
+});
+
 // Manual task completion (checkbox) - Marks as deleted to preserve URL history
 app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
