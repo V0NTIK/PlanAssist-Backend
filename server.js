@@ -2160,24 +2160,27 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             nextGradeId++;
           }
 
-          // If Canvas now marks the task completed and it wasn't before, write tasks_completed row
-          // Skip if already deleted/manually resolved by the user — they handled it themselves
-          if (!existingTask.segment && incomingTask.completed && !existingTask.completed && !existingTask.deleted) {
-            await pool.query(
-              `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
-               ON CONFLICT (id) DO NOTHING`,
-              [
-                existingTask.id, req.user.id, existingTask.title, existingTask.class,
-                existingTask.description || '', existingTask.url,
-                existingTask.deadline_date, existingTask.deadline_time,
-                existingTask.user_estimated_time || existingTask.estimated_time,
-                existingTask.accumulated_time || 0
-              ]
-            );
-            console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
-            // Leaderboard: Canvas confirmed completion — fire leaderboard update
+          // If Canvas now marks the task completed and it wasn't before:
+          if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
+            // Only write tasks_completed if user hasn't manually resolved it already
+            if (!existingTask.deleted) {
+              await pool.query(
+                `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+                 ON CONFLICT (id) DO NOTHING`,
+                [
+                  existingTask.id, req.user.id, existingTask.title, existingTask.class,
+                  existingTask.description || '', existingTask.url,
+                  existingTask.deadline_date, existingTask.deadline_time,
+                  existingTask.user_estimated_time || existingTask.estimated_time,
+                  existingTask.accumulated_time || 0
+                ]
+              );
+              console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
+            }
+            // Leaderboard fires regardless of deleted status — student submitted on Canvas
             updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
+            console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip)`);
           }
 
           // If task was previously ignored, treat it as a new task for sidebar/count purposes
@@ -2281,7 +2284,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             null, // No user override yet
             0, // No accumulated time yet
             nextPriority, // Append to end
-            !isAlreadyCompleted, // Mark as new only if not already completed
+            (!isAlreadyCompleted && !req.body.autoSync), // Skip is_new flag for auto-sync
             incomingTask.completed ?? false,
             false, // Not deleted
             incomingTask.courseId ?? null,
