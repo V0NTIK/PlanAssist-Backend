@@ -1795,7 +1795,6 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
        FROM courses
        WHERE course_id = $1
          AND COALESCE(current_period_score, current_score) IS NOT NULL
-         AND COALESCE(current_period_score, current_score) != ''
          AND enabled = true`,
       [courseId]
     );
