@@ -822,3 +822,48 @@ ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key
 
 -- 6. Ensure tutorials has the date-based unique constraint
 ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
+
+
+
+-- Feature 1: Itinerary date column
+ALTER TABLE itinerary_slots ADD COLUMN IF NOT EXISTS date DATE;
+UPDATE itinerary_slots SET date = NULL;
+ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
+ALTER TABLE itinerary_slots ADD CONSTRAINT itinerary_slots_user_date_period_unique UNIQUE (user_id, date, period);
+
+-- Feature 1: Tutorials date column (replace day)
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS date DATE;
+UPDATE tutorials SET date = NULL;
+ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
+ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
+
+-- Feature 2: Calendar week toggle columns
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS calendar_show_prev_week BOOLEAN DEFAULT false,
+  ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN DEFAULT true,
+  ADD COLUMN IF NOT EXISTS calendar_show_next_week1 BOOLEAN DEFAULT false,
+  ADD COLUMN IF NOT EXISTS calendar_show_next_week2 BOOLEAN DEFAULT false,
+  ADD COLUMN IF NOT EXISTS calendar_show_weekends BOOLEAN DEFAULT true;
+
+
+
+-- 1. Remove the now-unused calendar_today_centered column
+ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
+
+-- 2. Drop the day column from itinerary_slots
+ALTER TABLE itinerary_slots DROP COLUMN IF EXISTS day;
+
+-- 3. Drop the day column from tutorials
+ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
+
+-- 4. Drop the old day-based constraint on itinerary_slots (if it still exists)
+ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
+
+-- 5. Drop the old day-based constraint on tutorials (if it still exists)
+ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
+
+-- 6. Ensure tutorials has the date-based unique constraint
+ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
+
+
+
