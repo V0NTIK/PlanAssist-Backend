@@ -867,3 +867,19 @@ ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (u
 
 
 
+
+-- ============================================================================
+-- Goals Feature (Long-Term Planning)
+-- ============================================================================
+
+-- Academic goals: one target percentage per course per user
+CREATE TABLE IF NOT EXISTS user_goals (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    course_id BIGINT NOT NULL,
+    target_score DECIMAL(5,2) NOT NULL CHECK (target_score >= 45 AND target_score <= 100),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, course_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_goals_user_id ON user_goals(user_id);
