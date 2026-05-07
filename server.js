@@ -1790,11 +1790,17 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
     const { courseId } = req.params;
     
     const result = await pool.query(
-      `SELECT AVG(COALESCE(current_period_score, current_score)) as avg_score, COUNT(DISTINCT user_id) as student_count
+      `SELECT AVG(
+         CASE
+           WHEN current_period_score IS NOT NULL AND current_period_score::text ~ '^[0-9]+(\\.[0-9]+)?$'
+             THEN current_period_score::numeric
+           WHEN current_score IS NOT NULL AND current_score::text ~ '^[0-9]+(\\.[0-9]+)?$'
+             THEN current_score::numeric
+           ELSE NULL
+         END
+       ) as avg_score, COUNT(DISTINCT user_id) as student_count
        FROM courses
        WHERE course_id = $1
-         AND COALESCE(current_period_score, current_score) IS NOT NULL
-         AND COALESCE(current_period_score, current_score) != ''
          AND enabled = true`,
       [courseId]
     );
@@ -1806,6 +1812,120 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
   } catch (error) {
     console.error('Get course average error:', error);
     res.status(500).json({ error: 'Failed to get course average' });
+  }
+});
+
+// GET /api/tasks/grade-impact — returns { task_id: 'Low'|'Moderate'|'High' } for tasks with points_possible
+// Requires ≥10 tasks globally with same course_id + assignment_group_id. Uses group weight from assignment_groups.
+app.get('/api/tasks/grade-impact', authenticateToken, async (req, res) => {
+  try {
+    const userTasksResult = await pool.query(
+      `SELECT id, course_id, assignment_group_id, points_possible
+       FROM tasks
+       WHERE user_id = $1
+         AND deleted = false
+         AND completed = false
+         AND points_possible IS NOT NULL
+         AND points_possible > 0
+         AND course_id IS NOT NULL
+         AND assignment_group_id IS NOT NULL`,
+      [req.user.id]
+    );
+    if (userTasksResult.rows.length === 0) return res.json({});
+
+    const combos = [...new Set(userTasksResult.rows.map(r => `${r.course_id}:${r.assignment_group_id}`))];
+    const comboStats = {};
+    for (const combo of combos) {
+      const [courseId, groupId] = combo.split(':');
+      const statsResult = await pool.query(
+        `SELECT COUNT(*) as task_count, AVG(points_possible) as avg_points
+         FROM tasks
+         WHERE course_id = $1 AND assignment_group_id = $2
+           AND points_possible IS NOT NULL AND points_possible > 0`,
+        [courseId, groupId]
+      );
+      const count = parseInt(statsResult.rows[0].task_count) || 0;
+      const avg = parseFloat(statsResult.rows[0].avg_points) || 0;
+      if (count >= 10 && avg > 0) {
+        const weightResult = await pool.query(
+          `SELECT weight FROM assignment_groups
+           WHERE course_id = $1 AND group_id = $2 AND weight IS NOT NULL LIMIT 1`,
+          [courseId, groupId]
+        );
+        const weight = weightResult.rows[0]?.weight ?? 100;
+        comboStats[combo] = { avg, count, weight };
+      }
+    }
+
+    const impactMap = {};
+    for (const task of userTasksResult.rows) {
+      const combo = `${task.course_id}:${task.assignment_group_id}`;
+      const stats = comboStats[combo];
+      if (!stats) continue;
+      // ratio: task points vs group average, scaled by group weight (higher weight = higher stakes)
+      const ratio = (parseFloat(task.points_possible) / stats.avg) * (stats.weight / 100);
+      let rank;
+      if (ratio < 0.6) rank = 'Low';
+      else if (ratio < 1.4) rank = 'Moderate';
+      else rank = 'High';
+      impactMap[task.id] = rank;
+    }
+    res.json(impactMap);
+  } catch (error) {
+    console.error('Grade impact error:', error);
+    res.status(500).json({ error: 'Failed to calculate grade impact' });
+  }
+});
+
+// GET /api/goals — fetch all goals for the current user as { course_id: target_score }
+app.get('/api/goals', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT course_id, target_score FROM user_goals WHERE user_id = $1',
+      [req.user.id]
+    );
+    const goalsMap = {};
+    for (const row of result.rows) goalsMap[String(row.course_id)] = parseFloat(row.target_score);
+    res.json(goalsMap);
+  } catch (error) {
+    console.error('Get goals error:', error);
+    res.status(500).json({ error: 'Failed to get goals' });
+  }
+});
+
+// POST /api/goals — save/update all goals. Body: { goals: { course_id: target_score } }
+app.post('/api/goals', authenticateToken, async (req, res) => {
+  try {
+    const { goals } = req.body;
+    if (!goals || typeof goals !== 'object') return res.status(400).json({ error: 'goals must be an object' });
+    for (const [courseId, score] of Object.entries(goals)) {
+      const n = parseFloat(score);
+      if (isNaN(n) || n < 45 || n > 100) return res.status(400).json({ error: `Invalid score ${score} for course ${courseId}` });
+    }
+    for (const [courseId, score] of Object.entries(goals)) {
+      await pool.query(
+        `INSERT INTO user_goals (user_id, course_id, target_score, updated_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id, course_id)
+         DO UPDATE SET target_score = $3, updated_at = CURRENT_TIMESTAMP`,
+        [req.user.id, courseId, parseFloat(score)]
+      );
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Save goals error:', error);
+    res.status(500).json({ error: 'Failed to save goals' });
+  }
+});
+
+// DELETE /api/goals — discard all goals for the current user
+app.delete('/api/goals', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM user_goals WHERE user_id = $1', [req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete goals error:', error);
+    res.status(500).json({ error: 'Failed to delete goals' });
   }
 });
 
@@ -1838,19 +1958,144 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
   }
 });
 
-// POST /api/canvas/auto-sync — silent background sync check (does NOT clear session_active)
+// POST /api/canvas/auto-sync — 7-day focused background sync (does NOT clear session_active)
+// Performs a real sync limited to assignments due in the next 7 days for speed.
+// Runs full sync logic on those tasks: completed detection, grade_id tracking, estimation for new tasks.
 app.post('/api/canvas/auto-sync', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT canvas_api_token FROM users WHERE id = $1',
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
       [req.user.id]
     );
-    if (!userResult.rows[0]?.canvas_api_token) {
-      return res.json({ shouldSync: false, reason: 'no_token' });
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) return res.json({ shouldSync: false, reason: 'no_token' });
+
+    const encryptedParts = userRow.canvas_api_token.split(':');
+    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
+    if (!token) return res.json({ shouldSync: false, reason: 'decrypt_failed' });
+
+    const headers = { Authorization: `Bearer ${token}` };
+
+    // Fetch active courses
+    const coursesResp = await axios.get(
+      `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=enrollments&include[]=current_grading_period_scores&per_page=100`,
+      { headers, timeout: 10000 }
+    );
+    const courses = Array.isArray(coursesResp.data)
+      ? coursesResp.data.filter(c => c.workflow_state === 'available')
+      : [];
+    if (courses.length === 0) return res.json({ shouldSync: false, reason: 'no_courses' });
+
+    const today = new Date();
+    const sevenDaysFromNow = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    // Fetch assignments in parallel, filtered to next 7 days only
+    const courseAssignmentResults = await Promise.all(
+      courses.map(async (course) => {
+        try {
+          const resp = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
+            { headers, timeout: 12000 }
+          );
+          const all = Array.isArray(resp.data) ? resp.data : [];
+          return all
+            .filter(a => {
+              if (!a.due_at) return false;
+              const due = new Date(a.due_at);
+              return due >= today && due <= sevenDaysFromNow;
+            })
+            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
+        } catch (e) {
+          console.error(`[AUTO-SYNC] Failed course ${course.name}:`, e.message);
+          return [];
+        }
+      })
+    );
+    const allAssignments = courseAssignmentResults.flat();
+    console.log(`[AUTO-SYNC] user=${req.user.id} — ${allAssignments.length} assignments in next 7 days`);
+
+    // Pre-fetch max grade_id
+    const maxGradeResult = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [req.user.id]
+    );
+    let nextGradeId = parseInt(maxGradeResult.rows[0].max_id) + 1;
+    let newCount = 0;
+    let updatedCount = 0;
+
+    for (const assignment of allAssignments) {
+      const submission = assignment.submission || {};
+      const isSubmitted = ['submitted', 'graded'].includes(submission.workflow_state);
+      const dueDate = assignment.due_at ? assignment.due_at.split('T')[0] : null;
+      const dueTime = assignment.due_at ? assignment.due_at.split('T')[1]?.replace('Z', '') : null;
+
+      const existing = await pool.query(
+        'SELECT id, estimated_time, grade_id, current_score, current_grade FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
+        [req.user.id, assignment.id]
+      );
+
+      if (existing.rows.length > 0) {
+        const ex = existing.rows[0];
+        const scoreChanged = submission.score != null && String(submission.score) !== String(ex.current_score);
+        const gradeChanged = submission.grade != null && submission.grade !== ex.current_grade;
+        const gradeIdUpdate = (scoreChanged || gradeChanged) ? nextGradeId++ : ex.grade_id;
+        await pool.query(
+          `UPDATE tasks SET
+             completed = $1, current_score = $2, current_grade = $3, grade_id = $4,
+             deadline_date = $5, deadline_time = $6, is_missing = $7, is_late = $8, submitted_at = $9
+           WHERE id = $10 AND user_id = $11`,
+          [
+            isSubmitted,
+            submission.score ?? ex.current_score,
+            submission.grade ? String(submission.grade).slice(0, 50) : ex.current_grade,
+            gradeIdUpdate, dueDate, dueTime,
+            submission.missing || false, submission.late || false,
+            submission.submitted_at || null,
+            ex.id, req.user.id
+          ]
+        );
+        updatedCount++;
+      } else {
+        // New task — estimate and insert with is_new = true
+        const taskForEst = { title: assignment.name, class: assignment.course_name,
+          pointsPossible: assignment.points_possible || null, courseId: assignment.course_id,
+          assignmentGroupId: assignment.assignment_group_id || null };
+        const estimatedTime = await estimateTaskTime(taskForEst, req.user.id);
+        const maxP = await pool.query(
+          'SELECT MAX(priority_order) as m FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false',
+          [req.user.id]
+        );
+        const nextPriority = (maxP.rows[0].m || 0) + 1;
+        await pool.query(
+          `INSERT INTO tasks
+             (user_id, title, class, description, url, deadline_date, deadline_time,
+              estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
+              course_id, assignment_id, points_possible, assignment_group_id,
+              current_score, current_grade, grading_type, submitted_at, is_missing, is_late)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,true,$10,false,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+           ON CONFLICT (user_id, assignment_id) DO NOTHING`,
+          [
+            req.user.id, assignment.name, assignment.course_name,
+            assignment.description || '', assignment.html_url,
+            dueDate, dueTime, estimatedTime, nextPriority, isSubmitted,
+            assignment.course_id, assignment.id,
+            assignment.points_possible || null, assignment.assignment_group_id || null,
+            submission.score || null,
+            submission.grade ? String(submission.grade).slice(0, 50) : null,
+            (assignment.grading_type || 'points').slice(0, 50),
+            submission.submitted_at || null,
+            submission.missing || false, submission.late || false,
+          ]
+        );
+        newCount++;
+      }
     }
-    res.json({ shouldSync: true });
+
+    await reprioritizeTasks(req.user.id, pool);
+    console.log(`[AUTO-SYNC] Complete: ${updatedCount} updated, ${newCount} new`);
+    res.json({ shouldSync: true, newCount, updatedCount });
   } catch (err) {
-    console.error('Auto-sync check error:', err);
+    console.error('Auto-sync error:', err);
     res.json({ shouldSync: false });
   }
 });
@@ -4742,6 +4987,19 @@ app.get('/api/canvas/activity', authenticateToken, async (req, res) => {
 });
 
 app.listen(PORT, () => {
+  // Ensure user_goals table exists (migration-safe, runs once on startup)
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS user_goals (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      course_id BIGINT NOT NULL,
+      target_score DECIMAL(5,2) NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, course_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_goals_user_id ON user_goals(user_id);
+  `).catch(err => console.error('user_goals migration error:', err));
+
   console.log(`\n==============================================`);
   console.log(`  PlanAssist API v2.0 - REDESIGNED`);
   console.log(`  Server running on port ${PORT}`);
