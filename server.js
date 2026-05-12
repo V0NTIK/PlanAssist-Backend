@@ -1227,27 +1227,12 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} assignments fetched`);
           return allCourseAssignments
             .filter(a => {
-              // Classic Canvas Quizzes often have due_at = null but a valid lock_at
-              // ("Available Until" date). Fall back to lock_at so quiz assignments
-              // are not silently dropped by the !due_at guard.
-              const effectiveDue = a.due_at || a.lock_at;
-              if (!effectiveDue) return false;
-              const dueDate = new Date(effectiveDue);
+              if (!a.due_at) return false;
+              const dueDate = new Date(a.due_at);
               // Extended to 90 days — catches full-term assignments published early
               return dueDate >= today && dueDate <= ninetyDaysFromNow;
             })
-            .map(a => {
-              // Classic Quiz assignments: Canvas returns html_url as /assignments/XXXXX
-              // but the actual student-facing page is /quizzes/XXXXX. Rewrite when
-              // quiz_id is present on the assignment object.
-              let html_url = a.html_url || '';
-              if (a.quiz_id && html_url.includes('/assignments/')) {
-                html_url = html_url.replace(/\/assignments\/\d+/, `/quizzes/${a.quiz_id}`);
-              }
-              // Normalise due_at so downstream code always has a date to work with
-              const due_at = a.due_at || a.lock_at;
-              return { ...a, html_url, due_at, course_name: course.name, course_id: course.id };
-            });
+            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (error) {
           console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
           return [];
@@ -1602,7 +1587,7 @@ app.post('/api/cron/daily-email', async (req, res) => {
            WHERE user_id = $1
              AND completed = false
              AND deleted = false
-           ORDER BY priority_order ASC NULLS LAST, deadline_date ASC
+           ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST
            LIMIT 8`,
           [user.id]
         );
@@ -1664,102 +1649,16 @@ app.post('/api/cron/daily-email', async (req, res) => {
 });
 
 // ============================================================================
-// PRIORITY ORDER CLEANUP - Run after any sync/save to keep orders clean
+// PRIORITY ORDER CLEANUP - No-op stub kept for call-site compatibility.
+// priority_order column has been removed; tasks are always sorted by deadline.
 // ============================================================================
 
 async function reprioritizeTasks(userId, pool) {
-  // Step 1: Null out priority_order for completed, deleted, or ignored tasks
-  await pool.query(
-    `UPDATE tasks SET priority_order = NULL
-     WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
-    [userId]
-  );
-
-  // Step 2: Renumber remaining active tasks 1,2,3... preserving relative order
-  await pool.query(
-    `WITH ordered AS (
-      SELECT id,
-             ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
-      FROM tasks
-      WHERE user_id = $1 AND completed = false AND deleted = false AND (ignored = false OR ignored IS NULL)
-    )
-    UPDATE tasks SET priority_order = ordered.new_order
-    FROM ordered
-    WHERE tasks.id = ordered.id`,
-    [userId]
-  );
+  // priority_order removed — tasks are ordered by deadline_date / deadline_time.
+  // This stub is intentionally empty; all callers remain unchanged.
 }
 
-// ============================================================================
-// SMART TASKS SCAN HELPER
-// Inserts is_new tasks into the active list using deadline-sorted order,
-// matching the frontend clearAllNewTasks algorithm exactly.
-// ============================================================================
-async function smartTasksScan(userId, poolOrClient) {
-  const db = poolOrClient;
 
-  // Get all new (unsorted) tasks
-  const newTasksRes = await db.query(
-    `SELECT id, deadline_date, deadline_time FROM tasks
-     WHERE user_id = $1 AND is_new = true AND deleted = false
-       AND (ignored = false OR ignored IS NULL)`,
-    [userId]
-  );
-  const newTasks = newTasksRes.rows;
-
-  // Get all active (already sorted) tasks
-  const activeRes = await db.query(
-    `SELECT id, deadline_date, deadline_time, priority_order FROM tasks
-     WHERE user_id = $1 AND is_new = false AND deleted = false AND completed = false
-       AND (ignored = false OR ignored IS NULL)
-     ORDER BY priority_order ASC NULLS LAST, deadline_date ASC NULLS LAST`,
-    [userId]
-  );
-  const activeTasks = activeRes.rows;
-
-  // Sort new tasks by deadline
-  const sortedNew = [...newTasks].sort((a, b) => {
-    const da = a.deadline_date ? new Date(`${a.deadline_date.toString().split('T')[0]}T${a.deadline_time || '23:59:00'}Z`) : null;
-    const db2 = b.deadline_date ? new Date(`${b.deadline_date.toString().split('T')[0]}T${b.deadline_time || '23:59:00'}Z`) : null;
-    if (!da && !db2) return 0;
-    if (!da) return 1;
-    if (!db2) return -1;
-    return da - db2;
-  });
-
-  // Build merged list: insert each new task before the first active task with a later deadline
-  let merged = [...activeTasks];
-  for (const nt of sortedNew) {
-    const ntDate = nt.deadline_date
-      ? new Date(`${nt.deadline_date.toString().split('T')[0]}T${nt.deadline_time || '23:59:00'}Z`)
-      : null;
-    const insertIdx = merged.findIndex(ex => {
-      if (!ntDate) return false;
-      const exDate = ex.deadline_date
-        ? new Date(`${ex.deadline_date.toString().split('T')[0]}T${ex.deadline_time || '23:59:00'}Z`)
-        : null;
-      if (!exDate) return false;
-      return exDate > ntDate;
-    });
-    if (insertIdx === -1) merged.push(nt);
-    else merged.splice(insertIdx, 0, nt);
-  }
-
-  // Assign sequential priority_order and clear is_new
-  for (let i = 0; i < merged.length; i++) {
-    await db.query(
-      'UPDATE tasks SET priority_order = $1, is_new = false WHERE id = $2 AND user_id = $3',
-      [i + 1, merged[i].id, userId]
-    );
-  }
-
-  // Null out priority_order for completed/deleted/ignored tasks
-  await db.query(
-    `UPDATE tasks SET priority_order = NULL
-     WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
-    [userId]
-  );
-}
 
 // ============================================================================
 // COURSES & GRADES ROUTES (for Marks tab)
@@ -1989,147 +1888,23 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
   }
 });
 
-// POST /api/canvas/auto-sync — 7-day focused background sync (does NOT clear session_active)
-// Performs a real sync limited to assignments due in the next 7 days for speed.
-// Runs full sync logic on those tasks: completed detection, grade_id tracking, estimation for new tasks.
+// POST /api/canvas/auto-sync — check if user has a Canvas token (background sync trigger)
 app.post('/api/canvas/auto-sync', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
+      'SELECT canvas_api_token FROM users WHERE id = $1',
       [req.user.id]
     );
-    const userRow = userResult.rows[0];
-    if (!userRow?.canvas_api_token) return res.json({ shouldSync: false, reason: 'no_token' });
-
-    const encryptedParts = userRow.canvas_api_token.split(':');
-    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
-    if (!token) return res.json({ shouldSync: false, reason: 'decrypt_failed' });
-
-    const headers = { Authorization: `Bearer ${token}` };
-
-    // Fetch active courses
-    const coursesResp = await axios.get(
-      `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=enrollments&include[]=current_grading_period_scores&per_page=100`,
-      { headers, timeout: 10000 }
-    );
-    const courses = Array.isArray(coursesResp.data)
-      ? coursesResp.data.filter(c => c.workflow_state === 'available')
-      : [];
-    if (courses.length === 0) return res.json({ shouldSync: false, reason: 'no_courses' });
-
-    const today = new Date();
-    const sevenDaysFromNow = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-    // Fetch assignments in parallel, filtered to next 7 days only
-    const courseAssignmentResults = await Promise.all(
-      courses.map(async (course) => {
-        try {
-          const resp = await axios.get(
-            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
-            { headers, timeout: 12000 }
-          );
-          const all = Array.isArray(resp.data) ? resp.data : [];
-          return all
-            .filter(a => {
-              if (!a.due_at) return false;
-              const due = new Date(a.due_at);
-              return due >= today && due <= sevenDaysFromNow;
-            })
-            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
-        } catch (e) {
-          console.error(`[AUTO-SYNC] Failed course ${course.name}:`, e.message);
-          return [];
-        }
-      })
-    );
-    const allAssignments = courseAssignmentResults.flat();
-    console.log(`[AUTO-SYNC] user=${req.user.id} — ${allAssignments.length} assignments in next 7 days`);
-
-    // Pre-fetch max grade_id
-    const maxGradeResult = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextGradeId = parseInt(maxGradeResult.rows[0].max_id) + 1;
-    let newCount = 0;
-    let updatedCount = 0;
-
-    for (const assignment of allAssignments) {
-      const submission = assignment.submission || {};
-      const isSubmitted = ['submitted', 'graded'].includes(submission.workflow_state);
-      const dueDate = assignment.due_at ? assignment.due_at.split('T')[0] : null;
-      const dueTime = assignment.due_at ? assignment.due_at.split('T')[1]?.replace('Z', '') : null;
-
-      const existing = await pool.query(
-        'SELECT id, estimated_time, grade_id, current_score, current_grade FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
-        [req.user.id, assignment.id]
-      );
-
-      if (existing.rows.length > 0) {
-        const ex = existing.rows[0];
-        const scoreChanged = submission.score != null && String(submission.score) !== String(ex.current_score);
-        const gradeChanged = submission.grade != null && submission.grade !== ex.current_grade;
-        const gradeIdUpdate = (scoreChanged || gradeChanged) ? nextGradeId++ : ex.grade_id;
-        await pool.query(
-          `UPDATE tasks SET
-             completed = $1, current_score = $2, current_grade = $3, grade_id = $4,
-             deadline_date = $5, deadline_time = $6, is_missing = $7, is_late = $8, submitted_at = $9
-           WHERE id = $10 AND user_id = $11`,
-          [
-            isSubmitted,
-            submission.score ?? ex.current_score,
-            submission.grade ? String(submission.grade).slice(0, 50) : ex.current_grade,
-            gradeIdUpdate, dueDate, dueTime,
-            submission.missing || false, submission.late || false,
-            submission.submitted_at || null,
-            ex.id, req.user.id
-          ]
-        );
-        updatedCount++;
-      } else {
-        // New task — estimate and insert with is_new = true
-        const taskForEst = { title: assignment.name, class: assignment.course_name,
-          pointsPossible: assignment.points_possible || null, courseId: assignment.course_id,
-          assignmentGroupId: assignment.assignment_group_id || null };
-        const estimatedTime = await estimateTaskTime(taskForEst, req.user.id);
-        const maxP = await pool.query(
-          'SELECT MAX(priority_order) as m FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false',
-          [req.user.id]
-        );
-        const nextPriority = (maxP.rows[0].m || 0) + 1;
-        await pool.query(
-          `INSERT INTO tasks
-             (user_id, title, class, description, url, deadline_date, deadline_time,
-              estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
-              course_id, assignment_id, points_possible, assignment_group_id,
-              current_score, current_grade, grading_type, submitted_at, is_missing, is_late)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,true,$10,false,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-           ON CONFLICT (user_id, assignment_id) DO NOTHING`,
-          [
-            req.user.id, assignment.name, assignment.course_name,
-            assignment.description || '', assignment.html_url,
-            dueDate, dueTime, estimatedTime, nextPriority, isSubmitted,
-            assignment.course_id, assignment.id,
-            assignment.points_possible || null, assignment.assignment_group_id || null,
-            submission.score || null,
-            submission.grade ? String(submission.grade).slice(0, 50) : null,
-            (assignment.grading_type || 'points').slice(0, 50),
-            submission.submitted_at || null,
-            submission.missing || false, submission.late || false,
-          ]
-        );
-        newCount++;
-      }
+    if (!userResult.rows[0]?.canvas_api_token) {
+      return res.json({ shouldSync: false, reason: 'no_token' });
     }
-
-    await reprioritizeTasks(req.user.id, pool);
-    console.log(`[AUTO-SYNC] Complete: ${updatedCount} updated, ${newCount} new`);
-    res.json({ shouldSync: true, newCount, updatedCount });
+    res.json({ shouldSync: true });
   } catch (err) {
-    console.error('Auto-sync error:', err);
+    console.error('Auto-sync check error:', err);
     res.json({ shouldSync: false });
   }
 });
+
 
 // Get tasks (all incomplete tasks)
 // Calendar endpoint - returns ALL non-deleted tasks (including completed)
@@ -2139,7 +1914,7 @@ app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
     // Active + completed tasks still in tasks table (deleted=false)
     const activeResult = await pool.query(
       `SELECT id, title, segment, class, url, description,
-              deadline_date, deadline_time, priority_order,
+              deadline_date, deadline_time,
               completed, submitted_at, is_missing, is_late,
               points_possible, course_id, assignment_id
        FROM tasks
@@ -2154,7 +1929,6 @@ app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
       `SELECT id, title, NULL as segment, class, url, NULL as description,
               deadline_date,
               deadline_time,
-              NULL as priority_order,
               true as completed, completed_at as submitted_at,
               false as is_missing, false as is_late,
               NULL as points_possible, NULL as course_id, NULL as assignment_id
@@ -2183,8 +1957,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       `SELECT * FROM tasks
        WHERE user_id = $1
          AND (split_origin = false OR split_origin IS NULL)
-         AND (ignored = false OR ignored IS NULL)
-       ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST`,
+       ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST, segment ASC NULLS FIRST`,
       [req.user.id]
     );
     res.json(result.rows || []);
@@ -2194,8 +1967,8 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Save & Adjust Plan — lightweight endpoint that only updates priority_order, segment,
-// user_estimated_time, and accumulated_time for existing tasks. No Canvas sync logic.
+// Save & Adjust Plan — lightweight endpoint that only updates segment,
+// user_estimated_time, and accumulated_time for existing tasks.
 app.post('/api/tasks/save-plan', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
@@ -2205,7 +1978,6 @@ app.post('/api/tasks/save-plan', authenticateToken, async (req, res) => {
 
     console.log(`\n=== SAVE PLAN: Updating ${tasks.length} tasks for user ${req.user.id} ===`);
 
-    // Use a single transaction for speed and atomicity
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -2213,13 +1985,11 @@ app.post('/api/tasks/save-plan', authenticateToken, async (req, res) => {
         if (!task.id) continue;
         await client.query(
           `UPDATE tasks
-           SET priority_order     = $1,
-               segment            = $2,
-               user_estimated_time = $3,
-               accumulated_time   = $4
-           WHERE id = $5 AND user_id = $6`,
+           SET segment            = $1,
+               user_estimated_time = $2,
+               accumulated_time   = $3
+           WHERE id = $4 AND user_id = $5`,
           [
-            task.completed ? null : (task.priorityOrder ?? null),
             task.segment ?? null,
             task.userEstimate ?? null,
             task.accumulatedTime ?? 0,
@@ -2256,7 +2026,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     console.log(`\n=== SYNC OPERATION: Processing ${tasks.length} tasks from Canvas API ===`);
 
     // CRITICAL: Sort tasks by deadline before assigning priorities
-    // This ensures priority_order follows chronological deadline order
+    // Sort tasks by deadline — earliest first
     const sortedTasks = [...tasks].sort((a, b) => {
       const dateA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
       const dateB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
@@ -2349,10 +2119,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     submitted_at = $9,
                     is_missing = $10,
                     is_late = $11,
-                    ignored = false,
-                    is_new = $12,
-                    priority_order = $13
-                   WHERE id = $14 AND user_id = $15`,
+                    ignored = false
+                   WHERE id = $12 AND user_id = $13`,
                   [
                     incomingTask.title,
                     incomingTask.class,
@@ -2365,9 +2133,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     incomingTask.submittedAt ?? null,
                     incomingTask.isMissing ?? false,
                     incomingTask.isLate ?? false,
-                    existingTask.ignored ? true : existingTask.is_new,
-                    // null priority_order if ignored OR task is now completed
-                    existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order),
                     existingTask.id,
                     req.user.id
                   ]
@@ -2410,10 +2175,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     submitted_at = $18,
                     is_missing = $19,
                     is_late = $20,
-                    ignored = false,
-                    is_new = $21,
-                    priority_order = $22
-                   WHERE id = $23 AND user_id = $24`,
+                    ignored = false
+                   WHERE id = $21 AND user_id = $22`,
                   [
                     incomingTask.title,
                     incomingTask.description || '',
@@ -2435,8 +2198,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     incomingTask.submittedAt ?? null,
                     incomingTask.isMissing ?? false,
                     incomingTask.isLate ?? false,
-                    existingTask.ignored ? true : existingTask.is_new,
-                    existingTask.ignored ? null : (incomingTask.completed ? null : existingTask.priority_order),
                     existingTask.id,
                     req.user.id
                   ]
@@ -2509,10 +2270,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           }
 
           // If task was previously ignored, treat it as a new task for sidebar/count purposes
-          if (existingTask.ignored) {
-            newCount++;
-            console.log(`  ↩ Re-queued ignored task ID ${existingTask.id}: "${existingTask.title}" → sidebar`);
-          } else {
+          {
             const didChange = existingTask.segment ? segChanged : taskChanged;
             if (didChange) {
               console.log(`  ✓ Updated task ID ${existingTask.id}: "${existingTask.title}"`);
@@ -2558,22 +2316,13 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         console.log(`\n[NEW] Importing new task: ${incomingTask.title}`);
         console.log(`  courseId=${incomingTask.courseId}, assignmentId=${incomingTask.assignmentId}, pointsPossible=${incomingTask.pointsPossible}`);
         
-        // Get max priority for appending new tasks (only for incomplete tasks)
-        let nextPriority = null;
         const isAlreadyCompleted = incomingTask.completed ?? false;
-        if (!isAlreadyCompleted) {
-          const maxPriorityResult = await pool.query(
-            'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false AND (ignored = false OR ignored IS NULL)',
-            [req.user.id]
-          );
-          nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
-        }
 
         const result = await pool.query(
           `INSERT INTO tasks 
-           (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed, deleted,
+           (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, completed, deleted,
             course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
            ON CONFLICT (user_id, assignment_id) DO UPDATE SET
              title = EXCLUDED.title,
              description = EXCLUDED.description,
@@ -2593,8 +2342,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
              lock_at = EXCLUDED.lock_at,
              submitted_at = EXCLUDED.submitted_at,
              is_missing = EXCLUDED.is_missing,
-             is_late = EXCLUDED.is_late,
-             priority_order = CASE WHEN EXCLUDED.completed THEN NULL ELSE tasks.priority_order END
+             is_late = EXCLUDED.is_late
            RETURNING *`,
           [
             req.user.id,
@@ -2608,8 +2356,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.estimatedTime,
             null, // No user override yet
             0, // No accumulated time yet
-            nextPriority, // Append to end
-            (!isAlreadyCompleted && !req.body.autoSync), // Skip is_new flag for auto-sync
             incomingTask.completed ?? false,
             false, // Not deleted
             incomingTask.courseId ?? null,
@@ -2628,40 +2374,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         );
         
         insertedTasks.push(result.rows[0]);
-        if (!isAlreadyCompleted) {
-          newCount++;
-          console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
-        } else {
-          // Task was imported already Canvas-completed (e.g. submitted before first PlanAssist sync).
-          // The existing-task "flip" path will never fire for this task, so this is our only
-          // opportunity to count it on the leaderboard.
-          // De-dupe guard: write to tasks_completed first (ON CONFLICT DO NOTHING). If the row
-          // already exists, someone already counted it — skip. This prevents double-counting if
-          // the same completed task is re-synced on a subsequent sync.
-          const newRow = result.rows[0];
-          if (newRow) {
-            const insertResult = await pool.query(
-              `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
-               ON CONFLICT (id) DO NOTHING`,
-              [
-                newRow.id, req.user.id, incomingTask.title, incomingTask.class,
-                incomingTask.description || '', incomingTask.url,
-                incomingTask.deadlineDate, incomingTask.deadlineTime,
-                incomingTask.estimatedTime, 0
-              ]
-            );
-            if (insertResult.rowCount > 0) {
-              // Row was freshly inserted — this is a new completion, count it
-              updateLeaderboardOnCompletion(req.user.id).catch(err =>
-                console.error('Leaderboard update failed (new completed import):', err)
-              );
-              console.log(`  ★ Leaderboard updated for already-completed new import: "${incomingTask.title}" (ID: ${newRow.id})`);
-            } else {
-              console.log(`  — Already-completed task, leaderboard already counted: "${incomingTask.title}"`);
-            }
-          }
-        }
+        newCount++;
+        console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
       }
     }
 
@@ -2679,7 +2393,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
         // Old tasks (10+ days): hard suppress with deleted=true
         const deleteOld = await pool.query(
-          `UPDATE tasks SET deleted = true, ignored = true, is_new = false, priority_order = NULL
+          `UPDATE tasks SET deleted = true
            WHERE user_id = $1
              AND deleted = false
              AND course_id = ANY($2::int[])
@@ -2689,7 +2403,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
         // Recent tasks: just ignore (don't delete, not old enough)
         const ignoreRecent = await pool.query(
-          `UPDATE tasks SET ignored = true, is_new = false, priority_order = NULL
+          `UPDATE tasks SET deleted = true
            WHERE user_id = $1
              AND deleted = false
              AND course_id = ANY($2::int[])
@@ -2712,7 +2426,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // - class contains OSGAccelerate or OSG Accelerate (identifies the course)
     // Real individual OSG tasks from Canvas will have assignment_id set so are unaffected.
     const osgCleanup = await pool.query(
-      `UPDATE tasks SET deleted = true, priority_order = NULL, is_new = false
+      `UPDATE tasks SET deleted = true
        WHERE user_id = $1
          AND deleted = false
          AND assignment_id IS NULL
@@ -2765,16 +2479,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     // Reprioritize: null completed/deleted, renumber active tasks cleanly
     await reprioritizeTasks(req.user.id, pool);
 
-    // First-sync fix: if this was the user's first sync (0 existing tasks before),
-    // auto-accept all tasks so they appear in Task List immediately (not stuck in sidebar)
-    if (updatedCount === 0 && newCount > 0) {
-      await pool.query(
-        'UPDATE tasks SET is_new = false WHERE user_id = $1',
-        [req.user.id]
-      );
-      console.log(`First sync detected — auto-accepted all ${newCount} tasks`);
-    }
-
     res.json({ 
       success: true, 
       tasks: insertedTasks, 
@@ -2782,7 +2486,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         updated: updatedCount, 
         new: newCount,
         cleaned: cleanedUpCount,
-        firstSync: updatedCount === 0 && newCount > 0
       } 
     });
   } catch (error) {
@@ -2830,11 +2533,11 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
       const result = await pool.query(
         `INSERT INTO tasks 
          (user_id, title, segment, class, description, url, deadline_date, deadline_time,
-          estimated_time, user_estimated_time, accumulated_time, priority_order, is_new, completed,
+          estimated_time, user_estimated_time, accumulated_time, completed,
           course_id, assignment_id, points_possible, assignment_group_id, grading_type,
           deleted, manually_created)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15, NULL, NULL, NULL, 'points', false, false)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, NULL, NULL, NULL, 'points', false, false)
          RETURNING *`,
         [
           req.user.id,
@@ -2847,9 +2550,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
           originalTask.deadline_time,
           Math.floor(originalTask.estimated_time / segments.length),
           originalTask.user_estimated_time ? Math.floor(originalTask.user_estimated_time / segments.length) : null,
-          segAccumulatedTime, // first segment inherits all prior partial time
-          null, // priority set when user adds from sidebar
-          true, // is_new so it appears in sidebar
+          segAccumulatedTime,
           false,
           originalTask.course_id   // keep course association, but NO assignment_id
         ]
@@ -2861,7 +2562,7 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
     // Soft-delete the original task so Sync doesn't re-import it as a new task
     // The Sync will find the segments by assignment_id and update them
     await pool.query(
-      'UPDATE tasks SET deleted = true, split_origin = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, split_origin = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -2891,82 +2592,17 @@ app.patch('/api/tasks/:id/estimate', authenticateToken, async (req, res) => {
 });
 
 // Reorder tasks
+// POST /api/tasks/reorder — kept for backwards-compat; tasks are now deadline-sorted
 app.post('/api/tasks/reorder', authenticateToken, async (req, res) => {
-  try {
-    const { taskOrder } = req.body;
-
-    if (!Array.isArray(taskOrder)) {
-      return res.status(400).json({ error: 'taskOrder must be an array' });
-    }
-
-    // Update priority orders, but only for non-deleted, non-completed tasks
-    const updatePromises = taskOrder.map((taskId, index) =>
-      pool.query(
-        'UPDATE tasks SET priority_order = $1 WHERE id = $2 AND user_id = $3 AND deleted = false AND completed = false AND (ignored = false OR ignored IS NULL)',
-        [index + 1, taskId, req.user.id]
-      )
-    );
-
-    await Promise.all(updatePromises);
-
-    // Clean up: null completed/deleted, renumber active tasks
-    await reprioritizeTasks(req.user.id, pool);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Reorder tasks error:', error);
-    res.status(500).json({ error: 'Failed to reorder tasks' });
-  }
+  // priority_order removed; tasks always sort by deadline. This is a safe no-op.
+  res.json({ success: true });
 });
 
-// Toggle priority lock
-// Clear new task flags
-app.post('/api/tasks/clear-new-flags', authenticateToken, async (req, res) => {
-  try {
-    const { taskIds } = req.body;
 
-    if (!Array.isArray(taskIds) || taskIds.length === 0) {
-      return res.json({ success: true });
-    }
 
-    await pool.query(
-      'UPDATE tasks SET is_new = FALSE WHERE id = ANY($1::int[]) AND user_id = $2',
-      [taskIds, req.user.id]
-    );
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Clear new flags error:', error);
-    res.status(500).json({ error: 'Failed to clear new flags' });
-  }
-});
-
-// POST /api/tasks/sort-by-deadline — reassigns priority_order for all active tasks
-// sorted purely by deadline (earliest first), ignoring current user-set order.
+// POST /api/tasks/sort-by-deadline — no-op; tasks are always deadline-sorted now.
 app.post('/api/tasks/sort-by-deadline', authenticateToken, async (req, res) => {
-  try {
-    await pool.query(
-      `WITH deadline_ordered AS (
-         SELECT id,
-                ROW_NUMBER() OVER (
-                  ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST
-                ) AS new_order
-         FROM tasks
-         WHERE user_id = $1
-           AND completed = false
-           AND deleted = false
-           AND (ignored = false OR ignored IS NULL)
-       )
-       UPDATE tasks SET priority_order = deadline_ordered.new_order
-       FROM deadline_ordered
-       WHERE tasks.id = deadline_ordered.id`,
-      [req.user.id]
-    );
-    console.log(`[SORT BY DEADLINE] Reordered tasks for user ${req.user.id}`);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Sort by deadline error:', error);
-    res.status(500).json({ error: 'Failed to sort tasks by deadline' });
-  }
+  res.json({ success: true });
 });
 
 // Manual task completion (checkbox) - Marks as deleted to preserve URL history
@@ -2984,10 +2620,10 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // Mark task as deleted and clear priority_order
+    // Mark task as deleted
     // This preserves the URL in the database so it won't be re-imported during sync
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -3013,17 +2649,9 @@ app.patch('/api/tasks/:id/uncomplete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // Restore task by unmarking deleted and restoring to end of priority list
-    // Get max priority for appending
-    const maxPriorityResult = await pool.query(
-      'SELECT MAX(priority_order) as max_priority FROM tasks WHERE user_id = $1 AND deleted = false',
-      [req.user.id]
-    );
-    const nextPriority = (maxPriorityResult.rows[0]?.max_priority || 0) + 1;
-
     await pool.query(
-      'UPDATE tasks SET deleted = false, priority_order = $1 WHERE id = $2 AND user_id = $3',
-      [nextPriority, taskId, req.user.id]
+      'UPDATE tasks SET deleted = false WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
     );
 
     res.json({ success: true });
@@ -3048,13 +2676,13 @@ app.get('/api/sessions/tasks', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT id, title, segment, class, url, deadline_date, deadline_time,
               estimated_time, user_estimated_time, accumulated_time, session_active,
-              priority_order, points_possible, assignment_id, course_id, manually_created
+              points_possible, assignment_id, course_id, manually_created
        FROM tasks
        WHERE user_id = $1
          AND completed = false
          AND deleted = false
          AND LOWER(class) NOT LIKE '%homeroom%'
-       ORDER BY priority_order ASC NULLS LAST, deadline_date ASC`,
+       ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST, segment ASC NULLS FIRST`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -3243,7 +2871,7 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     // Mark task as deleted instead of removing from database
     // This preserves the URL in the database so it won't be re-imported during sync
     await pool.query(
-      'UPDATE tasks SET deleted = true, priority_order = NULL, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
@@ -3267,22 +2895,13 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     }
     if (shouldFireFeed) {
       // Feed: only Canvas tasks done in Session/Agenda with time > 0
+      // Leaderboard is intentionally NOT fired here — the sync endpoint (POST /api/tasks)
+      // is the authoritative source for leaderboard increments when Canvas confirms completion.
+      // Firing here too would double-count tasks completed in a session that Canvas also marks done.
       addToCompletionFeed(req.user.id, task.title, task.class, {
         manuallyCreated: task.manually_created || false,
         timeSpent: timeSpent || 0
       }).catch(err => console.error('Feed update failed:', err));
-    }
-
-    // Leaderboard: fire when Canvas confirms the submission at mark-complete time.
-    // Double-count prevention: the sync-side flip path checks `if (!existingTask.deleted)` —
-    // since we set deleted=true above, it skips the leaderboard on the next sync for this task.
-    // The tasks_completed ON CONFLICT (id) DO NOTHING guard also prevents re-insertion.
-    const { canvasCompleted } = req.body;
-    if (canvasCompleted && !task.manually_created) {
-      updateLeaderboardOnCompletion(req.user.id).catch(err =>
-        console.error('Leaderboard update failed (complete endpoint):', err)
-      );
-      console.log(`  ★ Leaderboard updated for task ${task.id} (canvasCompleted=true at complete time)`);
     }
     
     res.json({ success: true });
@@ -3292,7 +2911,6 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
   }
 });
 
-// Ignore/Delete a task (marks as deleted without moving to completed)
 // Used when user wants to permanently ignore a task from the sidebar
 app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
   try {
@@ -3307,15 +2925,13 @@ app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
     
-    // Mark task as ignored: is_new=false so it leaves the sidebar, ignored=true so
-    // it won't re-enter the sidebar until the next sync resets ignored, deleted stays FALSE
-    // so the task remains in the DB and can be reviewed in Resolved Tasks.
+    // Mark task as ignored+deleted — stays in DB so it won't be re-imported on sync.
+    // Viewable on the Resolved Tasks page.
     await pool.query(
-      'UPDATE tasks SET ignored = true, is_new = false, priority_order = NULL WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET ignored = true, deleted = true WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
-    
-    console.log(`✓ Task ${taskId} marked as ignored by user ${req.user.id}`);
+    console.log(`✓ Task ${taskId} ignored by user ${req.user.id}`);
     res.json({ success: true });
   } catch (error) {
     console.error('Ignore task error:', error);
@@ -3662,7 +3278,7 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
       const tasksResult = await pool.query(
         `SELECT id, title, segment, class, url, deadline_date, deadline_time,
                 estimated_time, user_estimated_time, accumulated_time,
-                session_active, priority_order, completed, deleted
+                session_active, completed, deleted
          FROM tasks WHERE id = ANY($1) AND user_id = $2`,
         [taskIds, req.user.id]
       );
@@ -4063,74 +3679,111 @@ app.delete('/api/tutorials', authenticateToken, async (req, res) => {
 });
 
 
-// POST /api/tasks/normalize — compact priority_order to remove gaps after deletions
-// POST /api/tasks/smart-scan — smart deadline-sorted insertion of is_new tasks for current user
-app.post('/api/tasks/smart-scan', authenticateToken, async (req, res) => {
+
+
+// POST /api/tasks/normalize — no-op; priority_order removed, tasks are deadline-sorted.
+app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
+  res.json({ success: true });
+});
+
+
+// ============================================================================
+// SESSION PRIORITIES — daily "today's focus" list
+// ============================================================================
+
+// GET /api/session-priorities/today — fetch today's priority list for current user
+app.get('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    await smartTasksScan(req.user.id, pool);
+    const todayStr = new Date().toISOString().split('T')[0];
+    const result = await pool.query(
+      `SELECT task_ids FROM session_priorities WHERE user_id = $1 AND date = $2`,
+      [req.user.id, todayStr]
+    );
+    if (result.rows.length === 0) return res.json({ taskIds: null });
+    res.json({ taskIds: result.rows[0].task_ids });
+  } catch (err) {
+    console.error('Get session priorities error:', err);
+    res.status(500).json({ error: 'Failed to get priorities' });
+  }
+});
+
+// POST /api/session-priorities/today — save today's priority list
+app.post('/api/session-priorities/today', authenticateToken, async (req, res) => {
+  try {
+    const { taskIds } = req.body;
+    if (!Array.isArray(taskIds)) return res.status(400).json({ error: 'taskIds must be an array' });
+    const todayStr = new Date().toISOString().split('T')[0];
+    await pool.query(
+      `INSERT INTO session_priorities (user_id, date, task_ids)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, date) DO UPDATE SET task_ids = EXCLUDED.task_ids, updated_at = CURRENT_TIMESTAMP`,
+      [req.user.id, todayStr, JSON.stringify(taskIds)]
+    );
     res.json({ success: true });
   } catch (err) {
-    console.error('Smart scan error:', err);
-    res.status(500).json({ error: 'Smart scan failed' });
+    console.error('Save session priorities error:', err);
+    res.status(500).json({ error: 'Failed to save priorities' });
   }
 });
 
-app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
+// DELETE /api/session-priorities/today — clear today's list (start fresh)
+app.delete('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    // Null out priority_order for any completed, deleted, or ignored tasks
+    const todayStr = new Date().toISOString().split('T')[0];
     await pool.query(
-      `UPDATE tasks SET priority_order = NULL
-       WHERE user_id = $1 AND (completed = true OR deleted = true OR ignored = true)`,
-      [req.user.id]
-    );
-    // Renumber only active (non-completed, non-deleted, non-ignored) tasks
-    await pool.query(
-      `WITH ordered AS (
-         SELECT id,
-           ROW_NUMBER() OVER (ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST) AS new_order
-         FROM tasks
-         WHERE user_id = $1 AND deleted = false AND completed = false
-           AND (ignored = false OR ignored IS NULL) AND priority_order IS NOT NULL
-       )
-       UPDATE tasks SET priority_order = ordered.new_order
-       FROM ordered WHERE tasks.id = ordered.id`,
-      [req.user.id]
+      `DELETE FROM session_priorities WHERE user_id = $1 AND date = $2`,
+      [req.user.id, todayStr]
     );
     res.json({ success: true });
-  } catch (error) {
-    console.error('Normalize priority error:', error);
-    res.status(500).json({ error: 'Failed to normalize priority' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to clear priorities' });
+  }
+});
+
+// PATCH /api/tasks/:id/segment-deadline — set a per-segment deadline override
+app.patch('/api/tasks/:id/segment-deadline', authenticateToken, async (req, res) => {
+  try {
+    const { deadlineDate, deadlineTime } = req.body;
+    const taskId = req.params.id;
+    if (!deadlineDate) return res.status(400).json({ error: 'deadlineDate required' });
+    // Only allow on segment tasks (has a segment value)
+    const check = await pool.query(
+      'SELECT id, segment FROM tasks WHERE id = $1 AND user_id = $2',
+      [taskId, req.user.id]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    if (!check.rows[0].segment) return res.status(400).json({ error: 'Can only set individual deadlines on split segments' });
+    await pool.query(
+      'UPDATE tasks SET deadline_date = $1, deadline_time = $2 WHERE id = $3 AND user_id = $4',
+      [deadlineDate, deadlineTime || null, taskId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Segment deadline error:', err);
+    res.status(500).json({ error: 'Failed to update segment deadline' });
   }
 });
 
 
-// POST /api/tasks/manual — create a user-defined task
 app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
   try {
     const { title, deadlineDate, deadlineTime, estimatedTime, description, url } = req.body;
     if (!title || !deadlineDate || !deadlineTime || !estimatedTime) {
       return res.status(400).json({ error: 'title, deadlineDate, deadlineTime, and estimatedTime are required' });
     }
-    // Get next priority
-    const maxP = await pool.query(
-      'SELECT MAX(priority_order) as max_p FROM tasks WHERE user_id = $1 AND deleted = false AND completed = false',
-      [req.user.id]
-    );
-    const nextPriority = (maxP.rows[0].max_p || 0) + 1;
-
     const result = await pool.query(
       `INSERT INTO tasks
          (user_id, title, segment, class, description, url, deadline_date, deadline_time,
-          estimated_time, user_estimated_time, accumulated_time, priority_order,
-          is_new, completed, deleted, manually_created,
+          estimated_time, user_estimated_time, accumulated_time,
+          completed, deleted, manually_created,
           course_id, assignment_id, points_possible, assignment_group_id, grading_type)
-       VALUES ($1, $2, NULL, 'Personal', $3, $4, $5, $6, $7, $7, 0, $8,
-               true, false, false, true,
+       VALUES ($1, $2, NULL, 'Personal', $3, $4, $5, $6, $7, $7, 0,
+               false, false, true,
                NULL, NULL, NULL, NULL, 'not_graded')
        RETURNING *`,
       [
         req.user.id, title, description || null, url || 'https://planassist.onrender.com/',
-        deadlineDate, deadlineTime || null, estimatedTime, nextPriority
+        deadlineDate, deadlineTime || null, estimatedTime
       ]
     );
     res.json(result.rows[0]);
@@ -4281,7 +3934,6 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
               u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
-              COUNT(DISTINCT t.id) FILTER (WHERE t.is_new = true AND t.deleted = false) AS new_tasks,
               MAX(tc.completed_at) AS last_completion,
               COUNT(DISTINCT tc.id) AS total_completed,
               EXISTS(SELECT 1 FROM tasks st WHERE st.user_id = u.id AND st.session_active = true) AS in_session
@@ -4309,14 +3961,8 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const tasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, deadline_time, priority_order, completed, deleted, is_new, manually_created, session_active
-       FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
-      [req.params.id]
-    );
-    const newTasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, deadline_time, manually_created
-       FROM tasks WHERE user_id = $1 AND is_new = true AND deleted = false
-       ORDER BY deadline_date ASC`,
+      `SELECT id, title, segment, class, deadline_date, deadline_time, completed, deleted, manually_created, session_active
+       FROM tasks WHERE user_id = $1 ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST LIMIT 100`,
       [req.params.id]
     );
     const completedRes = await pool.query(
@@ -4324,7 +3970,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
        FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 20`,
       [req.params.id]
     );
-    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, newTasks: newTasksRes.rows, recentCompletions: completedRes.rows });
+    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, recentCompletions: completedRes.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user detail' });
   }
@@ -4415,67 +4061,13 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
 });
 
 
-// POST /api/admin/users/:id/tasks-scan — smart deadline-sorted insertion of is_new tasks
-app.post('/api/admin/users/:id/tasks-scan', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const targetId = parseInt(req.params.id);
-    await client.query('BEGIN');
-
-    // Use the smart scan helper: inserts new tasks by deadline order into the active list
-    await smartTasksScan(targetId, client);
-
-    await client.query('COMMIT');
-
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'TASKS_SCAN', targetId, targetRes.rows[0]?.name, {});
-
-    // Return updated task list for the user
-    const tasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, priority_order, completed, deleted, is_new, manually_created
-       FROM tasks WHERE user_id = $1 ORDER BY priority_order ASC NULLS LAST, deadline_date ASC LIMIT 100`,
-      [targetId]
-    );
-    res.json({ success: true, tasks: tasksRes.rows });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Tasks scan error:', err);
-    res.status(500).json({ error: 'Tasks scan failed' });
-  } finally {
-    client.release();
-  }
-});
-
-// POST /api/admin/tasks-scan-all — run smart tasks scan for every user
-app.post('/api/admin/tasks-scan-all', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const usersRes = await pool.query('SELECT id FROM users');
-    let processed = 0;
-    for (const row of usersRes.rows) {
-      try {
-        await smartTasksScan(row.id, pool);
-        processed++;
-      } catch (err) {
-        console.error(`Universal scan failed for user ${row.id}:`, err.message);
-      }
-    }
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'UNIVERSAL_TASKS_SCAN', null, null, { processed });
-    res.json({ success: true, processed });
-  } catch (err) {
-    console.error('Universal tasks scan error:', err);
-    res.status(500).json({ error: 'Universal scan failed' });
-  }
-});
-
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
 app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const taskRes = await pool.query('SELECT title, user_id FROM tasks WHERE id = $1', [req.params.taskId]);
     if (taskRes.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
     const task = taskRes.rows[0];
-    await pool.query('UPDATE tasks SET deleted = true, priority_order = NULL WHERE id = $1', [req.params.taskId]);
+    await pool.query('UPDATE tasks SET deleted = true WHERE id = $1', [req.params.taskId]);
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [task.user_id]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'DELETE_TASK', task.user_id, targetRes.rows[0]?.name, { task_title: task.title, task_id: req.params.taskId });
@@ -4652,47 +4244,12 @@ app.post('/api/tasks/:taskId/restore', authenticateToken, async (req, res) => {
       [taskId, req.user.id]
     );
 
-    // Determine insertion position by deadline (same algorithm as Add All to List)
-    const activeTasks = await pool.query(
-      `SELECT id, deadline_date, deadline_time, priority_order
-       FROM tasks WHERE user_id = $1 AND deleted = FALSE AND completed = FALSE
-       AND split_origin IS NOT TRUE
-       ORDER BY priority_order ASC NULLS LAST`,
-      [req.user.id]
-    );
-
-    const taskDeadline = new Date(
-      `${task.deadline_date}T${task.deadline_time || '23:59:00'}Z`
-    );
-
-    let insertPosition = activeTasks.rows.length + 1;
-    for (const t of activeTasks.rows) {
-      const d = new Date(`${t.deadline_date}T${t.deadline_time || '23:59:00'}Z`);
-      if (taskDeadline < d) {
-        insertPosition = t.priority_order || activeTasks.rows.indexOf(t) + 1;
-        break;
-      }
-    }
-
-    // Shift tasks at or after insertPosition up by 1
+    // Restore the task — deadline order is automatic, no priority needed
     await pool.query(
-      `UPDATE tasks SET priority_order = priority_order + 1
-       WHERE user_id = $1 AND deleted = FALSE AND completed = FALSE
-       AND split_origin IS NOT TRUE
-       AND priority_order >= $2`,
-      [req.user.id, insertPosition]
+      `UPDATE tasks SET completed = FALSE, deleted = FALSE, ignored = FALSE
+       WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id]
     );
-
-    // Restore the task
-    await pool.query(
-      `UPDATE tasks SET completed = FALSE, deleted = FALSE, ignored = FALSE,
-        is_new = FALSE, priority_order = $1
-       WHERE id = $2 AND user_id = $3`,
-      [insertPosition, taskId, req.user.id]
-    );
-
-    // Renormalize to clean up any gaps
-    await reprioritizeTasks(req.user.id, pool);
 
     res.json({ success: true });
   } catch (error) {
