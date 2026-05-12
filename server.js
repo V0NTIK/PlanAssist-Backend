@@ -1227,12 +1227,27 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} assignments fetched`);
           return allCourseAssignments
             .filter(a => {
-              if (!a.due_at) return false;
-              const dueDate = new Date(a.due_at);
+              // Classic Canvas Quizzes often have due_at = null but a valid lock_at
+              // ("Available Until" date). Fall back to lock_at so quiz assignments
+              // are not silently dropped by the !due_at guard.
+              const effectiveDue = a.due_at || a.lock_at;
+              if (!effectiveDue) return false;
+              const dueDate = new Date(effectiveDue);
               // Extended to 90 days — catches full-term assignments published early
               return dueDate >= today && dueDate <= ninetyDaysFromNow;
             })
-            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
+            .map(a => {
+              // Classic Quiz assignments: Canvas returns html_url as /assignments/XXXXX
+              // but the actual student-facing page is /quizzes/XXXXX. Rewrite when
+              // quiz_id is present on the assignment object.
+              let html_url = a.html_url || '';
+              if (a.quiz_id && html_url.includes('/assignments/')) {
+                html_url = html_url.replace(/\/assignments\/\d+/, `/quizzes/${a.quiz_id}`);
+              }
+              // Normalise due_at so downstream code always has a date to work with
+              const due_at = a.due_at || a.lock_at;
+              return { ...a, html_url, due_at, course_name: course.name, course_id: course.id };
+            });
         } catch (error) {
           console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
           return [];
@@ -2613,8 +2628,40 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         );
         
         insertedTasks.push(result.rows[0]);
-        newCount++;
-        console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
+        if (!isAlreadyCompleted) {
+          newCount++;
+          console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
+        } else {
+          // Task was imported already Canvas-completed (e.g. submitted before first PlanAssist sync).
+          // The existing-task "flip" path will never fire for this task, so this is our only
+          // opportunity to count it on the leaderboard.
+          // De-dupe guard: write to tasks_completed first (ON CONFLICT DO NOTHING). If the row
+          // already exists, someone already counted it — skip. This prevents double-counting if
+          // the same completed task is re-synced on a subsequent sync.
+          const newRow = result.rows[0];
+          if (newRow) {
+            const insertResult = await pool.query(
+              `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+               ON CONFLICT (id) DO NOTHING`,
+              [
+                newRow.id, req.user.id, incomingTask.title, incomingTask.class,
+                incomingTask.description || '', incomingTask.url,
+                incomingTask.deadlineDate, incomingTask.deadlineTime,
+                incomingTask.estimatedTime, 0
+              ]
+            );
+            if (insertResult.rowCount > 0) {
+              // Row was freshly inserted — this is a new completion, count it
+              updateLeaderboardOnCompletion(req.user.id).catch(err =>
+                console.error('Leaderboard update failed (new completed import):', err)
+              );
+              console.log(`  ★ Leaderboard updated for already-completed new import: "${incomingTask.title}" (ID: ${newRow.id})`);
+            } else {
+              console.log(`  — Already-completed task, leaderboard already counted: "${incomingTask.title}"`);
+            }
+          }
+        }
       }
     }
 
@@ -3220,13 +3267,22 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     }
     if (shouldFireFeed) {
       // Feed: only Canvas tasks done in Session/Agenda with time > 0
-      // Leaderboard is intentionally NOT fired here — the sync endpoint (POST /api/tasks)
-      // is the authoritative source for leaderboard increments when Canvas confirms completion.
-      // Firing here too would double-count tasks completed in a session that Canvas also marks done.
       addToCompletionFeed(req.user.id, task.title, task.class, {
         manuallyCreated: task.manually_created || false,
         timeSpent: timeSpent || 0
       }).catch(err => console.error('Feed update failed:', err));
+    }
+
+    // Leaderboard: fire when Canvas confirms the submission at mark-complete time.
+    // Double-count prevention: the sync-side flip path checks `if (!existingTask.deleted)` —
+    // since we set deleted=true above, it skips the leaderboard on the next sync for this task.
+    // The tasks_completed ON CONFLICT (id) DO NOTHING guard also prevents re-insertion.
+    const { canvasCompleted } = req.body;
+    if (canvasCompleted && !task.manually_created) {
+      updateLeaderboardOnCompletion(req.user.id).catch(err =>
+        console.error('Leaderboard update failed (complete endpoint):', err)
+      );
+      console.log(`  ★ Leaderboard updated for task ${task.id} (canvasCompleted=true at complete time)`);
     }
     
     res.json({ success: true });
