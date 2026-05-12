@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     accumulated_time INTEGER DEFAULT 0,         -- Replaces partial_completions table
     completed BOOLEAN DEFAULT FALSE,            -- When TRUE, moves to tasks_completed
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    priority_order INTEGER,                     -- Manual priority override (NULL by default)
     is_new BOOLEAN DEFAULT FALSE,               -- Marks newly imported tasks
     deleted BOOLEAN DEFAULT FALSE,              -- Marks tasks as deleted/checked off without removing from database
     -- NEW CANVAS API FIELDS
@@ -883,3 +882,47 @@ CREATE TABLE IF NOT EXISTS user_goals (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_goals_user_id ON user_goals(user_id);
+
+
+-- ============================================================================
+-- Session Priorities Feature
+-- Stores each user's daily "today's focus" task list for the Sessions page
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS session_priorities (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    task_ids JSONB NOT NULL DEFAULT '[]',        -- Ordered array of task IDs for the day
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_priorities_user_date ON session_priorities(user_id, date);
+
+-- Migration: remove priority_order from tasks (tasks now always sort by deadline)
+ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
+
+-- Migration: add segment-level deadline override support
+-- (segments already share deadline_date/deadline_time columns — no new columns needed;
+--  the PATCH /api/tasks/:id/segment-deadline endpoint writes directly to those columns)
+
+
+-- ============================================================================
+-- Ordering System Removal Migration
+-- Remove is_new, ignored columns; these are no longer used.
+-- priority_order was already dropped in the previous migration block above.
+-- ============================================================================
+
+-- Remove is_new flag (tasks are always immediately visible, sorted by deadline)
+ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
+
+-- Remove ignored flag (tasks are now marked deleted=true instead of just ignored)
+-- Note: the ignored column is still used by the resolved tasks query (ignored=TRUE shows
+-- in resolved tasks). If you want to keep resolved-task tracking, keep this column
+-- but stop writing new is_new values. To fully remove it:
+-- ALTER TABLE tasks DROP COLUMN IF EXISTS ignored;
+-- (Only drop if you are okay losing the ignored→resolved distinction.)
+
+-- Remove the session_priorities table if recreating from scratch (idempotent):
+-- Already handled by CREATE TABLE IF NOT EXISTS above.
