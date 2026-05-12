@@ -1862,11 +1862,27 @@ app.get('/api/tasks/grade-impact', authenticateToken, async (req, res) => {
       const combo = `${task.course_id}:${task.assignment_group_id}`;
       const stats = comboStats[combo];
       if (!stats) continue;
-      // ratio: task points vs group average, scaled by group weight (higher weight = higher stakes)
-      const ratio = (parseFloat(task.points_possible) / stats.avg) * (stats.weight / 100);
+
+      // ratio: how large this task is relative to the average for its group
+      // A ratio of 1.0 = exactly average. >1 = larger than average. <1 = smaller.
+      const ratio = parseFloat(task.points_possible) / stats.avg;
+
+      // Weight factor: high-weight groups (e.g. 40%) lower the thresholds so
+      // average-sized tasks in important groups still rank Moderate/High.
+      // Low-weight groups (e.g. 5%) raise the thresholds — only outsized tasks rank up.
+      // Normalised around 25% as the baseline (typical assignment group weight).
+      const weightFactor = 25 / Math.max(stats.weight, 5);
+
+      // Thresholds scaled by weightFactor:
+      //   25%-weight group: Low < 0.75, Moderate 0.75–1.5, High > 1.5
+      //   40%-weight group: Low < 0.47, Moderate 0.47–0.94, High > 0.94 (easier to rank up)
+      //   10%-weight group: Low < 1.88, Moderate 1.88–3.75, High > 3.75 (harder to rank up)
+      const lowThreshold = 0.75 * weightFactor;
+      const highThreshold = 1.5 * weightFactor;
+
       let rank;
-      if (ratio < 0.6) rank = 'Low';
-      else if (ratio < 1.4) rank = 'Moderate';
+      if (ratio < lowThreshold) rank = 'Low';
+      else if (ratio < highThreshold) rank = 'Moderate';
       else rank = 'High';
       impactMap[task.id] = rank;
     }
