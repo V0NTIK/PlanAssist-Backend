@@ -3694,7 +3694,10 @@ app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
 // GET /api/session-priorities/today — fetch today's priority list for current user
 app.get('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
+    // Use client-supplied local date to avoid UTC vs local timezone mismatch
+    const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? req.query.date
+      : new Date().toISOString().split('T')[0];
     const result = await pool.query(
       `SELECT task_ids FROM session_priorities WHERE user_id = $1 AND date = $2`,
       [req.user.id, todayStr]
@@ -3710,9 +3713,12 @@ app.get('/api/session-priorities/today', authenticateToken, async (req, res) => 
 // POST /api/session-priorities/today — save today's priority list
 app.post('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    const { taskIds } = req.body;
+    const { taskIds, date } = req.body;
     if (!Array.isArray(taskIds)) return res.status(400).json({ error: 'taskIds must be an array' });
-    const todayStr = new Date().toISOString().split('T')[0];
+    // Use client-supplied local date to avoid UTC vs local timezone mismatch
+    const todayStr = (date && /^\d{4}-\d{2}-\d{2}$/.test(date))
+      ? date
+      : new Date().toISOString().split('T')[0];
     await pool.query(
       `INSERT INTO session_priorities (user_id, date, task_ids)
        VALUES ($1, $2, $3)
@@ -3729,7 +3735,10 @@ app.post('/api/session-priorities/today', authenticateToken, async (req, res) =>
 // DELETE /api/session-priorities/today — clear today's list (start fresh)
 app.delete('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
+    // Use client-supplied local date to avoid UTC vs local timezone mismatch
+    const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? req.query.date
+      : new Date().toISOString().split('T')[0];
     await pool.query(
       `DELETE FROM session_priorities WHERE user_id = $1 AND date = $2`,
       [req.user.id, todayStr]
