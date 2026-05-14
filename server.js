@@ -2375,7 +2375,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         
         insertedTasks.push(result.rows[0]);
         newCount++;
-        console.log(`  ✓ Created task ID ${result.rows[0].id} with priority ${nextPriority}`);
+        console.log(`  ✓ Created task ID ${result.rows[0].id}`);
       }
     }
 
