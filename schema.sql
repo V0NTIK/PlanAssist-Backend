@@ -926,3 +926,9 @@ ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
 
 -- Remove the session_priorities table if recreating from scratch (idempotent):
 -- Already handled by CREATE TABLE IF NOT EXISTS above.
+
+
+
+
+
+ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
