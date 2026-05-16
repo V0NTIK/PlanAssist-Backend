@@ -3704,16 +3704,29 @@ app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
 // GET /api/session-priorities/today — fetch today's priority list for current user
 app.get('/api/session-priorities/today', authenticateToken, async (req, res) => {
   try {
-    // Use client-supplied local date to avoid UTC vs local timezone mismatch
-    const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+    // Use client-supplied local date (avoids UTC vs local timezone mismatch for late-evening users)
+    const clientDate = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
       ? req.query.date
-      : new Date().toISOString().split('T')[0];
-    const result = await pool.query(
-      `SELECT task_ids FROM session_priorities WHERE user_id = $1 AND date = $2`,
-      [req.user.id, todayStr]
-    );
-    if (result.rows.length === 0) return res.json({ taskIds: null });
-    res.json({ taskIds: result.rows[0].task_ids });
+      : null;
+    const utcDate = new Date().toISOString().split('T')[0];
+
+    // Try client local date first, then UTC date as fallback (handles records saved before fix
+    // or when client/server are on different calendar days due to timezone offset)
+    const datesToTry = clientDate
+      ? [clientDate, ...(clientDate !== utcDate ? [utcDate] : [])]
+      : [utcDate];
+
+    let foundRow = null;
+    for (const dateStr of datesToTry) {
+      const result = await pool.query(
+        `SELECT task_ids, date FROM session_priorities WHERE user_id = $1 AND date = $2`,
+        [req.user.id, dateStr]
+      );
+      if (result.rows.length > 0) { foundRow = result.rows[0]; break; }
+    }
+
+    if (!foundRow) return res.json({ taskIds: null });
+    res.json({ taskIds: foundRow.task_ids });
   } catch (err) {
     console.error('Get session priorities error:', err);
     res.status(500).json({ error: 'Failed to get priorities' });
