@@ -1874,7 +1874,9 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
     if (taskResult.rows.length === 0) return res.json({ completed: false });
     const task = taskResult.rows[0];
     if (!task.assignment_id || !task.course_id) return res.json({ completed: false });
+    if (!task.canvas_api_token || !task.canvas_api_token_iv) return res.json({ completed: false });
     const encParts = task.canvas_api_token.split(':');
+    if (encParts.length < 2) return res.json({ completed: false });
     const token = decryptToken(encParts[0], task.canvas_api_token_iv, encParts[1]);
     const subResp = await axios.get(
       `${CANVAS_API_BASE}/courses/${task.course_id}/assignments/${task.assignment_id}/submissions/self`,
@@ -1883,6 +1885,14 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
     const wf = subResp.data?.workflow_state;
     res.json({ completed: wf === 'submitted' || wf === 'graded' });
   } catch (err) {
+    const status = err.response?.status;
+    // 401: Canvas token expired/invalid; 403: assignment type doesn't support submissions/self
+    // (e.g. quizzes, external tools); 404: assignment deleted/archived on Canvas.
+    // All are expected for certain task types — return false silently rather than polluting logs.
+    if (status === 401 || status === 403 || status === 404) {
+      return res.json({ completed: false });
+    }
+    // Unexpected error (5xx, network timeout, decrypt failure) — worth logging
     console.error('Canvas check-completed error:', err.message);
     res.json({ completed: false });
   }
