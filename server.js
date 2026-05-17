@@ -3510,7 +3510,7 @@ app.get('/api/completion-feed', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at,
-              COALESCE(cf.feed_label, 'completed') AS feed_label,
+              COALESCE(u.feed_label_selected, 'completed') AS feed_label,
               COALESCE(
                 (SELECT json_agg(json_build_object('emoji', fr.emoji, 'count', fr.cnt))
                  FROM (SELECT emoji, COUNT(*) AS cnt FROM feed_reactions WHERE feed_entry_id = cf.id GROUP BY emoji) fr),
