@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     accumulated_time INTEGER DEFAULT 0,         -- Replaces partial_completions table
     completed BOOLEAN DEFAULT FALSE,            -- When TRUE, moves to tasks_completed
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    priority_order INTEGER,                     -- Manual priority override (NULL by default)
     is_new BOOLEAN DEFAULT FALSE,               -- Marks newly imported tasks
     deleted BOOLEAN DEFAULT FALSE,              -- Marks tasks as deleted/checked off without removing from database
     -- NEW CANVAS API FIELDS
@@ -866,69 +867,226 @@ ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (u
 
 
 
+-- 1. Drop priority_order (already done if you ran the previous migration)
+ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
 
--- ============================================================================
--- Goals Feature (Long-Term Planning)
--- ============================================================================
+-- 2. Drop is_new — tasks are now always immediately visible, sorted by deadline
+ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
 
--- Academic goals: one target percentage per course per user
-CREATE TABLE IF NOT EXISTS user_goals (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    course_id BIGINT NOT NULL,
-    target_score DECIMAL(5,2) NOT NULL CHECK (target_score >= 45 AND target_score <= 100),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, course_id)
-);
+-- 3. Drop ignored — tasks are now marked deleted=true directly
+--    (Keep this if you want to preserve the ignored→resolved distinction on the Resolved Tasks page)
+-- ALTER TABLE tasks DROP COLUMN IF EXISTS ignored;
 
-CREATE INDEX IF NOT EXISTS idx_user_goals_user_id ON user_goals(user_id);
-
-
--- ============================================================================
--- Session Priorities Feature
--- Stores each user's daily "today's focus" task list for the Sessions page
--- ============================================================================
-
+-- 4. Create session_priorities table
 CREATE TABLE IF NOT EXISTS session_priorities (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     date DATE NOT NULL,
-    task_ids JSONB NOT NULL DEFAULT '[]',        -- Ordered array of task IDs for the day
+    task_ids JSONB NOT NULL DEFAULT '[]',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, date)
 );
-
 CREATE INDEX IF NOT EXISTS idx_session_priorities_user_date ON session_priorities(user_id, date);
-
--- Migration: remove priority_order from tasks (tasks now always sort by deadline)
-ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
-
--- Migration: add segment-level deadline override support
--- (segments already share deadline_date/deadline_time columns — no new columns needed;
---  the PATCH /api/tasks/:id/segment-deadline endpoint writes directly to those columns)
-
-
--- ============================================================================
--- Ordering System Removal Migration
--- Remove is_new, ignored columns; these are no longer used.
--- priority_order was already dropped in the previous migration block above.
--- ============================================================================
-
--- Remove is_new flag (tasks are always immediately visible, sorted by deadline)
-ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
-
--- Remove ignored flag (tasks are now marked deleted=true instead of just ignored)
--- Note: the ignored column is still used by the resolved tasks query (ignored=TRUE shows
--- in resolved tasks). If you want to keep resolved-task tracking, keep this column
--- but stop writing new is_new values. To fully remove it:
--- ALTER TABLE tasks DROP COLUMN IF EXISTS ignored;
--- (Only drop if you are okay losing the ignored→resolved distinction.)
-
--- Remove the session_priorities table if recreating from scratch (idempotent):
--- Already handled by CREATE TABLE IF NOT EXISTS above.
-
-
 
 
 
 ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
+
+
+
+-- ============================================================================
+-- Migration: Add last_sync column to users table
+-- Tracks when Main Sync or Background Sync last completed for a user.
+-- Used by: Diagnostics "Stale Syncs" report, login-time sync decision,
+--          Admin Console Users tab, Background Sync updated_since parameter.
+-- ============================================================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_sync TIMESTAMP;
+
+-- Backfill from MAX(tasks.created_at) for existing users so existing data
+-- doesn't make everyone appear as "never synced"
+UPDATE users u
+SET last_sync = (
+  SELECT MAX(t.created_at)
+  FROM tasks t
+  WHERE t.user_id = u.id
+)
+WHERE u.last_sync IS NULL;
+
+-- Index for Diagnostics query (ORDER BY last_sync ASC NULLS FIRST)
+CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRST);
+
+
+
+
+
+-- ============================================================================
+-- PlanAssist Feature Migration
+-- Covers: Streak Shields, Feed Labels, Reactions, Announcements targeting,
+--         Gallery badges, last_sync (if not already added)
+-- ============================================================================
+
+-- ── 1. Users table additions ────────────────────────────────────────────────
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS streak_shields_available INTEGER DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS streak_shield_mode VARCHAR(10) DEFAULT 'manual'
+    CHECK (streak_shield_mode IN ('manual', 'automatic')),
+  ADD COLUMN IF NOT EXISTS feed_label_days INTEGER DEFAULT 0,      -- days with ≥1 task completed (never resets)
+  ADD COLUMN IF NOT EXISTS feed_label_selected VARCHAR(30) DEFAULT 'completed',
+  ADD COLUMN IF NOT EXISTS last_sync TIMESTAMP;                     -- idempotent if already added
+
+-- Index for admin health score sort (last_sync)
+CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRST);
+
+-- ── 2. Streak shields log ───────────────────────────────────────────────────
+-- Each row records one day a shield was consumed (used to fill streak gaps).
+CREATE TABLE IF NOT EXISTS streak_shield_log (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    shield_date DATE NOT NULL,          -- The weekday the shield covered
+    consumed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, shield_date)        -- One shield per day per user
+);
+CREATE INDEX IF NOT EXISTS idx_streak_shield_log_user ON streak_shield_log(user_id, shield_date DESC);
+
+-- ── 3. Feed reactions ───────────────────────────────────────────────────────
+-- One reaction per user per feed entry, replace on change.
+CREATE TABLE IF NOT EXISTS feed_reactions (
+    id SERIAL PRIMARY KEY,
+    feed_entry_id INTEGER NOT NULL REFERENCES completion_feed(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji VARCHAR(10) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(feed_entry_id, user_id)      -- one reaction per user per entry
+);
+CREATE INDEX IF NOT EXISTS idx_feed_reactions_entry ON feed_reactions(feed_entry_id);
+CREATE INDEX IF NOT EXISTS idx_feed_reactions_user ON feed_reactions(user_id);
+
+-- ── 4. Feed label unlock tracking ──────────────────────────────────────────
+-- Records which labels each user has unlocked (for UI display).
+CREATE TABLE IF NOT EXISTS feed_label_unlocks (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    label VARCHAR(30) NOT NULL,
+    unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_feed_label_unlocks_user ON feed_label_unlocks(user_id);
+
+-- ── 5. Gallery badges ───────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS user_badges (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    badge_key VARCHAR(60) NOT NULL,     -- e.g. 'first_completion', 'streak_7', 'tasks_50'
+    awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, badge_key)
+);
+CREATE INDEX IF NOT EXISTS idx_user_badges_user ON user_badges(user_id);
+
+-- ── 6. Announcements: add targeting column ──────────────────────────────────
+-- 'all' = everyone, 'existing' = users created before announcement, 'new' = after
+ALTER TABLE announcements
+  ADD COLUMN IF NOT EXISTS target_audience VARCHAR(20) DEFAULT 'all'
+    CHECK (target_audience IN ('all', 'existing', 'new'));
+
+-- ── 7. Backfill: feed_label_days from existing tasks_completed data ─────────
+-- Count distinct days each user has completed ≥1 task.
+UPDATE users u
+SET feed_label_days = (
+    SELECT COUNT(DISTINCT tc.completed_at::date)
+    FROM tasks_completed tc
+    WHERE tc.user_id = u.id
+)
+WHERE feed_label_days = 0;
+
+-- ── 8. Backfill: feed_label_unlocks from current feed_label_days ────────────
+-- Unlocks all labels the user has already earned.
+DO $$
+DECLARE
+  label_thresholds INT[] := ARRAY[0,5,10,20,30,40,50,60,70,80,90,100,120,140,160,180,200,250,300,400,500];
+  label_words TEXT[] := ARRAY['completed','finished','did','handled','closed','processed','resolved',
+    'settled','finalized','accomplished','achieved','fulfilled','delivered','executed','cleared',
+    'dispatched','secured','conquered','crushed','dominated','mastered'];
+  rec RECORD;
+  i INT;
+BEGIN
+  FOR rec IN SELECT id, feed_label_days FROM users LOOP
+    FOR i IN 1..array_length(label_thresholds, 1) LOOP
+      IF rec.feed_label_days >= label_thresholds[i] THEN
+        INSERT INTO feed_label_unlocks (user_id, label)
+        VALUES (rec.id, label_words[i])
+        ON CONFLICT (user_id, label) DO NOTHING;
+      END IF;
+    END LOOP;
+    -- Set selected label to highest unlocked
+    DECLARE highest TEXT := 'completed';
+    BEGIN
+      FOR i IN REVERSE array_length(label_thresholds, 1)..1 LOOP
+        IF rec.feed_label_days >= label_thresholds[i] THEN
+          highest := label_words[i];
+          EXIT;
+        END IF;
+      END LOOP;
+      UPDATE users SET feed_label_selected = highest WHERE id = rec.id;
+    END;
+  END LOOP;
+END $$;
+
+-- ── 9. Backfill: gallery badges from existing data ──────────────────────────
+-- Badge: first_completion
+INSERT INTO user_badges (user_id, badge_key, awarded_at)
+SELECT DISTINCT tc.user_id, 'first_completion', MIN(tc.completed_at)
+FROM tasks_completed tc
+GROUP BY tc.user_id
+ON CONFLICT DO NOTHING;
+
+-- Badge: tasks_10, tasks_25, tasks_50, tasks_100, tasks_250, tasks_500
+DO $$
+DECLARE
+  thresholds INT[] := ARRAY[10,25,50,100,250,500];
+  t INT;
+  rec RECORD;
+  cnt INT;
+  aw TIMESTAMP;
+BEGIN
+  FOR rec IN SELECT user_id, COUNT(*) as total FROM tasks_completed GROUP BY user_id LOOP
+    FOREACH t IN ARRAY thresholds LOOP
+      IF rec.total >= t THEN
+        SELECT completed_at INTO aw FROM (
+          SELECT completed_at FROM tasks_completed WHERE user_id = rec.user_id
+          ORDER BY completed_at ASC LIMIT t
+        ) sub ORDER BY completed_at DESC LIMIT 1;
+        INSERT INTO user_badges (user_id, badge_key, awarded_at)
+        VALUES (rec.user_id, 'tasks_' || t, aw)
+        ON CONFLICT DO NOTHING;
+      END IF;
+    END LOOP;
+  END LOOP;
+END $$;
+
+-- Badge: streak_7, streak_14, streak_30 (best day streak from tasks_completed)
+-- (streak calculation is done client-side; we award these badges via the backend on Hub load)
+
+-- Badge: most_in_day (most tasks in a single day)
+INSERT INTO user_badges (user_id, badge_key, awarded_at)
+SELECT tc.user_id, 'most_in_day_' || MAX(daily.cnt), MIN(tc.completed_at)
+FROM tasks_completed tc
+JOIN (
+  SELECT user_id, completed_at::date AS day, COUNT(*) AS cnt
+  FROM tasks_completed
+  GROUP BY user_id, completed_at::date
+) daily ON daily.user_id = tc.user_id
+GROUP BY tc.user_id
+ON CONFLICT DO NOTHING;
+
+-- ── 10. Completion_feed: add feed_label column ──────────────────────────────
+ALTER TABLE completion_feed
+  ADD COLUMN IF NOT EXISTS feed_label VARCHAR(30) DEFAULT 'completed';
+
+
+-- Correction: Reset all users' feed_label_selected back to 'completed'
+-- The previous backfill auto-selected the highest unlocked label, but the
+-- spec says the default should always be 'completed' and users must manually choose.
+-- Unlocked labels are preserved — only the active selection is reset.
+UPDATE users SET feed_label_selected = 'completed';
+
+
