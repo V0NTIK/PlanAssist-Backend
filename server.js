@@ -3501,32 +3501,6 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
 // ADMIN: Streak shield grants
 // ============================================================================
 
-// POST /api/admin/users/:id/grant-shield — grant one streak shield to a user
-app.post('/api/admin/users/:id/grant-shield', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const targetId = req.params.id;
-    await pool.query(
-      'UPDATE users SET streak_shields_available = streak_shields_available + 1 WHERE id = $1',
-      [targetId]
-    );
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name, streak_shields_available FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_STREAK_SHIELD', parseInt(targetId), targetRes.rows[0]?.name, {});
-    res.json({ success: true, shields: targetRes.rows[0]?.streak_shields_available });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/admin/grant-shields-all — grant one shield to ALL users
-app.post('/api/admin/grant-shields-all', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const r = await pool.query('UPDATE users SET streak_shields_available = streak_shields_available + 1');
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_SHIELDS_ALL', null, null, { users_affected: r.rowCount });
-    console.log(`[ADMIN] Granted shields to ${r.rowCount} users`);
-    res.json({ success: true, affected: r.rowCount });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // ============================================================================
 // HUB FEATURES - Completion Feed & Leaderboard
 // ============================================================================
@@ -4441,6 +4415,32 @@ app.post('/api/announcements/:id/dismiss', authenticateToken, async (req, res) =
   } catch (err) {
     res.status(500).json({ error: 'Failed to dismiss' });
   }
+});
+
+// POST /api/admin/users/:id/grant-shield — grant one streak shield to a user
+app.post('/api/admin/users/:id/grant-shield', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    await pool.query(
+      'UPDATE users SET streak_shields_available = streak_shields_available + 1 WHERE id = $1',
+      [targetId]
+    );
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name, streak_shields_available FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_STREAK_SHIELD', parseInt(targetId), targetRes.rows[0]?.name, {});
+    res.json({ success: true, shields: targetRes.rows[0]?.streak_shields_available });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/admin/grant-shields-all — grant one shield to ALL users
+app.post('/api/admin/grant-shields-all', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('UPDATE users SET streak_shields_available = streak_shields_available + 1');
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_SHIELDS_ALL', null, null, { users_affected: r.rowCount });
+    console.log(`[ADMIN] Granted shields to ${r.rowCount} users`);
+    res.json({ success: true, affected: r.rowCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ============================================================================
