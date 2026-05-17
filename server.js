@@ -3200,6 +3200,333 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
   }
 });
 
+
+// ============================================================================
+// STREAK SHIELDS
+// ============================================================================
+
+// GET /api/streak/shields — get user's shield count and mode
+app.get('/api/streak/shields', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT streak_shields_available, streak_shield_mode FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    res.json({ available: r.rows[0]?.streak_shields_available ?? 0, mode: r.rows[0]?.streak_shield_mode ?? 'manual' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/streak/shields/use — manually consume one shield for a specific date
+app.post('/api/streak/shields/use', authenticateToken, async (req, res) => {
+  try {
+    const { date } = req.body; // YYYY-MM-DD local date
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date' });
+    const user = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+    if ((user.rows[0]?.streak_shields_available ?? 0) < 1) return res.status(400).json({ error: 'No shields available' });
+    await pool.query('BEGIN');
+    await pool.query(
+      'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.user.id, date]
+    );
+    await pool.query(
+      'UPDATE users SET streak_shields_available = streak_shields_available - 1 WHERE id = $1 AND streak_shields_available > 0',
+      [req.user.id]
+    );
+    await pool.query('COMMIT');
+    const updated = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+    res.json({ success: true, remaining: updated.rows[0].streak_shields_available });
+  } catch (err) { await pool.query('ROLLBACK').catch(() => {}); res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/streak/shields/auto-consume — consume shields for gap dates (automatic mode)
+app.post('/api/streak/shields/auto-consume', authenticateToken, async (req, res) => {
+  try {
+    const { gapDates } = req.body; // array of YYYY-MM-DD strings
+    if (!Array.isArray(gapDates) || gapDates.length === 0) return res.json({ consumed: 0 });
+    const user = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+    let available = user.rows[0]?.streak_shields_available ?? 0;
+    let consumed = 0;
+    await pool.query('BEGIN');
+    for (const date of gapDates) {
+      if (available <= 0) break;
+      const ins = await pool.query(
+        'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
+        [req.user.id, date]
+      );
+      if (ins.rowCount > 0) { available--; consumed++; }
+    }
+    if (consumed > 0) {
+      await pool.query(
+        'UPDATE users SET streak_shields_available = streak_shields_available - $1 WHERE id = $2',
+        [consumed, req.user.id]
+      );
+    }
+    await pool.query('COMMIT');
+    res.json({ consumed, remaining: available });
+  } catch (err) { await pool.query('ROLLBACK').catch(() => {}); res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/streak/shields/mode — toggle manual/automatic
+app.put('/api/streak/shields/mode', authenticateToken, async (req, res) => {
+  try {
+    const { mode } = req.body;
+    if (!['manual', 'automatic'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
+    await pool.query('UPDATE users SET streak_shield_mode = $1 WHERE id = $2', [mode, req.user.id]);
+    res.json({ success: true, mode });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/streak/shields/log — get shield usage log for streak calculation
+app.get('/api/streak/shields/log', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT shield_date FROM streak_shield_log WHERE user_id = $1 ORDER BY shield_date DESC',
+      [req.user.id]
+    );
+    res.json({ shieldDates: r.rows.map(row => row.shield_date) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/streak/records — get personal record and all-time record
+app.get('/api/streak/records', authenticateToken, async (req, res) => {
+  try {
+    // We compute streaks client-side; the server just returns the needed raw data
+    // For the all-time record across all users we'd need all completion dates — instead,
+    // store a high-water mark column. For now return max streak from weekly_leaderboard proxy.
+    // A dedicated max_streak column on users is cleaner — return null for now (client computes).
+    res.json({ note: 'Computed client-side from completion history' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================================
+// FEED REACTIONS
+// ============================================================================
+
+// GET /api/feed-reactions/:entryId — get reactions for a feed entry
+app.get('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT fr.emoji, COUNT(*) as count,
+              bool_or(fr.user_id = $1) as user_reacted,
+              (SELECT fr2.emoji FROM feed_reactions fr2 WHERE fr2.feed_entry_id = $2 AND fr2.user_id = $1 LIMIT 1) as user_emoji
+       FROM feed_reactions fr
+       WHERE fr.feed_entry_id = $2
+       GROUP BY fr.emoji
+       ORDER BY count DESC`,
+      [req.user.id, req.params.entryId]
+    );
+    res.json({ reactions: r.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/feed-reactions/:entryId — add or replace reaction
+app.post('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
+  try {
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ error: 'emoji required' });
+    await pool.query(
+      `INSERT INTO feed_reactions (feed_entry_id, user_id, emoji)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (feed_entry_id, user_id) DO UPDATE SET emoji = EXCLUDED.emoji, created_at = CURRENT_TIMESTAMP`,
+      [req.params.entryId, req.user.id, emoji]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/feed-reactions/:entryId — remove own reaction
+app.delete('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM feed_reactions WHERE feed_entry_id = $1 AND user_id = $2',
+      [req.params.entryId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================================
+// FEED LABELS
+// ============================================================================
+
+// GET /api/feed-label — get current label, days count, and all unlocked labels
+app.get('/api/feed-label', authenticateToken, async (req, res) => {
+  try {
+    const userR = await pool.query(
+      'SELECT feed_label_days, feed_label_selected FROM users WHERE id = $1', [req.user.id]
+    );
+    const unlocksR = await pool.query(
+      'SELECT label, unlocked_at FROM feed_label_unlocks WHERE user_id = $1 ORDER BY unlocked_at ASC', [req.user.id]
+    );
+    res.json({
+      days: userR.rows[0]?.feed_label_days ?? 0,
+      selected: userR.rows[0]?.feed_label_selected ?? 'completed',
+      unlocked: unlocksR.rows
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/feed-label — set selected label
+app.put('/api/feed-label', authenticateToken, async (req, res) => {
+  try {
+    const { label } = req.body;
+    // Verify user has unlocked this label
+    const check = await pool.query(
+      'SELECT 1 FROM feed_label_unlocks WHERE user_id = $1 AND label = $2', [req.user.id, label]
+    );
+    if (check.rowCount === 0) return res.status(403).json({ error: 'Label not unlocked' });
+    await pool.query('UPDATE users SET feed_label_selected = $1 WHERE id = $2', [label, req.user.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/feed-label/check-unlock — check if new labels were unlocked after a completion
+// Called by sync-save/mark-complete when feed_label_days may have changed
+app.post('/api/feed-label/check-unlock', authenticateToken, async (req, res) => {
+  try {
+    const LABEL_THRESHOLDS = [
+      [0,'completed'],[5,'finished'],[10,'did'],[20,'handled'],[30,'closed'],
+      [40,'processed'],[50,'resolved'],[60,'settled'],[70,'finalized'],[80,'accomplished'],
+      [90,'achieved'],[100,'fulfilled'],[120,'delivered'],[140,'executed'],[160,'cleared'],
+      [180,'dispatched'],[200,'secured'],[250,'conquered'],[300,'crushed'],[400,'dominated'],[500,'mastered']
+    ];
+    const userR = await pool.query('SELECT feed_label_days FROM users WHERE id = $1', [req.user.id]);
+    const days = userR.rows[0]?.feed_label_days ?? 0;
+    const newlyUnlocked = [];
+    for (const [threshold, label] of LABEL_THRESHOLDS) {
+      if (days >= threshold) {
+        const ins = await pool.query(
+          'INSERT INTO feed_label_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label',
+          [req.user.id, label]
+        );
+        if (ins.rowCount > 0) newlyUnlocked.push(label);
+      }
+    }
+    res.json({ newlyUnlocked, days });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================================
+// GALLERY BADGES
+// ============================================================================
+
+// GET /api/badges — get all earned badges for the user
+app.get('/api/badges', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT badge_key, awarded_at FROM user_badges WHERE user_id = $1 ORDER BY awarded_at ASC',
+      [req.user.id]
+    );
+    res.json({ badges: r.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/badges/check — check and award any new badges (called on Hub load)
+app.post('/api/badges/check', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const newBadges = [];
+
+    // Helper: award badge if not already awarded
+    const award = async (key, awardedAt) => {
+      const r = await pool.query(
+        'INSERT INTO user_badges (user_id, badge_key, awarded_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING badge_key',
+        [userId, key, awardedAt || new Date()]
+      );
+      if (r.rowCount > 0) newBadges.push(key);
+    };
+
+    // Total completions milestones
+    const totalR = await pool.query(
+      'SELECT COUNT(*) as cnt, MIN(completed_at) as first_at FROM tasks_completed WHERE user_id = $1', [userId]
+    );
+    const total = parseInt(totalR.rows[0].cnt);
+    const firstAt = totalR.rows[0].first_at;
+    if (total >= 1) await award('first_completion', firstAt);
+    for (const t of [10,25,50,100,250,500]) {
+      if (total >= t) {
+        const atR = await pool.query(
+          'SELECT completed_at FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at ASC LIMIT $2',
+          [userId, t]
+        );
+        const rows = atR.rows;
+        if (rows.length >= t) await award('tasks_' + t, rows[rows.length - 1].completed_at);
+      }
+    }
+
+    // Most tasks in a single day
+    const dayR = await pool.query(
+      `SELECT completed_at::date AS day, COUNT(*) AS cnt
+       FROM tasks_completed WHERE user_id = $1
+       GROUP BY completed_at::date ORDER BY cnt DESC LIMIT 1`,
+      [userId]
+    );
+    if (dayR.rows.length > 0) {
+      const best = parseInt(dayR.rows[0].cnt);
+      const bestDay = dayR.rows[0].day;
+      for (const t of [3,5,10,20]) {
+        if (best >= t) await award('day_' + t, bestDay);
+      }
+    }
+
+    // Streak badges (pass current streak in request body from client calculation)
+    const { currentStreak } = req.body;
+    if (currentStreak) {
+      for (const t of [7,14,30,60,100]) {
+        if (currentStreak >= t) await award('streak_' + t);
+      }
+    }
+
+    // Early bird: completed a task before 8am
+    const earlyR = await pool.query(
+      `SELECT completed_at FROM tasks_completed WHERE user_id = $1
+       AND EXTRACT(HOUR FROM completed_at AT TIME ZONE 'UTC') < 8 LIMIT 1`,
+      [userId]
+    );
+    if (earlyR.rows.length > 0) await award('early_bird', earlyR.rows[0].completed_at);
+
+    // Night owl: completed a task after 10pm
+    const nightR = await pool.query(
+      `SELECT completed_at FROM tasks_completed WHERE user_id = $1
+       AND EXTRACT(HOUR FROM completed_at AT TIME ZONE 'UTC') >= 22 LIMIT 1`,
+      [userId]
+    );
+    if (nightR.rows.length > 0) await award('night_owl', nightR.rows[0].completed_at);
+
+    res.json({ newBadges });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================================
+// ADMIN: Streak shield grants
+// ============================================================================
+
+// POST /api/admin/users/:id/grant-shield — grant one streak shield to a user
+app.post('/api/admin/users/:id/grant-shield', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    await pool.query(
+      'UPDATE users SET streak_shields_available = streak_shields_available + 1 WHERE id = $1',
+      [targetId]
+    );
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name, streak_shields_available FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_STREAK_SHIELD', parseInt(targetId), targetRes.rows[0]?.name, {});
+    res.json({ success: true, shields: targetRes.rows[0]?.streak_shields_available });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/admin/grant-shields-all — grant one shield to ALL users
+app.post('/api/admin/grant-shields-all', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('UPDATE users SET streak_shields_available = streak_shields_available + 1');
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_SHIELDS_ALL', null, null, { users_affected: r.rowCount });
+    console.log(`[ADMIN] Granted shields to ${r.rowCount} users`);
+    res.json({ success: true, affected: r.rowCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ============================================================================
 // HUB FEATURES - Completion Feed & Leaderboard
 // ============================================================================
@@ -3208,13 +3535,21 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 app.get('/api/completion-feed', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at
+      `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at,
+              COALESCE(cf.feed_label, 'completed') AS feed_label,
+              COALESCE(
+                (SELECT json_agg(json_build_object('emoji', fr.emoji, 'count', fr.cnt))
+                 FROM (SELECT emoji, COUNT(*) AS cnt FROM feed_reactions WHERE feed_entry_id = cf.id GROUP BY emoji) fr),
+                '[]'::json
+              ) AS reactions,
+              (SELECT fr2.emoji FROM feed_reactions fr2 WHERE fr2.feed_entry_id = cf.id AND fr2.user_id = $1 LIMIT 1) AS user_reaction
        FROM completion_feed cf
        JOIN users u ON cf.user_id = u.id
        WHERE u.show_in_feed = true
        AND cf.completed_at > NOW() - INTERVAL '7 days'
        ORDER BY cf.completed_at DESC
-       LIMIT 50`
+       LIMIT 50`,
+      [req.user.id]
     );
     
     res.json(result.rows);
@@ -3340,7 +3675,7 @@ async function updateLeaderboardOnCompletion(userId) {
   try {
     // Get user info
     const userResult = await pool.query(
-      'SELECT name, grade, show_in_feed FROM users WHERE id = $1',
+      'SELECT name, grade, show_in_feed, feed_label_selected FROM users WHERE id = $1',
       [userId]
     );
     
@@ -3387,9 +3722,9 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
     
     // Add to completion feed
     await pool.query(
-      `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at)
-       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-      [userId, user.name, user.grade, taskTitle, taskClass]
+      `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at, feed_label)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6)`,
+      [userId, user.name, user.grade, taskTitle, taskClass, user.feed_label_selected || 'completed']
     );
     
     // Keep only last 1000 entries to prevent table bloat
@@ -4047,8 +4382,13 @@ app.get('/api/announcements', authenticateToken, async (req, res) => {
          ) as dismissed
        FROM announcements a
        WHERE a.is_active = true
+         AND (
+           COALESCE(a.target_audience, 'all') = 'all'
+           OR (a.target_audience = 'existing' AND $2 <= a.created_at)
+           OR (a.target_audience = 'new' AND $2 > a.created_at)
+         )
        ORDER BY a.created_at DESC`,
-      [req.user.id]
+      [req.user.id, (await pool.query('SELECT created_at FROM users WHERE id = $1', [req.user.id])).rows[0]?.created_at]
     );
     res.json(result.rows);
   } catch (err) {
@@ -4063,9 +4403,10 @@ app.post('/api/admin/announcements', authenticateToken, requireAdmin, async (req
     if (!message || !type) return res.status(400).json({ error: 'message and type required' });
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const adminName = adminRes.rows[0]?.name || 'Admin';
+    const audience = ['all', 'existing', 'new'].includes(req.body.target_audience) ? req.body.target_audience : 'all';
     const result = await pool.query(
-      `INSERT INTO announcements (author_id, author_name, message, type) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.user.id, adminName, message, type]
+      `INSERT INTO announcements (author_id, author_name, message, type, target_audience) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [req.user.id, adminName, message, type, audience]
     );
     await auditLog(req.user.id, adminName, 'CREATE_ANNOUNCEMENT', null, null, { message, type });
     res.json(result.rows[0]);
@@ -4112,9 +4453,12 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
               u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at, u.last_sync,
+              u.streak_shields_available,
+              u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
               MAX(tc.completed_at) AS last_completion,
               COUNT(DISTINCT tc.id) AS total_completed,
+              COUNT(DISTINCT tc.id) FILTER (WHERE tc.completed_at >= NOW() - INTERVAL '7 days') AS completed_this_week,
               EXISTS(SELECT 1 FROM tasks st WHERE st.user_id = u.id AND st.session_active = true) AS in_session
        FROM users u
        LEFT JOIN tasks t ON t.user_id = u.id
