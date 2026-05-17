@@ -3503,7 +3503,7 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
 // HUB FEATURES - Completion Feed & Leaderboard
 // ============================================================================
 
-// Get recent completion feed (last 50 completions from opted-in users)
+// Get recent completion feed (last 30 completions from opted-in users)
 app.get('/api/completion-feed', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -3518,9 +3518,9 @@ app.get('/api/completion-feed', authenticateToken, async (req, res) => {
        FROM completion_feed cf
        JOIN users u ON cf.user_id = u.id
        WHERE u.show_in_feed = true
-       AND cf.completed_at > NOW() - INTERVAL '7 days'
+       AND cf.completed_at > NOW() - INTERVAL '14 days'
        ORDER BY cf.completed_at DESC
-       LIMIT 10`,
+       LIMIT 30`,
       [req.user.id]
     );
     
@@ -4496,14 +4496,21 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   try {
     const userRes = await pool.query(
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
-              present_periods, schedule_enhanced, created_at FROM users WHERE id = $1`,
+              present_periods, schedule_enhanced, created_at,
+              streak_shields_available, insignia_days, insignia_selected
+       FROM users WHERE id = $1`,
       [req.params.id]
     );
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
+    // Only fetch active (non-deleted, non-completed) tasks for the Active Tasks panel
     const tasksRes = await pool.query(
-      `SELECT id, title, segment, class, deadline_date, deadline_time, completed, deleted, manually_created, session_active
-       FROM tasks WHERE user_id = $1 ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST LIMIT 100`,
+      `SELECT id, title, segment, class, deadline_date, deadline_time,
+              completed, deleted, manually_created, session_active
+       FROM tasks
+       WHERE user_id = $1 AND deleted = false AND completed = false
+       ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST
+       LIMIT 100`,
       [req.params.id]
     );
     const completedRes = await pool.query(
