@@ -3346,57 +3346,55 @@ app.delete('/api/feed-reactions/:entryId', authenticateToken, async (req, res) =
 });
 
 // ============================================================================
-// FEED LABELS
+// INSIGNIA
 // ============================================================================
 
-// GET /api/feed-label — get current label, days count, and all unlocked labels
-app.get('/api/feed-label', authenticateToken, async (req, res) => {
+// GET /api/insignia — get current insignia, days count, and all unlocked insignias
+app.get('/api/insignia', authenticateToken, async (req, res) => {
   try {
     const userR = await pool.query(
-      'SELECT feed_label_days, feed_label_selected FROM users WHERE id = $1', [req.user.id]
+      'SELECT insignia_days, insignia_selected FROM users WHERE id = $1', [req.user.id]
     );
     const unlocksR = await pool.query(
-      'SELECT label, unlocked_at FROM feed_label_unlocks WHERE user_id = $1 ORDER BY unlocked_at ASC', [req.user.id]
+      'SELECT label, unlocked_at FROM insignia_unlocks WHERE user_id = $1 ORDER BY unlocked_at ASC', [req.user.id]
     );
     res.json({
-      days: userR.rows[0]?.feed_label_days ?? 0,
-      selected: userR.rows[0]?.feed_label_selected ?? 'completed',
+      days: userR.rows[0]?.insignia_days ?? 0,
+      selected: userR.rows[0]?.insignia_selected ?? 'Default',
       unlocked: unlocksR.rows
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PUT /api/feed-label — set selected label
-app.put('/api/feed-label', authenticateToken, async (req, res) => {
+// PUT /api/insignia — set selected insignia
+app.put('/api/insignia', authenticateToken, async (req, res) => {
   try {
     const { label } = req.body;
     // Verify user has unlocked this label
     const check = await pool.query(
-      'SELECT 1 FROM feed_label_unlocks WHERE user_id = $1 AND label = $2', [req.user.id, label]
+      'SELECT 1 FROM insignia_unlocks WHERE user_id = $1 AND label = $2', [req.user.id, label]
     );
     if (check.rowCount === 0) return res.status(403).json({ error: 'Label not unlocked' });
-    await pool.query('UPDATE users SET feed_label_selected = $1 WHERE id = $2', [label, req.user.id]);
+    await pool.query('UPDATE users SET insignia_selected = $1 WHERE id = $2', [label, req.user.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/feed-label/check-unlock — check if new labels were unlocked after a completion
-// Called by sync-save/mark-complete when feed_label_days may have changed
-app.post('/api/feed-label/check-unlock', authenticateToken, async (req, res) => {
+// POST /api/insignia/check-unlock — check if new insignias were unlocked after a completion
+// Called by sync-save/mark-complete when insignia_days may have changed
+app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
-    const LABEL_THRESHOLDS = [
-      [0,'completed'],[5,'finished'],[10,'did'],[20,'handled'],[30,'banned'],
-      [40,'processed'],[50,'resolved'],[60,'settled'],[70,'finalized'],[80,'accomplished'],
-      [90,'achieved'],[100,'fulfilled'],[120,'delivered'],[140,'executed'],[160,'cleared'],
-      [180,'dispatched'],[200,'secured'],[250,'conquered'],[300,'crushed'],[400,'dominated'],[500,'mastered']
+    const INSIGNIA_THRESHOLDS = [
+      [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
+      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Aether']
     ];
-    const userR = await pool.query('SELECT feed_label_days FROM users WHERE id = $1', [req.user.id]);
-    const days = userR.rows[0]?.feed_label_days ?? 0;
+    const userR = await pool.query('SELECT insignia_days FROM users WHERE id = $1', [req.user.id]);
+    const days = userR.rows[0]?.insignia_days ?? 0;
     const newlyUnlocked = [];
-    for (const [threshold, label] of LABEL_THRESHOLDS) {
+    for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
       if (days >= threshold) {
         const ins = await pool.query(
-          'INSERT INTO feed_label_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label',
+          'INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label',
           [req.user.id, label]
         );
         if (ins.rowCount > 0) newlyUnlocked.push(label);
@@ -3510,7 +3508,7 @@ app.get('/api/completion-feed', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at,
-              COALESCE(u.feed_label_selected, 'completed') AS feed_label,
+              COALESCE(u.insignia_selected, 'Default') AS insignia,
               COALESCE(
                 (SELECT json_agg(json_build_object('emoji', fr.emoji, 'count', fr.cnt))
                  FROM (SELECT emoji, COUNT(*) AS cnt FROM feed_reactions WHERE feed_entry_id = cf.id GROUP BY emoji) fr),
@@ -3544,12 +3542,14 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Get top 10 for this grade this week
+    // Get top 10 for this grade this week, join with users for insignia
     const result = await pool.query(
-      `SELECT user_name, grade, tasks_completed, updated_at
-       FROM weekly_leaderboard
-       WHERE grade = $1 AND week_start = $2
-       ORDER BY tasks_completed DESC, updated_at ASC
+      `SELECT wl.user_name, wl.grade, wl.tasks_completed, wl.updated_at,
+              COALESCE(u.insignia_selected, 'Default') AS insignia
+       FROM weekly_leaderboard wl
+       LEFT JOIN users u ON u.id = wl.user_id
+       WHERE wl.grade = $1 AND wl.week_start = $2
+       ORDER BY wl.tasks_completed DESC, wl.updated_at ASC
        LIMIT 10`,
       [grade, currentWeekStart]
     );
@@ -3649,7 +3649,7 @@ async function updateLeaderboardOnCompletion(userId) {
   try {
     // Get user info
     const userResult = await pool.query(
-      'SELECT name, grade, show_in_feed, feed_label_selected FROM users WHERE id = $1',
+      'SELECT name, grade, show_in_feed, insignia_selected FROM users WHERE id = $1',
       [userId]
     );
     
@@ -3686,7 +3686,7 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
 
     // Get user info
     const userResult = await pool.query(
-      'SELECT name, grade, show_in_feed, feed_label_selected FROM users WHERE id = $1',
+      'SELECT name, grade, show_in_feed, insignia_selected FROM users WHERE id = $1',
       [userId]
     );
     
@@ -3694,7 +3694,7 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
     
     const user = userResult.rows[0];
     
-    // Increment feed_label_days if this is the user's first completion today (UTC date)
+    // Increment insignia_days if this is the user's first completion today (UTC date)
     const todayUtc = new Date().toISOString().slice(0, 10);
     const alreadyTodayRes = await pool.query(
       `SELECT 1 FROM completion_feed
@@ -3704,17 +3704,17 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
     if (alreadyTodayRes.rowCount === 0) {
       // First completion of today — increment the days counter
       await pool.query(
-        'UPDATE users SET feed_label_days = feed_label_days + 1 WHERE id = $1',
+        'UPDATE users SET insignia_days = insignia_days + 1 WHERE id = $1',
         [userId]
       );
-      console.log(`[FEED LABEL] Incremented feed_label_days for user ${userId}`);
+      console.log(`[INSIGNIA] Incremented insignia_days for user ${userId}`);
     }
 
     // Add to completion feed
     await pool.query(
-      `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at, feed_label)
+      `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at, insignia)
        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6)`,
-      [userId, user.name, user.grade, taskTitle, taskClass, user.feed_label_selected || 'completed']
+      [userId, user.name, user.grade, taskTitle, taskClass, user.insignia_selected || 'Default']
     );
     
     // Keep only last 1000 entries to prevent table bloat
