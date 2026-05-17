@@ -3681,6 +3681,24 @@ async function updateLeaderboardOnCompletion(userId) {
 // Helper function to add to completion feed
 async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreated = false, timeSpent = 0 } = {}) {
   try {
+    // ── Always increment insignia_days on the first completion of each UTC day ──
+    // This runs regardless of feed opt-in, manual creation, or time spent,
+    // so insignia_days reliably reflects every day the user completes ≥1 task.
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const alreadyTodayRes = await pool.query(
+      `SELECT 1 FROM tasks_completed
+       WHERE user_id = $1 AND completed_at::date = $2::date LIMIT 1`,
+      [userId, todayUtc]
+    );
+    if (alreadyTodayRes.rowCount === 0) {
+      await pool.query(
+        'UPDATE users SET insignia_days = insignia_days + 1 WHERE id = $1',
+        [userId]
+      );
+      console.log(`[INSIGNIA] Incremented insignia_days for user ${userId}`);
+    }
+
+    // ── Feed entry: only Canvas tasks completed with time > 0 ──
     // Feed rule: only Canvas tasks (not manually created) completed with time > 0
     if (manuallyCreated || !(timeSpent > 0)) return;
 
@@ -3689,26 +3707,10 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
       'SELECT name, grade, show_in_feed, insignia_selected FROM users WHERE id = $1',
       [userId]
     );
-    
+
     if (userResult.rows.length === 0 || !userResult.rows[0].show_in_feed) return;
-    
+
     const user = userResult.rows[0];
-    
-    // Increment insignia_days if this is the user's first completion today (UTC date)
-    const todayUtc = new Date().toISOString().slice(0, 10);
-    const alreadyTodayRes = await pool.query(
-      `SELECT 1 FROM completion_feed
-       WHERE user_id = $1 AND completed_at::date = $2::date LIMIT 1`,
-      [userId, todayUtc]
-    );
-    if (alreadyTodayRes.rowCount === 0) {
-      // First completion of today — increment the days counter
-      await pool.query(
-        'UPDATE users SET insignia_days = insignia_days + 1 WHERE id = $1',
-        [userId]
-      );
-      console.log(`[INSIGNIA] Incremented insignia_days for user ${userId}`);
-    }
 
     // Add to completion feed
     await pool.query(
