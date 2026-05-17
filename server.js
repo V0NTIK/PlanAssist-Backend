@@ -1983,8 +1983,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
     let nextGradeId = parseInt(gradeIdRes.rows[0].max_id) + 1;
 
     const sortedTasks = [...tasks].sort((a, b) => {
-      const dA = new Date(\`\${a.deadlineDate}T\${a.deadlineTime || '23:59:59'}Z\`);
-      const dB = new Date(\`\${b.deadlineDate}T\${b.deadlineTime || '23:59:59'}Z\`);
+      const dA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
+      const dB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
       return dA - dB;
     });
 
@@ -2004,7 +2004,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
 
       if (existing) {
         if (existing.manually_created) {
-          console.log(\`  [SKIP] Manually created: "\${existing.title}"\`);
+          console.log(`  [SKIP] Manually created: "${existing.title}"`);
           insertedTaskIds.push(existing.id);
           continue;
         }
@@ -2026,10 +2026,10 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         if (existing.segment) {
           // Segment task: only update display fields
           await pool.query(
-            \`UPDATE tasks SET title=$1, class=$2, url=$3, deadline_date=$4, deadline_time=$5,
+            `UPDATE tasks SET title=$1, class=$2, url=$3, deadline_date=$4, deadline_time=$5,
                points_possible=$6, current_score=$7, current_grade=$8,
                submitted_at=$9, is_missing=$10, is_late=$11, ignored=false
-             WHERE id=$12 AND user_id=$13\`,
+             WHERE id=$12 AND user_id=$13`,
             [t.title, t.class, t.url, t.deadlineDate, t.deadlineTime,
              t.pointsPossible ?? null, t.currentScore ?? null, t.currentGrade ?? null,
              t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
@@ -2038,7 +2038,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         } else {
           // Full canvas field update
           await pool.query(
-            \`UPDATE tasks SET
+            `UPDATE tasks SET
                title=$1, class=$2, description=$3, url=$4,
                deadline_date=$5, deadline_time=$6, course_id=$7, assignment_id=$8,
                points_possible=$9, assignment_group_id=$10,
@@ -2047,7 +2047,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                is_missing=$17, is_late=$18, grade_id=$19,
                completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END,
                ignored=false
-             WHERE id=$21 AND user_id=$22\`,
+             WHERE id=$21 AND user_id=$22`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
              t.pointsPossible ?? null, t.assignmentGroupId ?? null,
@@ -2060,12 +2060,12 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
 
         if (completionFlip) {
           completionFlips++;
-          console.log(\`  ★ Completion flip detected for "\${existing.title}" → updating leaderboard\`);
+          console.log(`  ★ Completion flip detected for "${existing.title}" → updating leaderboard`);
           incrementLeaderboardForUser(userId).catch(err =>
             console.error('[LEADERBOARD] sync flip error:', err.message));
         }
         if (gradeFlipped) {
-          console.log(\`  ★ Grade change for "\${existing.title}": \${existing.current_score}→\${t.currentScore} (grade_id=\${gradeIdToUse})\`);
+          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
         }
         updatedCount++;
         insertedTaskIds.push(existing.id);
@@ -2073,7 +2073,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       } else {
         // ── INSERT new task ──
         const result = await pool.query(
-          \`INSERT INTO tasks
+          `INSERT INTO tasks
              (user_id, title, segment, class, description, url,
               deadline_date, deadline_time, estimated_time, user_estimated_time,
               course_id, assignment_id, points_possible, assignment_group_id,
@@ -2081,7 +2081,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               unlock_at, lock_at, submitted_at, is_missing, is_late,
               completed, deleted, manually_created, is_new)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
-           RETURNING id\`,
+           RETURNING id`,
           [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
            t.courseId ?? null, t.assignmentId ?? null, t.pointsPossible ?? null,
@@ -2094,7 +2094,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         const newId = result.rows[0].id;
         insertedTaskIds.push(newId);
         newCount++;
-        console.log(\`  ✓ Inserted task ID \${newId}: "\${t.title}"\`);
+        console.log(`  ✓ Inserted task ID ${newId}: "${t.title}"`);
 
         // If inserted task already completed on Canvas, update leaderboard
         if (t.completed === true) {
@@ -2108,13 +2108,13 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
     // ── Step 4: Soft-delete past-due incomplete tasks (always, even for partial) ──
     const nowUtc = new Date().toISOString().split('T')[0];
     const pastDueCleanup = await pool.query(
-      \`UPDATE tasks SET deleted=true, session_active=false
+      `UPDATE tasks SET deleted=true, session_active=false
        WHERE user_id=$1 AND completed=false AND deleted=false AND deadline_date < $2
-       RETURNING id, title\`,
+       RETURNING id, title`,
       [userId, nowUtc]
     );
     if (pastDueCleanup.rowCount > 0) {
-      console.log(\`[SYNC-SAVE] Soft-deleted \${pastDueCleanup.rowCount} past-due task(s)\`);
+      console.log(`[SYNC-SAVE] Soft-deleted ${pastDueCleanup.rowCount} past-due task(s)`);
     }
 
     // ── Step 5: Update last_sync timestamp ──
@@ -2123,7 +2123,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       [userId]
     );
 
-    console.log(\`=== SYNC-SAVE COMPLETE: updated=\${updatedCount} new=\${newCount} leaderboard_flips=\${completionFlips} past_due_cleaned=\${pastDueCleanup.rowCount} ===\`);
+    console.log(`=== SYNC-SAVE COMPLETE: updated=${updatedCount} new=${newCount} leaderboard_flips=${completionFlips} past_due_cleaned=${pastDueCleanup.rowCount} ===`);
 
     res.json({
       success: true,
