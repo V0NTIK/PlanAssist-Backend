@@ -1090,3 +1090,75 @@ ALTER TABLE completion_feed
 UPDATE users SET feed_label_selected = 'completed';
 
 
+-- ============================================================================
+-- MIGRATION: Feed Label → Insignia system
+-- Replaces word-based feed labels with tiered name Insignias
+-- ============================================================================
+
+-- ── 11. Rename feed_label_unlocks table → insignia_unlocks ──────────────────
+-- We keep the same structure but rename for clarity.
+-- Existing rows (old label strings) are cleared since tier names changed.
+ALTER TABLE feed_label_unlocks RENAME TO insignia_unlocks;
+
+-- Clear old label unlock records (old tier names are no longer valid)
+DELETE FROM insignia_unlocks;
+
+-- ── 12. Rename columns: users table ─────────────────────────────────────────
+ALTER TABLE users
+  RENAME COLUMN feed_label_days TO insignia_days;
+ALTER TABLE users
+  RENAME COLUMN feed_label_selected TO insignia_selected;
+
+-- ── 13. Rename column: completion_feed table ─────────────────────────────────
+ALTER TABLE completion_feed
+  RENAME COLUMN feed_label TO insignia;
+
+-- ── 14. Reset insignia_selected to new default tier name 'Default' ───────────
+UPDATE users SET insignia_selected = 'Default';
+
+-- ── 15. Backfill insignia_unlocks from current insignia_days ─────────────────
+-- Re-run unlock logic for all users using new Insignia thresholds
+DO $$
+DECLARE
+  tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
+  tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald','Amethyst','Ruby','Diamond','Obsidian','Aether'];
+  rec RECORD;
+  i INT;
+BEGIN
+  FOR rec IN SELECT id, insignia_days FROM users LOOP
+    FOR i IN 1..array_length(tier_thresholds, 1) LOOP
+      IF rec.insignia_days >= tier_thresholds[i] THEN
+        INSERT INTO insignia_unlocks (user_id, label)
+        VALUES (rec.id, tier_labels[i])
+        ON CONFLICT DO NOTHING;
+      END IF;
+    END LOOP;
+  END LOOP;
+END $$;
+
+-- ── 16. Set insignia_selected to highest unlocked Insignia per user ───────────
+-- Gives each user their best earned Insignia automatically.
+-- Users can override any time in the Insignia pane.
+DO $$
+DECLARE
+  tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
+  tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald','Amethyst','Ruby','Diamond','Obsidian','Aether'];
+  rec RECORD;
+  highest TEXT := 'Default';
+  i INT;
+BEGIN
+  FOR rec IN SELECT id, insignia_days FROM users LOOP
+    highest := 'Default';
+    FOR i IN array_length(tier_thresholds, 1) .. 1 BY -1 LOOP
+      IF rec.insignia_days >= tier_thresholds[i] THEN
+        highest := tier_labels[i];
+        EXIT;
+      END IF;
+    END LOOP;
+    UPDATE users SET insignia_selected = highest WHERE id = rec.id;
+  END LOOP;
+END $$;
+
+-- ── 17. Update completion_feed.insignia default to new tier name ─────────────
+ALTER TABLE completion_feed
+  ALTER COLUMN insignia SET DEFAULT 'Default';
