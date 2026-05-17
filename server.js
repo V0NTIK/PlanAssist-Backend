@@ -4666,13 +4666,27 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
        ORDER BY created_at DESC`
     );
 
+    // Activity heatmap: completions by hour of day (UTC, collapsed across all days)
+    const heatmapRes = await pool.query(
+      `SELECT EXTRACT(HOUR FROM completed_at)::int AS hour, COUNT(*) AS count
+       FROM tasks_completed
+       GROUP BY hour
+       ORDER BY hour ASC`
+    );
+    // Fill all 24 hours (0-23) so the chart has no gaps
+    const heatmapFull = Array.from({ length: 24 }, (_, h) => {
+      const found = heatmapRes.rows.find(r => r.hour === h);
+      return { hour: h, count: found ? parseInt(found.count) : 0 };
+    });
+
     res.json({
       staleSyncs: staleSyncRes.rows,
       noToken: noTokenRes.rows,
       badTasks: badTasksRes.rows,
       duplicates: dupRes.rows,
       gradeStats: statsRes.rows,
-      newUsers: newUsersRes.rows
+      newUsers: newUsersRes.rows,
+      activityHeatmap: heatmapFull
     });
   } catch (err) {
     console.error(err);
