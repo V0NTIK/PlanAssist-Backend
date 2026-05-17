@@ -819,24 +819,47 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
       invalidateCachedToken(req.user.id);
     }
 
-    await pool.query(
-      `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
-        present_periods = $4, is_new_user = false,
-        calendar_show_homeroom = $5, calendar_show_completed = $6,
-        calendar_show_prev_week = $7, calendar_show_current_week = $8,
-        calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
-        calendar_show_weekends = $11
-       WHERE id = $12`,
-      [grade, encryptedToken, iv, presentPeriods,
-       calendarShowHomeroom ?? false,
-       calendarShowCompleted ?? true,
-       calendarShowPrevWeek ?? false,
-       calendarShowCurrentWeek ?? true,
-       calendarShowNextWeek1 ?? false,
-       calendarShowNextWeek2 ?? false,
-       calendarShowWeekends ?? true,
-       req.user.id]
-    );
+    // Only update token columns when a token is actually provided
+    if (canvasApiToken && canvasApiToken.trim()) {
+      await pool.query(
+        `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
+          present_periods = $4, is_new_user = false,
+          calendar_show_homeroom = $5, calendar_show_completed = $6,
+          calendar_show_prev_week = $7, calendar_show_current_week = $8,
+          calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
+          calendar_show_weekends = $11
+         WHERE id = $12`,
+        [grade, encryptedToken, iv, presentPeriods,
+         calendarShowHomeroom ?? false,
+         calendarShowCompleted ?? true,
+         calendarShowPrevWeek ?? false,
+         calendarShowCurrentWeek ?? true,
+         calendarShowNextWeek1 ?? false,
+         calendarShowNextWeek2 ?? false,
+         calendarShowWeekends ?? true,
+         req.user.id]
+      );
+    } else {
+      // No token provided — update everything except the token columns
+      await pool.query(
+        `UPDATE users SET grade = $1,
+          present_periods = $2, is_new_user = false,
+          calendar_show_homeroom = $3, calendar_show_completed = $4,
+          calendar_show_prev_week = $5, calendar_show_current_week = $6,
+          calendar_show_next_week1 = $7, calendar_show_next_week2 = $8,
+          calendar_show_weekends = $9
+         WHERE id = $10`,
+        [grade, presentPeriods,
+         calendarShowHomeroom ?? false,
+         calendarShowCompleted ?? true,
+         calendarShowPrevWeek ?? false,
+         calendarShowCurrentWeek ?? true,
+         calendarShowNextWeek1 ?? false,
+         calendarShowNextWeek2 ?? false,
+         calendarShowWeekends ?? true,
+         req.user.id]
+      );
+    }
 
     // Upsert schedule rows — preserves course_id/course_name from enhanced schedule
     const schedulePromises = [];
@@ -2028,7 +2051,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
           await pool.query(
             `UPDATE tasks SET title=$1, class=$2, url=$3, deadline_date=$4, deadline_time=$5,
                points_possible=$6, current_score=$7, current_grade=$8,
-               submitted_at=$9, is_missing=$10, is_late=$11, ignored=false
+               submitted_at=$9, is_missing=$10, is_late=$11
              WHERE id=$12 AND user_id=$13`,
             [t.title, t.class, t.url, t.deadlineDate, t.deadlineTime,
              t.pointsPossible ?? null, t.currentScore ?? null, t.currentGrade ?? null,
@@ -2045,8 +2068,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                current_score=$11, current_grade=$12, grading_type=$13,
                unlock_at=$14, lock_at=$15, submitted_at=$16,
                is_missing=$17, is_late=$18, grade_id=$19,
-               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END,
-               ignored=false
+               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
              WHERE id=$21 AND user_id=$22`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
@@ -2225,7 +2247,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
                 (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
                 (existingTask.is_late ?? false) !== (incomingTask.isLate ?? false) ||
-                existingTask.ignored === true;
+                false; // ignored flag removed
               if (segChanged) {
                 await pool.query(
                   `UPDATE tasks SET \
@@ -2239,8 +2261,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     current_grade = $8,
                     submitted_at = $9,
                     is_missing = $10,
-                    is_late = $11,
-                    ignored = false
+                    is_late = $11
                    WHERE id = $12 AND user_id = $13`,
                   [
                     incomingTask.title,
@@ -2272,7 +2293,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
                 (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
                 (existingTask.is_late ?? false) !== (incomingTask.isLate ?? false) ||
-                existingTask.ignored === true;
+                false; // ignored flag removed
               if (taskChanged) {
                 await pool.query(
                   `UPDATE tasks SET 
@@ -2295,8 +2316,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                     lock_at = $17,
                     submitted_at = $18,
                     is_missing = $19,
-                    is_late = $20,
-                    ignored = false
+                    is_late = $20
                    WHERE id = $21 AND user_id = $22`,
                   [
                     incomingTask.title,
@@ -2390,7 +2410,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip)`);
           }
 
-          // If task was previously ignored, treat it as a new task for sidebar/count purposes
+          // If task was previously dismissed (deleted=true), treat it as a new task for sidebar/count purposes
           {
             const didChange = existingTask.segment ? segChanged : taskChanged;
             if (didChange) {
@@ -3053,13 +3073,13 @@ app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
     
-    // Mark task as ignored+deleted — stays in DB so it won't be re-imported on sync.
-    // Viewable on the Resolved Tasks page.
+    // Mark task as deleted — stays in DB so it won't be re-imported on sync.
+    // Viewable in the Activity > Resolutions tab.
     await pool.query(
-      'UPDATE tasks SET ignored = true, deleted = true WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = true WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
-    console.log(`✓ Task ${taskId} ignored by user ${req.user.id}`);
+    console.log(`✓ Task ${taskId} dismissed by user ${req.user.id}`);
     res.json({ success: true });
   } catch (error) {
     console.error('Ignore task error:', error);
@@ -4739,7 +4759,8 @@ app.get('/api/admin/audit-log', authenticateToken, requireAdmin, async (req, res
 
 // ── ACCOUNT & ANALYTICS ENDPOINTS ────────────────────────────────────────────
 
-// GET resolved tasks (completed OR deleted-and-ignored, excluding split_origin)
+// GET resolved tasks (completed OR deleted, excluding split_origin)
+// GET resolved tasks (completed OR deleted, excluding split_origin)
 app.get('/api/tasks/resolved', authenticateToken, async (req, res) => {
   try {
     const { sort = 'created_at', search = '' } = req.query;
@@ -4752,11 +4773,7 @@ app.get('/api/tasks/resolved', authenticateToken, async (req, res) => {
        LEFT JOIN tasks_completed tc ON tc.id = t.id AND tc.user_id = t.user_id
        WHERE t.user_id = $1
          AND (t.split_origin IS NOT TRUE)
-         AND (
-           t.completed = TRUE
-           OR t.ignored = TRUE
-           OR (t.deleted = TRUE AND (t.ignored IS NOT TRUE))
-         )
+         AND (t.completed = TRUE OR t.deleted = TRUE)
          AND (t.title ILIKE $2 OR t.class ILIKE $2)
        ORDER BY ${orderCol} DESC NULLS LAST`,
       [req.user.id, searchParam]
@@ -4809,7 +4826,7 @@ app.post('/api/tasks/:taskId/restore', authenticateToken, async (req, res) => {
 
     // Restore the task — deadline order is automatic, no priority needed
     await pool.query(
-      `UPDATE tasks SET completed = FALSE, deleted = FALSE, ignored = FALSE
+      `UPDATE tasks SET completed = FALSE, deleted = FALSE
        WHERE id = $1 AND user_id = $2`,
       [taskId, req.user.id]
     );
