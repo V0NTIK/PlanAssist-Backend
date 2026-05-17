@@ -3385,7 +3385,7 @@ app.put('/api/feed-label', authenticateToken, async (req, res) => {
 app.post('/api/feed-label/check-unlock', authenticateToken, async (req, res) => {
   try {
     const LABEL_THRESHOLDS = [
-      [0,'completed'],[5,'finished'],[10,'did'],[20,'handled'],[30,'closed'],
+      [0,'completed'],[5,'finished'],[10,'did'],[20,'handled'],[30,'banned'],
       [40,'processed'],[50,'resolved'],[60,'settled'],[70,'finalized'],[80,'accomplished'],
       [90,'achieved'],[100,'fulfilled'],[120,'delivered'],[140,'executed'],[160,'cleared'],
       [180,'dispatched'],[200,'secured'],[250,'conquered'],[300,'crushed'],[400,'dominated'],[500,'mastered']
@@ -3522,7 +3522,7 @@ app.get('/api/completion-feed', authenticateToken, async (req, res) => {
        WHERE u.show_in_feed = true
        AND cf.completed_at > NOW() - INTERVAL '7 days'
        ORDER BY cf.completed_at DESC
-       LIMIT 50`,
+       LIMIT 10`,
       [req.user.id]
     );
     
@@ -3694,6 +3694,22 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
     
     const user = userResult.rows[0];
     
+    // Increment feed_label_days if this is the user's first completion today (UTC date)
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const alreadyTodayRes = await pool.query(
+      `SELECT 1 FROM completion_feed
+       WHERE user_id = $1 AND completed_at::date = $2::date LIMIT 1`,
+      [userId, todayUtc]
+    );
+    if (alreadyTodayRes.rowCount === 0) {
+      // First completion of today — increment the days counter
+      await pool.query(
+        'UPDATE users SET feed_label_days = feed_label_days + 1 WHERE id = $1',
+        [userId]
+      );
+      console.log(`[FEED LABEL] Incremented feed_label_days for user ${userId}`);
+    }
+
     // Add to completion feed
     await pool.query(
       `INSERT INTO completion_feed (user_id, user_name, user_grade, task_title, task_class, completed_at, feed_label)
