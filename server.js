@@ -133,6 +133,44 @@ const authenticateToken = (req, res, next) => {
 // HELPER FUNCTIONS
 // ============================================================================
 
+
+// ── Canvas token decryption cache (15-min TTL) ──────────────────────────────
+// Avoids repeated decrypt calls across Main Sync, Background Sync, Course Sync, Grade Sync.
+// Cache is invalidated immediately when a user saves a new Canvas token.
+const _tokenCache = new Map(); // userId → { token: string, expiresAt: number }
+
+function getCachedToken(userId) {
+  const entry = _tokenCache.get(userId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _tokenCache.delete(userId); return null; }
+  return entry.token;
+}
+
+function setCachedToken(userId, token) {
+  _tokenCache.set(userId, { token, expiresAt: Date.now() + 15 * 60 * 1000 });
+}
+
+function invalidateCachedToken(userId) {
+  _tokenCache.delete(userId);
+  console.log(`[TOKEN CACHE] Invalidated cache for user ${userId}`);
+}
+
+// Helper: decrypt and cache the Canvas token for a given user row
+// Accepts the raw user row from DB ({ canvas_api_token, canvas_api_token_iv })
+function getDecryptedCanvasToken(userId, userRow) {
+  const cached = getCachedToken(userId);
+  if (cached) {
+    console.log(`[TOKEN CACHE] Cache hit for user ${userId}`);
+    return cached;
+  }
+  if (!userRow?.canvas_api_token || !userRow?.canvas_api_token_iv) return null;
+  const parts = userRow.canvas_api_token.split(':');
+  if (parts.length !== 2) return null;
+  const token = decryptToken(parts[0], userRow.canvas_api_token_iv, parts[1]);
+  if (token) setCachedToken(userId, token);
+  return token;
+}
+
 // Extract name from email
 const extractNameFromEmail = (email) => {
   const username = email.split('@')[0];
@@ -696,7 +734,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -745,7 +783,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       calendarShowWeekends: user.calendar_show_weekends ?? true,
       schedule_enhanced: user.schedule_enhanced || false,
       is_admin: user.is_admin || false,
-      showInFeed: user.show_in_feed !== false
+      showInFeed: user.show_in_feed !== false,
+      lastSync: user.last_sync || null
     });
   } catch (error) {
     console.error('Get account setup error:', error);
@@ -773,6 +812,11 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
       // Store encrypted token with auth tag appended (format: encrypted:authTag)
       encryptedToken = `${encrypted.encryptedToken}:${encrypted.authTag}`;
       iv = encrypted.iv;
+    }
+
+    // Invalidate the in-memory token cache so next sync uses fresh decrypted token
+    if (canvasApiToken && canvasApiToken.trim()) {
+      invalidateCachedToken(req.user.id);
     }
 
     await pool.query(
@@ -1057,307 +1101,449 @@ app.post('/api/calendar/fetch', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // Sync assignments from Canvas API (replaces /calendar/fetch)
+// ============================================================================
+// POST /api/canvas/sync — MAIN SYNC
+// Triggered: manual Sync button, or on first login / new user.
+// Fetches ALL courses assignments (up to 90 days out) in parallel, estimates times,
+// then calls sync-save for batched upsert.
+// ============================================================================
 app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
   try {
-    console.log('\n=== CANVAS API SYNC START ===');
+    const userId = req.user.id;
+    console.log(`\n=== MAIN SYNC START for user ${userId} ===`);
 
-    // Clear any stale session_active flags — user cannot be in a session while syncing
-    await pool.query(
-      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true',
-      [req.user.id]
-    );
-
-    // Get user's encrypted Canvas API token
+    // Step 0: Get and decrypt Canvas token (with cache)
     const userResult = await pool.query(
       'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
-      [req.user.id]
+      [userId]
     );
-    
-    if (!userResult.rows[0] || !userResult.rows[0].canvas_api_token) {
+    const canvasToken = getDecryptedCanvasToken(userId, userResult.rows[0]);
+    if (!canvasToken) {
       return res.status(400).json({ error: 'No Canvas API token found. Please add your token in Settings.' });
     }
-    
-    // Decrypt the Canvas API token
-    const encryptedParts = userResult.rows[0].canvas_api_token.split(':');
-    if (encryptedParts.length !== 2) {
-      return res.status(500).json({ error: 'Invalid token format in database' });
-    }
-    
-    const canvasToken = decryptToken(
-      encryptedParts[0],
-      userResult.rows[0].canvas_api_token_iv,
-      encryptedParts[1]
-    );
-    
-    if (!canvasToken) {
-      return res.status(500).json({ error: 'Failed to decrypt Canvas API token' });
-    }
-    
-    console.log('✓ Canvas API token decrypted successfully');
-    
-    // Canvas API base URL
-    // CANVAS_API_BASE is defined at module level
-    const headers = {
-      'Authorization': `Bearer ${canvasToken}`,
-      'Accept': 'application/json'
-    };
-    
-    // Step 1: Fetch all active courses for the user
-    console.log('\n📚 Fetching active courses...');
-    let coursesResponse;
+    const headers = { Authorization: `Bearer ${canvasToken}`, Accept: 'application/json' };
+
+    // Step 1: Fetch all active courses (needed to know which courses to scan)
+    console.log('[MAIN SYNC] Fetching active courses...');
+    let courses;
     try {
-      coursesResponse = await axios.get(
-        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
+      const resp = await axios.get(
+        `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
         { headers, timeout: 15000 }
       );
-    } catch (error) {
-      console.error('❌ Failed to fetch courses:', error.message);
-      if (error.response?.status === 401) {
+      courses = resp.data;
+      console.log(`[MAIN SYNC] ${courses.length} active courses found`);
+    } catch (err) {
+      if (err.response?.status === 401) {
         return res.status(401).json({ error: 'Canvas API token is invalid or expired. Please update your token in Settings.' });
       }
-      return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: error.message });
+      return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: err.message });
     }
-    
-    const courses = coursesResponse.data;
-    console.log(`✓ Found ${courses.length} active courses`);
-    
-    // Step 2: Sync course data to database
-    console.log('\n💾 Syncing course data to database...');
-    for (const course of courses) {
-      // Get enrollment data for grades - Canvas API returns enrollments array with total_scores
-      const enrollment = course.enrollments?.[0] || {};
-      
-      // Canvas returns computed_current_score OR grades.current_score depending on API version
-      const currentScore = enrollment.computed_current_score ?? enrollment.grades?.current_score ?? null;
-      const currentGrade = enrollment.computed_current_grade ?? enrollment.grades?.current_grade ?? null;
-      const finalScore = enrollment.computed_final_score ?? enrollment.grades?.final_score ?? null;
-      const finalGrade = enrollment.computed_final_grade ?? enrollment.grades?.final_grade ?? null;
 
-      // Grading period scores (current quarter/term only) — from include[]=current_grading_period_scores
-      const currentPeriodScore = enrollment.current_period_computed_current_score ?? null;
-      const currentPeriodGrade = enrollment.current_period_computed_current_grade ?? null;
-      const gradingPeriodId = enrollment.current_grading_period_id ?? null;
-      const gradingPeriodTitle = enrollment.current_grading_period_title ?? null;
-
-      console.log(`  Course: ${course.name} | Score: ${currentScore} | Period: ${gradingPeriodTitle} ${currentPeriodScore}`);
-      
-      await pool.query(
-        `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade, final_score, final_grade, enrollment_id,
-           current_period_score, current_period_grade, grading_period_id, grading_period_title, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
-         ON CONFLICT (user_id, course_id)
-         DO UPDATE SET 
-           name = EXCLUDED.name,
-           course_code = EXCLUDED.course_code,
-           current_score = EXCLUDED.current_score,
-           current_grade = EXCLUDED.current_grade,
-           final_score = EXCLUDED.final_score,
-           final_grade = EXCLUDED.final_grade,
-           current_period_score = EXCLUDED.current_period_score,
-           current_period_grade = EXCLUDED.current_period_grade,
-           grading_period_id = EXCLUDED.grading_period_id,
-           grading_period_title = EXCLUDED.grading_period_title,
-           updated_at = CURRENT_TIMESTAMP`,
-        [
-          req.user.id,
-          course.id,
-          course.name,
-          course.course_code || null,
-          currentScore,
-          currentGrade,
-          finalScore,
-          finalGrade,
-          enrollment.id || null,
-          currentPeriodScore,
-          currentPeriodGrade,
-          gradingPeriodId,
-          gradingPeriodTitle
-        ]
-      );
-    }
-    console.log(`✓ Synced ${courses.length} courses to database`);
-    
-    // Step 3: Fetch assignment groups for grade weight calculations
-    console.log('\n⚖️  Fetching assignment groups...');
-    for (const course of courses) {
-      try {
-        const groupsResponse = await axios.get(
-          `${CANVAS_API_BASE}/courses/${course.id}/assignment_groups`,
-          { headers, timeout: 10000 }
-        );
-        
-        for (const group of groupsResponse.data) {
-          await pool.query(
-            `INSERT INTO assignment_groups (user_id, course_id, group_id, name, weight, updated_at)
-             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
-             ON CONFLICT (user_id, course_id, group_id)
-             DO UPDATE SET 
-               name = EXCLUDED.name,
-               weight = EXCLUDED.weight,
-               updated_at = CURRENT_TIMESTAMP`,
-            [req.user.id, course.id, group.id, group.name, group.group_weight || null]
-          );
-        }
-        console.log(`  ✓ Course: ${course.name} - ${groupsResponse.data.length} assignment groups`);
-      } catch (error) {
-        console.error(`  ⚠️  Failed to fetch assignment groups for ${course.name}:`, error.message);
-      }
-    }
-    
-
-    
-    // Step 4: Fetch assignments from all courses IN PARALLEL
-    // Previously sequential (one request at a time) — now all requests fire simultaneously.
-    // 10 courses × ~2s each = ~20s sequential → ~2-3s parallel (slowest single request).
-    console.log('\n📋 Fetching assignments (parallel)...');
-    const today = new Date();
-    const ninetyDaysFromNow = new Date(today.getTime() + 90 * 24 * 60 * 60 * 1000);
-
-    const courseAssignmentResults = await Promise.all(
+    // Step 2: Fetch assignments for ALL courses IN PARALLEL (90-day window)
+    const ninetyDaysOut = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+    const now = new Date();
+    console.log('[MAIN SYNC] Fetching assignments in parallel...');
+    const courseResults = await Promise.all(
       courses.map(async (course) => {
         try {
-          const assignmentsResponse = await axios.get(
+          const resp = await axios.get(
             `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
             { headers, timeout: 15000 }
           );
-          const allCourseAssignments = Array.isArray(assignmentsResponse.data) ? assignmentsResponse.data : [];
-          console.log(`  ✓ Course: ${course.name} - ${allCourseAssignments.length} assignments fetched`);
-          return allCourseAssignments
+          const all = Array.isArray(resp.data) ? resp.data : [];
+          console.log(`  [MAIN SYNC] ${course.name}: ${all.length} assignments`);
+          return all
             .filter(a => {
               if (!a.due_at) return false;
-              const dueDate = new Date(a.due_at);
-              // Extended to 90 days — catches full-term assignments published early
-              return dueDate >= today && dueDate <= ninetyDaysFromNow;
+              const d = new Date(a.due_at);
+              return d >= now && d <= ninetyDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
-        } catch (error) {
-          console.error(`  ⚠️  Failed to fetch assignments for ${course.name}:`, error.message);
+        } catch (err) {
+          console.warn(`  [MAIN SYNC] Failed to fetch ${course.name}: ${err.message}`);
           return [];
         }
       })
     );
+    const allAssignments = courseResults.flat();
+    console.log(`[MAIN SYNC] Total assignments to process: ${allAssignments.length}`);
 
-    // Flatten results from all courses into a single array
-    const allAssignments = courseAssignmentResults.flat();
-    console.log(`✓ Found ${allAssignments.length} assignments within the next month`);
-    
-    // Step 5: Format assignments for database with time estimation
-    // MIGRATION: Update any existing OSG condensed tasks with old URL formats to /modules?week=YYYY-MM-DD
-    // Old format 1: /assignments#YYYY-MM-DD  (pre-fix format with date fragment)
-    // Old format 2: /modules (no week param - from previous migration, missing date)
-    const oldOsgRows = await pool.query(
-      `SELECT id, url, deadline_date FROM tasks
-       WHERE user_id = $1
-         AND deleted = false
-         AND title LIKE 'OSG Accelerate%'
-         AND (url LIKE '%assignments#%' OR (url LIKE '%/modules' AND url NOT LIKE '%?week=%'))`,
-      [req.user.id]
-    );
-    for (const row of oldOsgRows.rows) {
-      const courseMatch = row.url.match(/\/courses\/(\d+)\//);
-      if (courseMatch && row.deadline_date) {
-        const dateStr = typeof row.deadline_date === 'string'
-          ? row.deadline_date.split('T')[0]
-          : new Date(row.deadline_date).toISOString().split('T')[0];
-        const newUrl = `https://canvas.oneschoolglobal.com/courses/${courseMatch[1]}/modules?week=${dateStr}`;
-        await pool.query('UPDATE tasks SET url = $1 WHERE id = $2', [newUrl, row.id]);
-        console.log(`  ✓ Migrated OSG URL: ${row.url} → ${newUrl}`);
-      }
-    }
-
-    console.log('\n🔄 Formatting assignments and estimating times...');
+    // Step 3: Estimate times for new assignments (reuse existing estimates)
+    console.log('[MAIN SYNC] Estimating task times...');
     const tasks = [];
-    
-    for (const assignment of allAssignments) {
-      const dueDate = new Date(assignment.due_at);
-      
-      // Always derive deadline_date and deadline_time from the UTC representation.
-      // Canvas may return due_at with a timezone offset (e.g. "2026-02-24T23:59:00-05:00")
-      // or in UTC (e.g. "2026-02-25T04:59:00Z"). Using dueDate.toISOString() normalises
-      // both to UTC, so deadline_date and deadline_time are always a consistent UTC pair.
-      // Frontend reconstructs correctly: new Date(`${deadline_date}T${deadline_time}Z`)
-      const isoStr = dueDate.toISOString(); // always UTC, e.g. "2026-02-25T04:59:00.000Z"
-      const deadlineDate = isoStr.split('T')[0];          // UTC date: "2026-02-25"
-      const deadlineTime = isoStr.split('T')[1].split('.')[0]; // UTC time: "04:59:00"
-      
-      // Get submission data
-      const submission = assignment.submission || {};
-      const isSubmitted = submission.workflow_state === 'submitted' || submission.workflow_state === 'graded';
-      
+    for (const a of allAssignments) {
+      const dueDate = new Date(a.due_at);
+      const isoStr = dueDate.toISOString();
+      const deadlineDate = isoStr.split('T')[0];
+      const deadlineTime = isoStr.split('T')[1].split('.')[0];
+      const sub = a.submission || {};
+      const isSubmitted = sub.workflow_state === 'submitted' || sub.workflow_state === 'graded';
 
-      
-      // Create base task object for estimation
-      const taskForEstimation = {
-        title: assignment.name,
-        class: assignment.course_name,
-        url: assignment.html_url,
-        assignmentId: assignment.id,
-        pointsPossible: assignment.points_possible || null,
-        assignmentGroupId: assignment.assignment_group_id || null,
-        gradingType: (assignment.grading_type || 'points').slice(0, 50),
-        description: assignment.description || ''
-      };
-
-      // Only estimate if this task doesn't already have an estimate in the DB.
-      // This prevents re-calling AI (Haiku) on every sync for existing tasks.
-      const existingEstimate = await pool.query(
-        'SELECT estimated_time, user_estimated_time FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
-        [req.user.id, assignment.id]
+      // Check for existing estimate first (no AI call needed if it exists)
+      const existingEst = await pool.query(
+        'SELECT estimated_time FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
+        [userId, a.id]
       );
       let estimatedTime;
-      if (existingEstimate.rows.length > 0 && existingEstimate.rows[0].estimated_time != null) {
-        // Reuse the existing estimate — no API call needed
-        estimatedTime = existingEstimate.rows[0].estimated_time;
-        console.log(`  ↩ Reusing existing estimate: ${estimatedTime} min`);
+      if (existingEst.rows.length > 0 && existingEst.rows[0].estimated_time != null) {
+        estimatedTime = existingEst.rows[0].estimated_time;
       } else {
-        // New task — run full estimation algorithm
-        estimatedTime = await estimateTaskTime(taskForEstimation, req.user.id);
+        estimatedTime = await estimateTaskTime({
+          title: a.name, class: a.course_name, url: a.html_url,
+          assignmentId: a.id, courseId: a.course_id,
+          pointsPossible: a.points_possible, gradingType: a.grading_type,
+          description: a.description || ''
+        }, userId);
       }
-      
+
       tasks.push({
-          title: assignment.name,
-          segment: null,
-          class: assignment.course_name,
-          description: assignment.description || '',
-          url: assignment.html_url,
-          deadlineDate: deadlineDate,
-          deadlineTime: deadlineTime,
-          estimatedTime: estimatedTime,
-          // Canvas API fields
-          courseId: assignment.course_id,
-          assignmentId: assignment.id,
-          pointsPossible: assignment.points_possible || null,
-          assignmentGroupId: assignment.assignment_group_id || null,
-          currentScore: submission.score || null,
-          currentGrade: submission.grade ? String(submission.grade).slice(0, 50) : null,
-          gradingType: (assignment.grading_type || 'points').slice(0, 50),
-          unlockAt: assignment.unlock_at || null,
-          lockAt: assignment.lock_at || null,
-          submittedAt: submission.submitted_at || null,
-          isMissing: submission.missing || false,
-          isLate: submission.late || false,
-          completed: isSubmitted
-        });
+        title: a.name, segment: null, class: a.course_name,
+        description: a.description || '', url: a.html_url,
+        deadlineDate, deadlineTime, estimatedTime,
+        courseId: a.course_id, assignmentId: a.id,
+        pointsPossible: a.points_possible ?? null,
+        assignmentGroupId: a.assignment_group_id ?? null,
+        currentScore: sub.score ?? null,
+        currentGrade: sub.grade ? String(sub.grade).slice(0, 50) : null,
+        gradingType: (a.grading_type || 'points').slice(0, 50),
+        unlockAt: a.unlock_at ?? null, lockAt: a.lock_at ?? null,
+        submittedAt: sub.submitted_at ?? null,
+        isMissing: sub.missing ?? false, isLate: sub.late ?? false,
+        completed: isSubmitted
+      });
     }
-    
-    console.log(`✓ Formatted ${tasks.length} tasks for database`);
-    console.log('\n=== CANVAS API SYNC COMPLETE ===\n');
-    
-    res.json({ 
-      tasks,
-      stats: {
-        courses: courses.length,
-        assignments: tasks.length
+
+    console.log(`[MAIN SYNC] Returning ${tasks.length} tasks to frontend`);
+    res.json({ tasks, stats: { courses: courses.length, assignments: tasks.length } });
+
+  } catch (err) {
+    console.error('[MAIN SYNC] Error:', err.message);
+    console.error(err.stack);
+    res.status(500).json({ error: 'Failed to sync with Canvas', details: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// POST /api/canvas/background-sync — BACKGROUND SYNC
+// Triggered: 30-min interval (client-side) while authenticated and not in session.
+// Also triggered at login if last_sync is within 14 days.
+// Fetches only assignments due in next 14 days using due_after/due_before filters.
+// ============================================================================
+app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log(`\n=== BACKGROUND SYNC START for user ${userId} ===`);
+
+    // Get Canvas token
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv, last_sync FROM users WHERE id = $1',
+      [userId]
+    );
+    const userRow = userResult.rows[0];
+    if (!userRow?.canvas_api_token) {
+      return res.json({ shouldSync: false, reason: 'no_token' });
+    }
+    const canvasToken = getDecryptedCanvasToken(userId, userRow);
+    if (!canvasToken) return res.json({ shouldSync: false, reason: 'decrypt_failed' });
+
+    const headers = { Authorization: `Bearer ${canvasToken}`, Accept: 'application/json' };
+
+    // Fetch active courses first
+    let courses;
+    try {
+      const resp = await axios.get(
+        `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
+        { headers, timeout: 15000 }
+      );
+      courses = resp.data;
+    } catch (err) {
+      console.warn('[BG SYNC] Failed to fetch courses:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
+    }
+
+    // 14-day window
+    const now = new Date();
+    const fourteenDaysOut = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+    const dueAfter = now.toISOString();
+    const dueBefore = fourteenDaysOut.toISOString();
+
+    // updated_since: use last_sync if available, otherwise 24h ago as safe fallback
+    const updatedSince = userRow.last_sync
+      ? new Date(userRow.last_sync).toISOString()
+      : new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+
+    console.log(`[BG SYNC] Window: ${dueAfter} → ${dueBefore} | updated_since: ${updatedSince}`);
+
+    const courseResults = await Promise.all(
+      courses.map(async (course) => {
+        try {
+          const resp = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&bucket=upcoming&updated_since=${encodeURIComponent(updatedSince)}`,
+            { headers, timeout: 15000 }
+          );
+          const all = Array.isArray(resp.data) ? resp.data : [];
+          return all
+            .filter(a => {
+              if (!a.due_at) return false;
+              const d = new Date(a.due_at);
+              return d >= now && d <= fourteenDaysOut;
+            })
+            .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
+        } catch (err) {
+          console.warn(`  [BG SYNC] Failed ${course.name}: ${err.message}`);
+          return [];
+        }
+      })
+    );
+    const allAssignments = courseResults.flat();
+    console.log(`[BG SYNC] ${allAssignments.length} assignments in 14-day window`);
+
+    // Estimate times
+    const tasks = [];
+    for (const a of allAssignments) {
+      const dueDate = new Date(a.due_at);
+      const isoStr = dueDate.toISOString();
+      const sub = a.submission || {};
+      const isSubmitted = sub.workflow_state === 'submitted' || sub.workflow_state === 'graded';
+
+      const existingEst = await pool.query(
+        'SELECT estimated_time FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
+        [userId, a.id]
+      );
+      let estimatedTime;
+      if (existingEst.rows.length > 0 && existingEst.rows[0].estimated_time != null) {
+        estimatedTime = existingEst.rows[0].estimated_time;
+      } else {
+        estimatedTime = await estimateTaskTime({
+          title: a.name, class: a.course_name, url: a.html_url,
+          assignmentId: a.id, courseId: a.course_id,
+          pointsPossible: a.points_possible, gradingType: a.grading_type,
+          description: a.description || ''
+        }, userId);
       }
-    });
-    
-  } catch (error) {
-    console.error('❌ Canvas API sync error:', error);
-    console.error('Stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Failed to sync with Canvas',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+
+      tasks.push({
+        title: a.name, segment: null, class: a.course_name,
+        description: a.description || '', url: a.html_url,
+        deadlineDate: isoStr.split('T')[0], deadlineTime: isoStr.split('T')[1].split('.')[0],
+        estimatedTime, courseId: a.course_id, assignmentId: a.id,
+        pointsPossible: a.points_possible ?? null, assignmentGroupId: a.assignment_group_id ?? null,
+        currentScore: sub.score ?? null, currentGrade: sub.grade ? String(sub.grade).slice(0, 50) : null,
+        gradingType: (a.grading_type || 'points').slice(0, 50),
+        unlockAt: a.unlock_at ?? null, lockAt: a.lock_at ?? null,
+        submittedAt: sub.submitted_at ?? null,
+        isMissing: sub.missing ?? false, isLate: sub.late ?? false,
+        completed: isSubmitted
+      });
+    }
+
+    console.log(`[BG SYNC] Returning ${tasks.length} tasks`);
+    res.json({ tasks, stats: { courses: courses.length, assignments: tasks.length } });
+
+  } catch (err) {
+    console.error('[BG SYNC] Error:', err.message);
+    res.status(500).json({ error: 'Background sync failed', details: err.message });
+  }
+});
+
+// ============================================================================
+// POST /api/canvas/course-sync — COURSE SYNC
+// Triggered: opening Marks page, opening Goals pane, 60-min silent interval.
+// clearSessionActive=true only for Marks/Goals triggers (not the silent interval).
+// ============================================================================
+app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { clearSessionActive = false } = req.body;
+    console.log(`\n=== COURSE SYNC for user ${userId} clearSessionActive=${clearSessionActive} ===`);
+
+    // Optionally clear stale session_active flags (only for UI-triggered syncs)
+    if (clearSessionActive) {
+      const cleared = await pool.query(
+        'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
+        [userId]
+      );
+      if (cleared.rowCount > 0) {
+        console.log(`[COURSE SYNC] Cleared ${cleared.rowCount} stale session_active flag(s)`);
+      }
+    }
+
+    // Get Canvas token
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
+      [userId]
+    );
+    const canvasToken = getDecryptedCanvasToken(userId, userResult.rows[0]);
+    if (!canvasToken) {
+      return res.status(400).json({ error: 'No Canvas API token found.' });
+    }
+    const headers = { Authorization: `Bearer ${canvasToken}`, Accept: 'application/json' };
+
+    // Fetch courses WITH grade data
+    console.log('[COURSE SYNC] Fetching courses with grades...');
+    let courses;
+    try {
+      const resp = await axios.get(
+        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
+        { headers, timeout: 15000 }
+      );
+      courses = resp.data;
+      console.log(`[COURSE SYNC] ${courses.length} courses fetched`);
+    } catch (err) {
+      if (err.response?.status === 401) {
+        return res.status(401).json({ error: 'Canvas token invalid or expired.' });
+      }
+      return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
+    }
+
+    // Upsert courses
+    for (const course of courses) {
+      const enrollment = course.enrollments?.[0] || {};
+      await pool.query(
+        `INSERT INTO courses (user_id, course_id, name, course_code, current_score, current_grade,
+           final_score, final_grade, enrollment_id, current_period_score, current_period_grade,
+           grading_period_id, grading_period_title, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id, course_id) DO UPDATE SET
+           name=EXCLUDED.name, course_code=EXCLUDED.course_code,
+           current_score=EXCLUDED.current_score, current_grade=EXCLUDED.current_grade,
+           final_score=EXCLUDED.final_score, final_grade=EXCLUDED.final_grade,
+           current_period_score=EXCLUDED.current_period_score,
+           current_period_grade=EXCLUDED.current_period_grade,
+           grading_period_id=EXCLUDED.grading_period_id,
+           grading_period_title=EXCLUDED.grading_period_title,
+           updated_at=CURRENT_TIMESTAMP`,
+        [userId, course.id, course.name, course.course_code ?? null,
+         enrollment.computed_current_score ?? enrollment.grades?.current_score ?? null,
+         enrollment.computed_current_grade ?? enrollment.grades?.current_grade ?? null,
+         enrollment.computed_final_score ?? enrollment.grades?.final_score ?? null,
+         enrollment.computed_final_grade ?? enrollment.grades?.final_grade ?? null,
+         enrollment.id ?? null,
+         enrollment.current_period_computed_current_score ?? null,
+         enrollment.current_period_computed_current_grade ?? null,
+         enrollment.current_grading_period_id ?? null,
+         enrollment.current_grading_period_title ?? null]
+      );
+    }
+
+    // Fetch assignment groups IN PARALLEL
+    console.log('[COURSE SYNC] Fetching assignment groups in parallel...');
+    await Promise.all(
+      courses.map(async (course) => {
+        try {
+          const resp = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course.id}/assignment_groups`,
+            { headers, timeout: 10000 }
+          );
+          for (const group of resp.data) {
+            await pool.query(
+              `INSERT INTO assignment_groups (user_id, course_id, group_id, name, weight, updated_at)
+               VALUES ($1,$2,$3,$4,$5,CURRENT_TIMESTAMP)
+               ON CONFLICT (user_id, course_id, group_id)
+               DO UPDATE SET name=EXCLUDED.name, weight=EXCLUDED.weight, updated_at=CURRENT_TIMESTAMP`,
+              [userId, course.id, group.id, group.name, group.group_weight ?? null]
+            );
+          }
+          console.log(`  [COURSE SYNC] ${course.name}: ${resp.data.length} assignment groups`);
+        } catch (err) {
+          console.warn(`  [COURSE SYNC] Assignment groups failed for ${course.name}: ${err.message}`);
+        }
+      })
+    );
+
+    console.log(`[COURSE SYNC] Complete: ${courses.length} courses synced`);
+    res.json({ success: true, courses: courses.length });
+
+  } catch (err) {
+    console.error('[COURSE SYNC] Error:', err.message);
+    res.status(500).json({ error: 'Course sync failed', details: err.message });
+  }
+});
+
+// ============================================================================
+// POST /api/canvas/grade-sync — GRADE SYNC
+// Triggered: opening Activity pane on Account & Analytics page.
+// Fetches submissions for courses with recent tasks, updates grades.
+// ============================================================================
+app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log(`\n=== GRADE SYNC for user ${userId} ===`);
+
+    // Clear stale session_active flags
+    const cleared = await pool.query(
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
+      [userId]
+    );
+    if (cleared.rowCount > 0) {
+      console.log(`[GRADE SYNC] Cleared ${cleared.rowCount} stale session_active flag(s)`);
+    }
+
+    // Get Canvas token
+    const userResult = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
+      [userId]
+    );
+    const canvasToken = getDecryptedCanvasToken(userId, userResult.rows[0]);
+    if (!canvasToken) return res.status(400).json({ error: 'No Canvas API token found.' });
+
+    const headers = { Authorization: `Bearer ${canvasToken}` };
+
+    // Get course IDs with tasks in last 60 days
+    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const coursesRes = await pool.query(
+      'SELECT DISTINCT course_id FROM tasks WHERE user_id = $1 AND course_id IS NOT NULL AND deadline_date >= $2',
+      [userId, sixtyDaysAgo]
+    );
+    const courseIds = coursesRes.rows.map(r => r.course_id);
+    if (courseIds.length === 0) return res.json({ updated: 0 });
+
+    // Fetch submissions in parallel
+    const submissionResults = await Promise.allSettled(
+      courseIds.map(cid =>
+        axios.get(
+          `${CANVAS_API_BASE}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
+          { headers, timeout: 10000 }
+        ).then(r => r.data.map(s => ({ ...s, _courseId: cid })))
+      )
+    );
+    const allSubs = submissionResults.filter(r => r.status === 'fulfilled').flatMap(r => r.value);
+    if (allSubs.length === 0) return res.json({ updated: 0 });
+
+    // Get max grade_id
+    const maxGradeRes = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [userId]
+    );
+    let nextGradeId = parseInt(maxGradeRes.rows[0].max_id) + 1;
+    let updatedCount = 0;
+
+    for (const sub of allSubs) {
+      if (sub.score == null && !sub.grade) continue;
+      const taskRes = await pool.query(
+        'SELECT id, current_score, current_grade FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
+        [userId, sub.assignment_id]
+      );
+      if (taskRes.rows.length === 0) continue;
+      const task = taskRes.rows[0];
+      const scoreChanged = sub.score != null && String(sub.score) !== String(task.current_score);
+      const gradeChanged = sub.grade != null && sub.grade !== task.current_grade;
+      if (scoreChanged || gradeChanged) {
+        await pool.query(
+          'UPDATE tasks SET current_score=$1, current_grade=$2, grade_id=$3 WHERE id=$4 AND user_id=$5',
+          [sub.score, sub.grade, nextGradeId++, task.id, userId]
+        );
+        updatedCount++;
+      }
+    }
+
+    console.log(`[GRADE SYNC] Complete: ${updatedCount} grades updated`);
+    res.json({ updated: updatedCount });
+
+  } catch (err) {
+    console.error('[GRADE SYNC] Error:', err.message);
+    res.status(500).json({ error: 'Grade sync failed', details: err.message });
   }
 });
 
@@ -1611,7 +1797,8 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
   }
 });
 
-// POST /api/canvas/auto-sync — check if user has a Canvas token (background sync trigger)
+// POST /api/canvas/auto-sync — DEPRECATED: kept for backward compat, frontend now calls /canvas/background-sync
+// Returns shouldSync=true if Canvas token exists
 app.post('/api/canvas/auto-sync', authenticateToken, async (req, res) => {
   try {
     const userResult = await pool.query(
@@ -1738,6 +1925,217 @@ app.post('/api/tasks/save-plan', authenticateToken, async (req, res) => {
 });
 
 // Save tasks (bulk import from Canvas)
+// ============================================================================
+// POST /api/tasks/sync-save — Shared batched upsert for Main Sync + Background Sync
+// partial=true → skip global soft-delete cleanup (Background Sync only sends a 14-day window)
+//                but ALWAYS soft-delete tasks past their deadline
+// ============================================================================
+app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
+  try {
+    const { tasks, partial = false, syncType = 'main' } = req.body;
+    if (!Array.isArray(tasks)) return res.status(400).json({ error: 'tasks must be an array' });
+
+    const userId = req.user.id;
+    console.log(`\n=== SYNC-SAVE [${syncType}] partial=${partial}: ${tasks.length} tasks for user ${userId} ===`);
+
+    // ── Step 0: Clear stale session_active flags at start of every sync ──
+    const staleCleared = await pool.query(
+      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
+      [userId]
+    );
+    if (staleCleared.rowCount > 0) {
+      console.log(`[SYNC-SAVE] Cleared ${staleCleared.rowCount} stale session_active flag(s)`);
+    }
+
+    // ── Step 1: Batch-load all existing tasks for this user by assignment_id + url ──
+    const assignmentIds = tasks.map(t => t.assignmentId).filter(Boolean);
+    const urls = tasks.map(t => t.url).filter(Boolean);
+
+    const [byAssignmentId, byUrl] = await Promise.all([
+      assignmentIds.length > 0
+        ? pool.query(
+            'SELECT * FROM tasks WHERE user_id = $1 AND assignment_id = ANY($2)',
+            [userId, assignmentIds]
+          )
+        : Promise.resolve({ rows: [] }),
+      urls.length > 0
+        ? pool.query(
+            'SELECT * FROM tasks WHERE user_id = $1 AND url = ANY($2)',
+            [userId, urls]
+          )
+        : Promise.resolve({ rows: [] })
+    ]);
+
+    // Build lookup maps
+    const byAssId = new Map();
+    byAssignmentId.rows.forEach(r => byAssId.set(String(r.assignment_id), r));
+    const byUrlMap = new Map();
+    byUrl.rows.forEach(r => {
+      if (!byUrlMap.has(r.url)) byUrlMap.set(r.url, []);
+      byUrlMap.get(r.url).push(r);
+    });
+
+    // ── Step 2: Pre-fetch max grade_id ──
+    const gradeIdRes = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [userId]
+    );
+    let nextGradeId = parseInt(gradeIdRes.rows[0].max_id) + 1;
+
+    const sortedTasks = [...tasks].sort((a, b) => {
+      const dA = new Date(\`\${a.deadlineDate}T\${a.deadlineTime || '23:59:59'}Z\`);
+      const dB = new Date(\`\${b.deadlineDate}T\${b.deadlineTime || '23:59:59'}Z\`);
+      return dA - dB;
+    });
+
+    let updatedCount = 0, newCount = 0, completionFlips = 0;
+    const insertedTaskIds = [];
+
+    // ── Step 3: Upsert each task ──
+    for (const t of sortedTasks) {
+      // Find existing record
+      let existing = (t.assignmentId && byAssId.get(String(t.assignmentId))) ||
+                     (t.url && (byUrlMap.get(t.url) || []).find(r => !r.segment)) ||
+                     null;
+
+      const isSubmitted = t.completed === true ||
+        t.submittedAt != null ||
+        t.isMissing === false; // Canvas submission present
+
+      if (existing) {
+        if (existing.manually_created) {
+          console.log(\`  [SKIP] Manually created: "\${existing.title}"\`);
+          insertedTaskIds.push(existing.id);
+          continue;
+        }
+
+        // Detect completed=FALSE→TRUE flip (Canvas submission detected)
+        const wasCompleted = existing.completed;
+        const nowCompleted = t.completed === true;
+        const completionFlip = !wasCompleted && nowCompleted;
+
+        // Detect grade change
+        const scoreChanged = t.currentScore != null && String(t.currentScore) !== String(existing.current_score);
+        const gradeChanged = t.currentGrade != null && t.currentGrade !== existing.current_grade;
+        const gradeFlipped = (scoreChanged || gradeChanged) && !existing.segment;
+        let gradeIdToUse = existing.grade_id;
+        if (gradeFlipped) {
+          gradeIdToUse = nextGradeId++;
+        }
+
+        if (existing.segment) {
+          // Segment task: only update display fields
+          await pool.query(
+            \`UPDATE tasks SET title=$1, class=$2, url=$3, deadline_date=$4, deadline_time=$5,
+               points_possible=$6, current_score=$7, current_grade=$8,
+               submitted_at=$9, is_missing=$10, is_late=$11, ignored=false
+             WHERE id=$12 AND user_id=$13\`,
+            [t.title, t.class, t.url, t.deadlineDate, t.deadlineTime,
+             t.pointsPossible ?? null, t.currentScore ?? null, t.currentGrade ?? null,
+             t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
+             existing.id, userId]
+          );
+        } else {
+          // Full canvas field update
+          await pool.query(
+            \`UPDATE tasks SET
+               title=$1, class=$2, description=$3, url=$4,
+               deadline_date=$5, deadline_time=$6, course_id=$7, assignment_id=$8,
+               points_possible=$9, assignment_group_id=$10,
+               current_score=$11, current_grade=$12, grading_type=$13,
+               unlock_at=$14, lock_at=$15, submitted_at=$16,
+               is_missing=$17, is_late=$18, grade_id=$19,
+               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END,
+               ignored=false
+             WHERE id=$21 AND user_id=$22\`,
+            [t.title, t.class, t.description || '', t.url,
+             t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
+             t.pointsPossible ?? null, t.assignmentGroupId ?? null,
+             t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
+             t.unlockAt ?? null, t.lockAt ?? null, t.submittedAt ?? null,
+             t.isMissing ?? false, t.isLate ?? false, gradeIdToUse,
+             nowCompleted, existing.id, userId]
+          );
+        }
+
+        if (completionFlip) {
+          completionFlips++;
+          console.log(\`  ★ Completion flip detected for "\${existing.title}" → updating leaderboard\`);
+          incrementLeaderboardForUser(userId).catch(err =>
+            console.error('[LEADERBOARD] sync flip error:', err.message));
+        }
+        if (gradeFlipped) {
+          console.log(\`  ★ Grade change for "\${existing.title}": \${existing.current_score}→\${t.currentScore} (grade_id=\${gradeIdToUse})\`);
+        }
+        updatedCount++;
+        insertedTaskIds.push(existing.id);
+
+      } else {
+        // ── INSERT new task ──
+        const result = await pool.query(
+          \`INSERT INTO tasks
+             (user_id, title, segment, class, description, url,
+              deadline_date, deadline_time, estimated_time, user_estimated_time,
+              course_id, assignment_id, points_possible, assignment_group_id,
+              current_score, current_grade, grading_type,
+              unlock_at, lock_at, submitted_at, is_missing, is_late,
+              completed, deleted, manually_created, is_new)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+           RETURNING id\`,
+          [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
+           t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
+           t.courseId ?? null, t.assignmentId ?? null, t.pointsPossible ?? null,
+           t.assignmentGroupId ?? null, t.currentScore ?? null, t.currentGrade ?? null,
+           t.gradingType || 'points', t.unlockAt ?? null, t.lockAt ?? null,
+           t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
+           t.completed ?? false, t.completed ?? false, // deleted if already completed
+           false, true] // manually_created=false, is_new=true
+        );
+        const newId = result.rows[0].id;
+        insertedTaskIds.push(newId);
+        newCount++;
+        console.log(\`  ✓ Inserted task ID \${newId}: "\${t.title}"\`);
+
+        // If inserted task already completed on Canvas, update leaderboard
+        if (t.completed === true) {
+          completionFlips++;
+          incrementLeaderboardForUser(userId).catch(err =>
+            console.error('[LEADERBOARD] new completed task error:', err.message));
+        }
+      }
+    }
+
+    // ── Step 4: Soft-delete past-due incomplete tasks (always, even for partial) ──
+    const nowUtc = new Date().toISOString().split('T')[0];
+    const pastDueCleanup = await pool.query(
+      \`UPDATE tasks SET deleted=true, session_active=false
+       WHERE user_id=$1 AND completed=false AND deleted=false AND deadline_date < $2
+       RETURNING id, title\`,
+      [userId, nowUtc]
+    );
+    if (pastDueCleanup.rowCount > 0) {
+      console.log(\`[SYNC-SAVE] Soft-deleted \${pastDueCleanup.rowCount} past-due task(s)\`);
+    }
+
+    // ── Step 5: Update last_sync timestamp ──
+    await pool.query(
+      'UPDATE users SET last_sync = CURRENT_TIMESTAMP WHERE id = $1',
+      [userId]
+    );
+
+    console.log(\`=== SYNC-SAVE COMPLETE: updated=\${updatedCount} new=\${newCount} leaderboard_flips=\${completionFlips} past_due_cleaned=\${pastDueCleanup.rowCount} ===\`);
+
+    res.json({
+      success: true,
+      stats: { updated: updatedCount, new: newCount, completionFlips, cleaned: pastDueCleanup.rowCount }
+    });
+  } catch (err) {
+    console.error('[SYNC-SAVE] Error:', err.message);
+    console.error(err.stack);
+    res.status(500).json({ error: 'Failed to save tasks', details: err.message });
+  }
+});
+
 app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { tasks } = req.body;
@@ -2618,13 +3016,20 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     }
     if (shouldFireFeed) {
       // Feed: only Canvas tasks done in Session/Agenda with time > 0
-      // Leaderboard is intentionally NOT fired here — the sync endpoint (POST /api/tasks)
-      // is the authoritative source for leaderboard increments when Canvas confirms completion.
-      // Firing here too would double-count tasks completed in a session that Canvas also marks done.
       addToCompletionFeed(req.user.id, task.title, task.class, {
         manuallyCreated: task.manually_created || false,
         timeSpent: timeSpent || 0
       }).catch(err => console.error('Feed update failed:', err));
+
+      // Leaderboard: only if Canvas has confirmed the submission (canvasCompleted=true)
+      // and the task was NOT already completed before this action (task.completed was FALSE)
+      // This matches the spec: check completed=FALSE in DB first, then Canvas confirms.
+      const { canvasCompleted } = req.body;
+      if (canvasCompleted === true) {
+        console.log(`[MARK COMPLETE] Canvas confirmed submission for task ${taskId} — updating leaderboard`);
+        incrementLeaderboardForUser(req.user.id).catch(err =>
+          console.error('[LEADERBOARD] Mark complete error:', err.message));
+      }
     }
     
     res.json({ success: true });
@@ -2902,6 +3307,35 @@ app.put('/api/user/feed-preference', authenticateToken, async (req, res) => {
 });
 
 // Helper function to update leaderboard when task is completed
+// ── Shared: update leaderboard when sync detects a Canvas submission flip ──────
+// Called by Main Sync, Background Sync, and the Mark Complete endpoint.
+// Only increments weekly_leaderboard.tasks_completed — no tasks_completed write.
+async function incrementLeaderboardForUser(userId) {
+  try {
+    const userResult = await pool.query(
+      'SELECT name, grade FROM users WHERE id = $1',
+      [userId]
+    );
+    if (userResult.rows.length === 0) return;
+    const user = userResult.rows[0];
+    const weekStartRes = await pool.query(
+      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date AS week_start`
+    );
+    const weekStart = weekStartRes.rows[0].week_start;
+    await pool.query(
+      `INSERT INTO weekly_leaderboard (user_id, user_name, grade, tasks_completed, week_start, updated_at)
+       VALUES ($1, $2, $3, 1, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id, week_start)
+       DO UPDATE SET tasks_completed = weekly_leaderboard.tasks_completed + 1,
+                     updated_at = CURRENT_TIMESTAMP`,
+      [userId, user.name, user.grade, weekStart]
+    );
+    console.log(`[LEADERBOARD] Incremented tasks_completed for user ${userId} (week ${weekStart})`);
+  } catch (err) {
+    console.error('[LEADERBOARD] incrementLeaderboardForUser error:', err.message);
+  }
+}
+
 async function updateLeaderboardOnCompletion(userId) {
   try {
     // Get user info
@@ -3677,7 +4111,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
   try {
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
-              u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at,
+              u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at, u.last_sync,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
               MAX(tc.completed_at) AS last_completion,
               COUNT(DISTINCT tc.id) AS total_completed,
@@ -3796,6 +4230,7 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
     await pool.query(
       `UPDATE users SET canvas_api_token = NULL, canvas_api_token_iv = NULL WHERE id = $1`, [targetId]
     );
+    invalidateCachedToken(parseInt(targetId)); // Clear decrypt cache for this user
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'CLEAR_CANVAS_TOKEN', parseInt(targetId), targetRes.rows[0]?.name, {});
@@ -3829,15 +4264,15 @@ app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (r
 // GET /api/admin/diagnostics
 app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // a) Users who haven't synced recently (no tasks updated in 7 days)
+    // a) Users who haven't synced recently (no Main/Background Sync in 7 days)
+    // Uses last_sync column updated by sync-save endpoint
     const staleSyncRes = await pool.query(
-      `SELECT u.id, u.name, u.email, u.grade, MAX(t.created_at) as last_task_import
-       FROM users u
-       LEFT JOIN tasks t ON t.user_id = u.id
-       WHERE u.is_new_user = false
-       GROUP BY u.id
-       HAVING MAX(t.created_at) < NOW() - INTERVAL '7 days' OR MAX(t.created_at) IS NULL
-       ORDER BY last_task_import ASC NULLS FIRST LIMIT 20`
+      `SELECT id, name, email, grade, last_sync
+       FROM users
+       WHERE is_new_user = false
+         AND (last_sync IS NULL OR last_sync < NOW() - INTERVAL '7 days')
+       ORDER BY last_sync ASC NULLS FIRST
+       LIMIT 20`
     );
 
     // b) Users with no Canvas token set
@@ -4083,94 +4518,6 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
   }
 });
 
-// POST grade mini-sync — checks only tasks due in the last 30 days for grade changes
-app.post('/api/canvas/grades/mini-sync', authenticateToken, async (req, res) => {
-  try {
-    const userResult = await pool.query(
-      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    const userRow = userResult.rows[0];
-    if (!userRow?.canvas_api_token) return res.status(400).json({ error: 'No Canvas token' });
-
-    const encryptedParts = userRow.canvas_api_token.split(':');
-    const token = decryptToken(encryptedParts[0], userRow.canvas_api_token_iv, encryptedParts[1]);
-    if (!token) return res.status(500).json({ error: 'Failed to decrypt token' });
-
-    const headers = { Authorization: `Bearer ${token}` };
-    const canvasBase = CANVAS_API_BASE;
-
-    const sixtyDaysAgo = new Date();
-    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-
-    // Get distinct course_ids with tasks due in last 60 days (include deleted — graded tasks matter)
-    const coursesResult = await pool.query(
-      `SELECT DISTINCT course_id FROM tasks
-       WHERE user_id = $1 AND course_id IS NOT NULL
-         AND deadline_date >= $2`,
-      [req.user.id, sixtyDaysAgo.toISOString().slice(0, 10)]
-    );
-    const courseIds = coursesResult.rows.map(r => r.course_id);
-
-    if (courseIds.length === 0) return res.json({ updated: 0 });
-
-    // Fetch assignment submissions for those courses
-    const submissionResults = await Promise.allSettled(
-      courseIds.map(cid =>
-        axios.get(
-          `${canvasBase}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
-          { headers, timeout: 10000 }
-        ).then(r => r.data.map(s => ({ ...s, _courseId: cid })))
-      )
-    );
-
-    const allSubs = submissionResults
-      .filter(r => r.status === 'fulfilled')
-      .flatMap(r => r.value);
-
-    if (allSubs.length === 0) return res.json({ updated: 0 });
-
-    // Get max grade_id for this user
-    const maxResult = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextGradeId = parseInt(maxResult.rows[0].max_id) + 1;
-    let updatedCount = 0;
-
-    for (const sub of allSubs) {
-      if (sub.score == null && !sub.grade) continue;
-
-      // Find matching task in DB
-      const taskResult = await pool.query(
-        `SELECT id, current_score, current_grade FROM tasks
-         WHERE user_id = $1 AND assignment_id = $2 LIMIT 1`,
-        [req.user.id, sub.assignment_id]
-      );
-      if (taskResult.rows.length === 0) continue;
-
-      const task = taskResult.rows[0];
-      const scoreChanged = sub.score != null && String(sub.score) !== String(task.current_score);
-      const gradeChanged = sub.grade != null && sub.grade !== task.current_grade;
-
-      if (scoreChanged || gradeChanged) {
-        await pool.query(
-          `UPDATE tasks SET current_score = $1, current_grade = $2, grade_id = $3
-           WHERE id = $4 AND user_id = $5`,
-          [sub.score, sub.grade, nextGradeId, task.id, req.user.id]
-        );
-        nextGradeId++;
-        updatedCount++;
-      }
-    }
-
-    console.log(`[GRADE MINI-SYNC] user=${req.user.id}, updated=${updatedCount}`);
-    res.json({ updated: updatedCount });
-  } catch (error) {
-    console.error('Grade mini-sync error:', error.message);
-    res.status(500).json({ error: 'Failed to run grade mini-sync' });
-  }
-});
 
 // GET Canvas announcements (all active courses, last 20 total)
 app.get('/api/canvas/announcements', authenticateToken, async (req, res) => {
