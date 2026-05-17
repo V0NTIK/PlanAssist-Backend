@@ -1,336 +1,282 @@
 -- ============================================================================
--- PlanAssist - COMPLETELY REDESIGNED Database Schema
--- Major Changes:
--- 1. New tasks table with title/segment system (replacing parent_task_id/split_task_id)
--- 2. New tasks_completed table (replacing completion_history)
--- 3. Removed partial_completions table (integrated into tasks.accumulated_time)
--- 4. Fixed SERIAL IDs to be permanent across all tables
+-- PlanAssist — Canonical Database Schema
+-- OneSchool Global Study Planner
+--
+-- Safe to run against the live database: every statement uses
+-- CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS, CREATE INDEX IF NOT
+-- EXISTS, DROP COLUMN IF EXISTS, and DO $$ guards so nothing is duplicated
+-- or destroyed. Edit this file for all future schema changes.
 -- ============================================================================
 
+
 -- ============================================================================
--- CORE TABLES
+-- USERS
 -- ============================================================================
 
--- Users table
 CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    grade VARCHAR(10),
-    canvas_api_token TEXT,                      -- Encrypted Canvas API token (replaces canvas_url)
-    canvas_api_token_iv TEXT,                   -- Initialization vector for token encryption
-    present_periods VARCHAR(10) DEFAULT '2-6',
-    is_new_user BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id                          SERIAL PRIMARY KEY,
+    email                       VARCHAR(255) UNIQUE NOT NULL,
+    password                    VARCHAR(255) NOT NULL,
+    name                        VARCHAR(255) NOT NULL,
+    grade                       VARCHAR(50),
+    canvas_api_token            TEXT,                           -- AES-256-GCM encrypted Canvas personal access token
+    canvas_api_token_iv         TEXT,                           -- GCM initialisation vector
+    present_periods             VARCHAR(20)     DEFAULT '2-6',  -- OSG periods the student attends (e.g. '2-6')
+    is_new_user                 BOOLEAN         DEFAULT TRUE,   -- Cleared on first account setup save
+    is_admin                    BOOLEAN         DEFAULT FALSE,
+    is_banned                   BOOLEAN         DEFAULT FALSE,
+    ban_reason                  TEXT,
+    show_in_feed                BOOLEAN         DEFAULT TRUE,   -- Opt in/out of the Live Activity Feed
+    schedule_enhanced           BOOLEAN         DEFAULT FALSE,  -- TRUE once the enhanced schedule is saved
+    last_sync                   TIMESTAMP,                      -- Last successful Canvas sync timestamp
+    -- Insignia system
+    insignia_days               INTEGER         DEFAULT 0,      -- Distinct days the user completed >=1 task (never resets)
+    insignia_selected           VARCHAR(30)     DEFAULT 'Default', -- Active insignia tier key
+    -- Streak shields
+    streak_shields_available    INTEGER         DEFAULT 0,
+    streak_shield_mode          VARCHAR(10)     DEFAULT 'manual'
+                                    CHECK (streak_shield_mode IN ('manual', 'automatic')),
+    -- Calendar preferences
+    calendar_show_homeroom      BOOLEAN         DEFAULT FALSE,
+    calendar_show_completed     BOOLEAN         DEFAULT TRUE,
+    calendar_show_prev_week     BOOLEAN         DEFAULT FALSE,
+    calendar_show_current_week  BOOLEAN         DEFAULT TRUE,
+    calendar_show_next_week1    BOOLEAN         DEFAULT FALSE,
+    calendar_show_next_week2    BOOLEAN         DEFAULT FALSE,
+    calendar_show_weekends      BOOLEAN         DEFAULT TRUE,
+    -- Timestamps
+    created_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    updated_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
 );
 
--- Migration: Add API token columns if upgrading from ICS system
-ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token_iv TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token_iv        TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS present_periods            VARCHAR(20)  DEFAULT '2-6';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_user                BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin                   BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned                  BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason                 TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS show_in_feed               BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS schedule_enhanced          BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_sync                  TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_days              INTEGER      DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_selected          VARCHAR(30)  DEFAULT 'Default';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER      DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed    BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_prev_week    BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week1   BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week2   BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_weekends     BOOLEAN      DEFAULT TRUE;
 
--- NEW Tasks table - Completely redesigned with title/segment system
-CREATE TABLE IF NOT EXISTS tasks (
-    id SERIAL PRIMARY KEY,                      -- Permanent unique ID for each task/segment
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(500) NOT NULL,                -- Base task name (never changes, acts like old parent_id)
-    segment VARCHAR(500),                       -- NULL for base tasks, "Part 1" or "Hypothesis - First Phase" for splits
-    class VARCHAR(200) NOT NULL,                -- Course name from Canvas API
-    description TEXT,                           -- From assignment.description in Canvas API (HTML formatted)
-    url TEXT NOT NULL,                          -- Direct assignment URL from Canvas API
-    deadline_date DATE NOT NULL,                -- From assignment.due_at (date part)
-    deadline_time TIME,                         -- From assignment.due_at (time part, NULL if date-only)
-    estimated_time INTEGER NOT NULL,            -- AI-calculated estimate (minutes)
-    user_estimated_time INTEGER,                -- User override (NULL if not set)
-    accumulated_time INTEGER DEFAULT 0,         -- Replaces partial_completions table
-    completed BOOLEAN DEFAULT FALSE,            -- When TRUE, moves to tasks_completed
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    priority_order INTEGER,                     -- Manual priority override (NULL by default)
-    is_new BOOLEAN DEFAULT FALSE,               -- Marks newly imported tasks
-    deleted BOOLEAN DEFAULT FALSE,              -- Marks tasks as deleted/checked off without removing from database
-    -- NEW CANVAS API FIELDS
-    course_id BIGINT,                           -- Canvas course ID
-    assignment_id BIGINT,                       -- Canvas assignment ID (unique identifier)
-    points_possible DECIMAL(10,2),              -- Maximum points for assignment
-    assignment_group_id BIGINT,                 -- Category ID (Homework, Exams, etc.)
-    current_score DECIMAL(10,2),                -- Student's current score
-    current_grade VARCHAR(10),                  -- Student's current grade (letter/percent)
-    grading_type VARCHAR(20),                   -- How it's graded (points, percent, pass_fail, etc.)
-    unlock_at TIMESTAMP,                        -- When assignment becomes available
-    lock_at TIMESTAMP,                          -- When assignment locks
-    submitted_at TIMESTAMP,                     -- When student submitted
-    is_missing BOOLEAN DEFAULT false,           -- Canvas missing flag
-    is_late BOOLEAN DEFAULT false,              -- Canvas late flag
-    UNIQUE(user_id, assignment_id)              -- Prevent duplicate assignments per user
-);
+ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
+ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
+ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
 
--- Migration: Add new Canvas API columns to existing tasks table
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS course_id BIGINT;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_id BIGINT;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS points_possible DECIMAL(10,2);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_group_id BIGINT;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_score DECIMAL(10,2);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_grade VARCHAR(10);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grading_type VARCHAR(20);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unlock_at TIMESTAMP;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lock_at TIMESTAMP;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing BOOLEAN DEFAULT false;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late BOOLEAN DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_users_email     ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRST);
 
--- Schedules table - Fixed SERIAL ID
-CREATE TABLE IF NOT EXISTS schedules (
-    id SERIAL PRIMARY KEY,                      -- Fixed: Now permanent ID
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    day VARCHAR(20) NOT NULL,
-    period INTEGER NOT NULL,
-    type VARCHAR(20) NOT NULL,
-    UNIQUE(user_id, day, period)
-);
 
--- Session state table - Fixed SERIAL ID, removed session_id
-CREATE TABLE IF NOT EXISTS session_state (
-    id SERIAL PRIMARY KEY,                      -- Fixed: Now permanent ID
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    day VARCHAR(20) NOT NULL,
-    period INTEGER NOT NULL,
-    remaining_time INTEGER NOT NULL,
-    current_task_index INTEGER NOT NULL,        -- References tasks.id
-    task_start_time INTEGER NOT NULL,
-    completed_task_ids INTEGER[] DEFAULT '{}',
-    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id)
-);
+-- ============================================================================
+-- COURSES
+-- Synced from Canvas enrolments. One row per user per Canvas course.
+-- ============================================================================
 
--- Feedback table - Fixed SERIAL ID
-CREATE TABLE IF NOT EXISTS feedback (
-    id SERIAL PRIMARY KEY,                      -- Fixed: Now permanent ID
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    user_email VARCHAR(255),
-    user_name VARCHAR(255),
-    feedback_text TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Courses table - For Marks tab and grade tracking
 CREATE TABLE IF NOT EXISTS courses (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    course_id BIGINT NOT NULL,                  -- Canvas course ID
-    name VARCHAR(255) NOT NULL,                 -- Course name
-    course_code VARCHAR(50),                    -- Course code (e.g., "ENG-11")
-    current_score DECIMAL(5,2),                 -- Current percentage in course
-    current_grade VARCHAR(10),                  -- Current letter grade
-    final_score DECIMAL(5,2),                   -- Final percentage (if available)
-    final_grade VARCHAR(10),                    -- Final letter grade
-    enrollment_id BIGINT,                       -- Canvas enrollment ID
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, course_id)                  -- Prevent duplicate courses per user
+    id                      SERIAL PRIMARY KEY,
+    user_id                 INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id               BIGINT  NOT NULL,
+    name                    VARCHAR(255) NOT NULL,
+    course_code             VARCHAR(100),
+    current_score           NUMERIC(6,2),
+    current_grade           VARCHAR(50),
+    final_score             NUMERIC(6,2),
+    final_grade             VARCHAR(50),
+    current_period_score    NUMERIC(6,2),
+    current_period_grade    VARCHAR(50),
+    grading_period_id       INTEGER,
+    grading_period_title    TEXT,
+    enrollment_id           BIGINT,
+    zoom_number             TEXT,
+    enabled                 BOOLEAN DEFAULT TRUE,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, course_id)
 );
 
--- Assignment groups table - For grade weight calculations
-CREATE TABLE IF NOT EXISTS assignment_groups (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    course_id BIGINT NOT NULL,                  -- Which course this belongs to
-    group_id BIGINT NOT NULL,                   -- Canvas assignment group ID
-    name VARCHAR(255) NOT NULL,                 -- Category name (e.g., "Homework")
-    weight DECIMAL(5,2),                        -- Percentage weight in final grade
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, course_id, group_id)        -- Prevent duplicates
-);
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS course_code          VARCHAR(100);
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS current_period_score NUMERIC(6,2);
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS current_period_grade VARCHAR(50);
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS grading_period_id    INTEGER;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS grading_period_title TEXT;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS enrollment_id        BIGINT;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS zoom_number          TEXT;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS enabled              BOOLEAN DEFAULT TRUE;
+ALTER TABLE courses ALTER COLUMN current_grade TYPE VARCHAR(50);
+ALTER TABLE courses ALTER COLUMN final_grade    TYPE VARCHAR(50);
 
--- NEW Tasks Completed table - Replaces completion_history
--- Consolidates segments automatically when all parts are complete
-CREATE TABLE IF NOT EXISTS tasks_completed (
-    id SERIAL PRIMARY KEY,                      -- Permanent ID (kept from original task when moved)
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(500) NOT NULL,                -- Same as tasks.title
-    class VARCHAR(200) NOT NULL,                -- Same as tasks.class
-    description TEXT,                           -- Same as tasks.description
-    url TEXT NOT NULL,                          -- Same as tasks.url (used for consolidation matching)
-    deadline TIMESTAMP NOT NULL,                -- Same as tasks.deadline
-    estimated_time INTEGER NOT NULL,            -- Merged: shows user_estimated_time OR estimated_time
-    actual_time INTEGER NOT NULL,               -- Renamed from accumulated_time
-    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- ============================================================================
--- INDEXES FOR PERFORMANCE
--- ============================================================================
-
--- Users
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-
--- Tasks
-CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_title ON tasks(title);
-CREATE INDEX IF NOT EXISTS idx_tasks_class ON tasks(class);
-CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);
-CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date ON tasks(deadline_date);
-CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
-CREATE INDEX IF NOT EXISTS idx_tasks_priority_order ON tasks(priority_order);
-CREATE INDEX IF NOT EXISTS idx_tasks_is_new ON tasks(is_new);
-CREATE INDEX IF NOT EXISTS idx_tasks_segment ON tasks(segment);
-CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(deleted);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignment_id ON tasks(assignment_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_course_id ON tasks(course_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignment_group_id ON tasks(assignment_group_id);
-
--- Tasks Completed
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id ON tasks_completed(user_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_url ON tasks_completed(url);
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_class ON tasks_completed(class);
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_title ON tasks_completed(title);
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_completed_at ON tasks_completed(completed_at);
-
--- Schedules
-CREATE INDEX IF NOT EXISTS idx_schedules_user_id ON schedules(user_id);
-
--- Session State
-CREATE INDEX IF NOT EXISTS idx_session_state_user_id ON session_state(user_id);
-
--- Feedback
-CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
-CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at);
-
--- Courses
-CREATE INDEX IF NOT EXISTS idx_courses_user_id ON courses(user_id);
+CREATE INDEX IF NOT EXISTS idx_courses_user_id   ON courses(user_id);
 CREATE INDEX IF NOT EXISTS idx_courses_course_id ON courses(course_id);
 
--- Assignment Groups
-CREATE INDEX IF NOT EXISTS idx_assignment_groups_user_id ON assignment_groups(user_id);
+
+-- ============================================================================
+-- ASSIGNMENT GROUPS
+-- Canvas assignment groups with grade weights per course.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS assignment_groups (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id   BIGINT  NOT NULL,
+    group_id    BIGINT  NOT NULL,
+    name        VARCHAR(255) NOT NULL,
+    weight      NUMERIC(5,2),
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, course_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assignment_groups_user_id   ON assignment_groups(user_id);
 CREATE INDEX IF NOT EXISTS idx_assignment_groups_course_id ON assignment_groups(course_id);
-CREATE INDEX IF NOT EXISTS idx_assignment_groups_group_id ON assignment_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_groups_group_id  ON assignment_groups(group_id);
+
 
 -- ============================================================================
--- TRIGGERS
+-- TASKS
+-- Active assignments imported from Canvas. Supports split segments.
 -- ============================================================================
 
--- Function to update updated_at timestamp
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+CREATE TABLE IF NOT EXISTS tasks (
+    id                      SERIAL PRIMARY KEY,
+    user_id                 INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- Identity
+    title                   VARCHAR(500) NOT NULL,
+    segment                 VARCHAR(500),                   -- NULL for base tasks; e.g. 'Part 1' for splits
+    class                   VARCHAR(200) NOT NULL,
+    description             TEXT,
+    url                     TEXT NOT NULL,
+    -- Deadline
+    deadline_date           DATE NOT NULL,
+    deadline_time           TIME,                           -- NULL for date-only assignments
+    -- Time
+    estimated_time          INTEGER NOT NULL,               -- AI-estimated minutes
+    user_estimated_time     INTEGER,                        -- User override (NULL = use estimated_time)
+    accumulated_time        INTEGER DEFAULT 0,              -- Minutes logged so far (task still active)
+    -- State flags
+    completed               BOOLEAN DEFAULT FALSE,
+    deleted                 BOOLEAN DEFAULT FALSE,          -- Ignored/checked off; preserved across syncs
+    ignored                 BOOLEAN DEFAULT FALSE,          -- Explicitly ignored (shown in Resolved tab)
+    is_new                  BOOLEAN DEFAULT FALSE,          -- Freshly imported; pending user acknowledgement
+    session_active          BOOLEAN DEFAULT FALSE,          -- Timer is currently running
+    split_origin            BOOLEAN DEFAULT FALSE,          -- Original task before a split was performed
+    manually_created        BOOLEAN DEFAULT FALSE,          -- Created manually, not from Canvas
+    -- Canvas sync fields
+    course_id               BIGINT,
+    assignment_id           BIGINT,
+    points_possible         NUMERIC(10,2),
+    assignment_group_id     BIGINT,
+    current_score           NUMERIC(10,2),
+    current_grade           VARCHAR(50),
+    grading_type            VARCHAR(50),                    -- 'points' | 'percent' | 'letter_grade' | 'gpa_scale' | 'pass_fail' | 'not_graded'
+    grade_id                INTEGER,                        -- Monotonically increasing; used to detect new grade events
+    unlock_at               TIMESTAMP,
+    lock_at                 TIMESTAMP,
+    submitted_at            TIMESTAMP,
+    is_missing              BOOLEAN DEFAULT FALSE,
+    is_late                 BOOLEAN DEFAULT FALSE,
+    -- Timestamps
+    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, assignment_id)
+);
 
--- Trigger to auto-update updated_at on users
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS segment             VARCHAR(500);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description         TEXT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_date       DATE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_time       TIME;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_estimated_time INTEGER;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS accumulated_time    INTEGER DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ignored             BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_new              BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_active      BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS split_origin        BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS manually_created    BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS course_id           BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_id       BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS points_possible     NUMERIC(10,2);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_group_id BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_score       NUMERIC(10,2);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_grade       VARCHAR(50);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grading_type        VARCHAR(50);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grade_id            INTEGER;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unlock_at           TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lock_at             TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submitted_at        TIMESTAMP;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing          BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late             BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ALTER COLUMN current_grade TYPE VARCHAR(50);
+ALTER TABLE tasks ALTER COLUMN grading_type   TYPE VARCHAR(50);
+ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
+ALTER TABLE tasks DROP COLUMN IF EXISTS deadline;
+
+CREATE INDEX IF NOT EXISTS idx_tasks_user_id          ON tasks(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_title            ON tasks(title);
+CREATE INDEX IF NOT EXISTS idx_tasks_class            ON tasks(class);
+CREATE INDEX IF NOT EXISTS idx_tasks_url              ON tasks(url);
+CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date    ON tasks(deadline_date);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed        ON tasks(completed);
+CREATE INDEX IF NOT EXISTS idx_tasks_deleted          ON tasks(deleted);
+CREATE INDEX IF NOT EXISTS idx_tasks_is_new           ON tasks(is_new);
+CREATE INDEX IF NOT EXISTS idx_tasks_segment          ON tasks(segment);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignment_id    ON tasks(assignment_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_course_id        ON tasks(course_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignment_group ON tasks(assignment_group_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_session_active   ON tasks(user_id, session_active) WHERE session_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_tasks_user_grade_id    ON tasks(user_id, grade_id) WHERE grade_id IS NOT NULL;
+
 
 -- ============================================================================
--- MIGRATION SCRIPT - Run this on existing databases
+-- TASKS COMPLETED
+-- Permanent record of completed tasks. Split segments may be consolidated.
 -- ============================================================================
 
--- CRITICAL: This migration assumes you have MANUALLY dropped the old tasks table
--- If old tables exist, this will create the new structure alongside them
+CREATE TABLE IF NOT EXISTS tasks_completed (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title           VARCHAR(500) NOT NULL,
+    class           VARCHAR(200) NOT NULL,
+    description     TEXT,
+    url             TEXT NOT NULL,              -- Used to match and consolidate split segments
+    deadline_date   DATE NOT NULL,
+    deadline_time   TIME,
+    estimated_time  INTEGER NOT NULL,           -- user_estimated_time if set, otherwise estimated_time
+    actual_time     INTEGER NOT NULL,           -- Total minutes logged (sum across all segments for splits)
+    completed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
--- Nothing to migrate if starting fresh - the CREATE TABLE IF NOT EXISTS statements
--- above will create everything needed
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS description   TEXT;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_date DATE;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_time TIME;
+ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
 
--- If migrating from old system:
--- 1. Manually: DROP TABLE tasks CASCADE;
--- 2. Manually: DROP TABLE partial_completions CASCADE;
--- 3. Manually: DROP TABLE completion_history CASCADE;
--- 4. Run this entire schema file
--- 5. Re-import Canvas calendar data using the new endpoints
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id      ON tasks_completed(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_url          ON tasks_completed(url);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_class        ON tasks_completed(class);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_title        ON tasks_completed(title);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_completed_at ON tasks_completed(completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_deadline     ON tasks_completed(deadline_date);
+
 
 -- ============================================================================
--- TABLE COMMENTS FOR DOCUMENTATION
+-- TASK NOTES
+-- Per-task user notes. One row per (task, user) pair.
 -- ============================================================================
 
-COMMENT ON TABLE users IS 'Student user accounts with Canvas integration';
-
-COMMENT ON TABLE tasks IS 'Active tasks imported from Canvas. Uses title/segment system for split tasks.';
-COMMENT ON COLUMN tasks.title IS 'Base task name extracted from Canvas SUMMARY (before brackets). Never changes, identifies the original task.';
-COMMENT ON COLUMN tasks.segment IS 'NULL for base tasks. For splits: "Part 1", "Hypothesis - First Phase", etc. Identifies current split state.';
-COMMENT ON COLUMN tasks.class IS 'Extracted from brackets in Canvas SUMMARY. Example: [TAiLOR English]';
-COMMENT ON COLUMN tasks.url IS 'Direct assignment URL converted from Canvas calendar URL format';
-COMMENT ON COLUMN tasks.accumulated_time IS 'Replaces partial_completions table. Tracks time spent on incomplete tasks.';
-COMMENT ON COLUMN tasks.deleted IS 'Marks tasks as deleted/ignored by user. Prevents re-import during sync while preserving history.';
-
-COMMENT ON TABLE schedules IS 'User weekly schedule with fixed ID system';
-
-COMMENT ON TABLE session_state IS 'Saved study session state for resume capability. Fixed ID, no session_id.';
-COMMENT ON COLUMN session_state.current_task_index IS 'References the specific task.id being worked on';
-
-COMMENT ON TABLE feedback IS 'User feedback, bug reports, and feature requests with fixed ID';
-
-COMMENT ON TABLE tasks_completed IS 'Completed tasks with automatic segment consolidation. Replaces completion_history.';
-COMMENT ON COLUMN tasks_completed.url IS 'Used to match and consolidate segments from the same original task';
-COMMENT ON COLUMN tasks_completed.estimated_time IS 'Merged field: shows user_estimated_time if it was set, otherwise estimated_time';
-COMMENT ON COLUMN tasks_completed.actual_time IS 'Total time spent. For consolidated tasks, sum of all segment times.';
-
--- ============================================================================
--- VERIFICATION QUERIES
--- ============================================================================
-
--- Verify tasks table structure
-SELECT 
-    'Tasks by type:' as check_type,
-    CASE 
-        WHEN segment IS NULL THEN 'Base Task'
-        WHEN segment IS NOT NULL THEN 'Split Segment'
-    END as task_type,
-    COUNT(*) as count
-FROM tasks
-GROUP BY 
-    CASE 
-        WHEN segment IS NULL THEN 'Base Task'
-        WHEN segment IS NOT NULL THEN 'Split Segment'
-    END;
-
--- Show task examples
-SELECT 
-    id,
-    user_id,
-    LEFT(title, 40) as title,
-    LEFT(segment, 30) as segment,
-    LEFT(class, 20) as class,
-    estimated_time,
-    accumulated_time,
-    completed
-FROM tasks
-ORDER BY user_id, title, segment
-LIMIT 20;
-
--- Verify tasks_completed consolidation
-SELECT 
-    user_id,
-    LEFT(title, 40) as title,
-    LEFT(url, 60) as url,
-    estimated_time,
-    actual_time,
-    completed_at
-FROM tasks_completed
-ORDER BY user_id, completed_at DESC
-LIMIT 20;
-
--- Check for any orphaned session states
-SELECT 
-    ss.id,
-    ss.user_id,
-    ss.current_task_index,
-    CASE 
-        WHEN t.id IS NULL THEN 'ORPHANED - Task does not exist'
-        ELSE 'OK'
-    END as status
-FROM session_state ss
-LEFT JOIN tasks t ON ss.current_task_index = t.id AND ss.user_id = t.user_id;
-
-
-
--- Run this SQL to add the notes table
 CREATE TABLE IF NOT EXISTS notes (
-    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (task_id, user_id)
 );
 
@@ -339,826 +285,461 @@ CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
 
 
 -- ============================================================================
--- PlanAssist Hub Features - Database Migration
--- Adds: Completion Feed, Leaderboard, User Feed Preferences
+-- SESSION PRIORITIES
+-- Ordered task list for a user's focus session on a given date.
 -- ============================================================================
 
--- Add show_in_feed column to users table (defaults to true = opted in)
-ALTER TABLE users ADD COLUMN IF NOT EXISTS show_in_feed BOOLEAN DEFAULT true;
-
--- Completion Feed Table
--- Stores recent task completions for the live feed
-CREATE TABLE IF NOT EXISTS completion_feed (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    user_name VARCHAR(255) NOT NULL,
-    user_grade VARCHAR(10),
-    task_title VARCHAR(500) NOT NULL,
-    task_class VARCHAR(200) NOT NULL,
-    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes for completion feed
-CREATE INDEX IF NOT EXISTS idx_completion_feed_completed_at ON completion_feed(completed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_completion_feed_user_id ON completion_feed(user_id);
-
--- Weekly Leaderboard Table
--- Stores weekly task completion counts by grade
-CREATE TABLE IF NOT EXISTS weekly_leaderboard (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    user_name VARCHAR(255) NOT NULL,
-    grade VARCHAR(10) NOT NULL,
-    tasks_completed INTEGER DEFAULT 0,
-    week_start DATE NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, week_start)
-);
-
--- Indexes for weekly leaderboard
-CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_week_start ON weekly_leaderboard(week_start DESC);
-CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_grade ON weekly_leaderboard(grade);
-CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_tasks_completed ON weekly_leaderboard(tasks_completed DESC);
-
--- Comments for documentation
-COMMENT ON TABLE completion_feed IS 'Live feed of recent task completions across all users (respecting privacy settings)';
-COMMENT ON TABLE weekly_leaderboard IS 'Weekly task completion counts by grade, resets each Monday';
-COMMENT ON COLUMN users.show_in_feed IS 'User preference: show completions in public feed (default true)';
-
--- Verification queries
-SELECT 'Completion Feed Table Created' as status;
-SELECT 'Weekly Leaderboard Table Created' as status;
-SELECT 'Users table updated with show_in_feed column' as status;
-
-
-
-
-
--- Migration: Split deadline into deadline_date and deadline_time
--- This allows proper handling of date-only vs datetime assignments from Canvas
-
--- Step 1: Add new columns
-ALTER TABLE tasks 
-ADD COLUMN IF NOT EXISTS deadline_date DATE,
-ADD COLUMN IF NOT EXISTS deadline_time TIME;
-
--- Step 2: Migrate existing data (if any exists)
--- Parse existing deadline column into date and time components (only if deadline column still exists)
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'tasks' AND column_name = 'deadline'
-  ) THEN
-    UPDATE tasks
-    SET 
-      deadline_date = CASE 
-        WHEN deadline IS NOT NULL THEN DATE(deadline)
-        ELSE NULL
-      END,
-      deadline_time = CASE 
-        WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
-          CASE 
-            WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
-            ELSE NULL
-          END
-        ELSE NULL
-      END
-    WHERE deadline IS NOT NULL;
-  END IF;
-END $$;
-
--- Step 3: Drop old deadline column (safe even if already dropped)
-ALTER TABLE tasks DROP COLUMN IF EXISTS deadline;
-
--- Step 4: Add constraints
-ALTER TABLE tasks ALTER COLUMN deadline_date SET NOT NULL;
--- deadline_time can be NULL (for date-only assignments)
-
--- Step 5: Update indexes
-DROP INDEX IF EXISTS idx_tasks_deadline;
-CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date ON tasks(deadline_date);
-
--- Step 6: Do the same for tasks_completed table
-ALTER TABLE tasks_completed 
-ADD COLUMN IF NOT EXISTS deadline_date DATE,
-ADD COLUMN IF NOT EXISTS deadline_time TIME;
-
--- Only migrate if the old deadline column still exists
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'tasks_completed' AND column_name = 'deadline'
-  ) THEN
-    UPDATE tasks_completed
-    SET 
-      deadline_date = CASE 
-        WHEN deadline IS NOT NULL THEN DATE(deadline)
-        ELSE NULL
-      END,
-      deadline_time = CASE 
-        WHEN deadline IS NOT NULL AND deadline::text LIKE '%:%' THEN 
-          CASE 
-            WHEN deadline::TIME != '23:59:00'::time THEN deadline::TIME
-            ELSE NULL
-          END
-        ELSE NULL
-      END
-    WHERE deadline IS NOT NULL;
-
-    ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
-  END IF;
-END $$;
-
-ALTER TABLE tasks_completed ALTER COLUMN deadline_date SET NOT NULL;
-
-DROP INDEX IF EXISTS idx_tasks_completed_deadline;
-CREATE INDEX IF NOT EXISTS idx_tasks_completed_deadline_date ON tasks_completed(deadline_date);
-
--- Migration: Add calendar preference columns to users table
--- Safe: IF NOT EXISTS is idempotent, existing rows get the defaults
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_today_centered BOOLEAN DEFAULT false;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom  BOOLEAN DEFAULT false;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed BOOLEAN DEFAULT true;
-
-ALTER TABLE session_state 
-  ADD COLUMN IF NOT EXISTS partial_task_times JSONB DEFAULT NULL;
-
--- Add current grading period score columns to courses table
-ALTER TABLE courses
-  ADD COLUMN IF NOT EXISTS current_period_score NUMERIC,
-  ADD COLUMN IF NOT EXISTS current_period_grade TEXT,
-  ADD COLUMN IF NOT EXISTS grading_period_id INTEGER,
-  ADD COLUMN IF NOT EXISTS grading_period_title TEXT;
-
-
--- Add session_active flag to tasks table
--- Tracks whether a task currently has an in-progress timer session
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_active BOOLEAN DEFAULT false;
-
--- Drop old sessions infrastructure (no longer needed)
-DROP TABLE IF EXISTS user_sessions;
-
--- Agendas table
-CREATE TABLE IF NOT EXISTS agendas (
-  id            SERIAL PRIMARY KEY,
-  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name          TEXT NOT NULL,
-  task_ids      INTEGER[] NOT NULL,          -- ordered list of 1-3 task IDs
-  finished      BOOLEAN NOT NULL DEFAULT false,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS agendas_user_id_idx ON agendas(user_id);
-
-COMMENT ON TABLE agendas IS 'User-created agenda blocks grouping 1-3 tasks for a focused work session.';
-COMMENT ON COLUMN agendas.task_ids IS 'Ordered array of task IDs (max 3). Tasks can appear in multiple agendas.';
-COMMENT ON COLUMN agendas.finished IS 'True once all tasks in the agenda have been marked complete.';
-
--- ============================================================
--- Migration: Itinerary feature (uses existing schedules table)
--- ============================================================
-
--- 1. Add unique constraint to schedules so ON CONFLICT works for upserts
-ALTER TABLE schedules
-  ADD CONSTRAINT schedules_user_day_period_unique UNIQUE (user_id, day, period);
-
--- 2. Add course columns to existing schedules table
-ALTER TABLE schedules
-  ADD COLUMN IF NOT EXISTS course_id   INTEGER REFERENCES courses(id) ON DELETE SET NULL,
-  ADD COLUMN IF NOT EXISTS course_name TEXT;
-
--- 3. Add schedule_enhanced flag to users
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS schedule_enhanced BOOLEAN NOT NULL DEFAULT false;
-
--- 4. Add zoom_number to courses
-ALTER TABLE courses
-  ADD COLUMN IF NOT EXISTS zoom_number TEXT;
-
--- 5. Itinerary slots table: maps each Study period slot to an agenda for a given day
-CREATE TABLE IF NOT EXISTS itinerary_slots (
-  id         SERIAL PRIMARY KEY,
-  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  day        TEXT NOT NULL,
-  period     INTEGER NOT NULL,
-  agenda_id  INTEGER REFERENCES agendas(id) ON DELETE SET NULL,
-  UNIQUE (user_id, day, period)
-);
-
-CREATE INDEX IF NOT EXISTS itinerary_slots_user_idx ON itinerary_slots(user_id);
-
-COMMENT ON COLUMN schedules.course_id   IS 'Course assigned to this Lesson period (enhanced schedule).';
-COMMENT ON COLUMN schedules.course_name IS 'Denormalised course name for display.';
-COMMENT ON TABLE  itinerary_slots       IS 'Maps each Study period slot in the Itinerary to an agenda.';
-
--- ============================================================
--- Migration: Tutorials feature
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS tutorials (
-  id          SERIAL PRIMARY KEY,
-  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  day         TEXT NOT NULL,       -- 'Monday', 'Tuesday', etc.
-  period      INTEGER NOT NULL,
-  zoom_number TEXT,
-  topic       TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (user_id, day, period)    -- one tutorial per day/period slot
-);
-
-CREATE INDEX IF NOT EXISTS tutorials_user_idx ON tutorials(user_id);
-
-COMMENT ON TABLE tutorials IS 'Stores booked tutorial sessions per day/period slot.';
-
--- ============================================================
--- Migration: Misc fixes
--- ============================================================
-
--- 1. Add manually_created flag to tasks
-ALTER TABLE tasks
-  ADD COLUMN IF NOT EXISTS manually_created BOOLEAN NOT NULL DEFAULT false;
-
--- 2. Mark existing split-task segments as manually_created=false (default),
---    they are handled by Sync guard logic not this flag
--- (no data migration needed for segments)
-
--- 3. Trigger a one-time priority reorder for all users
---    (fixes gaps created by manual DB edits - item #4)
-WITH ordered AS (
-  SELECT id,
-    ROW_NUMBER() OVER (
-      PARTITION BY user_id
-      ORDER BY priority_order ASC NULLS LAST, deadline_date ASC, deadline_time ASC NULLS LAST
-    ) AS new_order
-  FROM tasks
-  WHERE deleted = false AND completed = false AND priority_order IS NOT NULL
-)
-UPDATE tasks SET priority_order = ordered.new_order
-FROM ordered WHERE tasks.id = ordered.id;
-
--- ============================================================
--- Migration: Admin Console
--- ============================================================
-
--- 1. Add admin/ban columns to users
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false,
-  ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT false,
-  ADD COLUMN IF NOT EXISTS ban_reason TEXT;
-
--- 2. Admin audit log
-CREATE TABLE IF NOT EXISTS admin_audit_log (
-  id SERIAL PRIMARY KEY,
-  admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
-  admin_name TEXT NOT NULL,
-  action TEXT NOT NULL,          -- e.g. 'BAN_USER', 'EDIT_USER', 'DISMISS_ANNOUNCEMENT'
-  target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  target_user_name TEXT,
-  details JSONB,                 -- flexible payload for action-specific data
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- 3. Announcements (persistent banners)
-CREATE TABLE IF NOT EXISTS announcements (
-  id SERIAL PRIMARY KEY,
-  author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
-  author_name TEXT NOT NULL,
-  message TEXT NOT NULL,
-  type TEXT NOT NULL DEFAULT 'info',   -- 'info' (dismissible, blue) | 'urgent' (non-dismissible, red/orange)
-  is_active BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  deactivated_at TIMESTAMPTZ
-);
-
--- 4. Per-user announcement dismissals (only used for dismissible announcements)
-CREATE TABLE IF NOT EXISTS announcement_dismissals (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
-  dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (user_id, announcement_id)
-);
-
--- Add split_origin column to tasks
-ALTER TABLE tasks
-  ADD COLUMN IF NOT EXISTS split_origin BOOLEAN NOT NULL DEFAULT false;
-
--- Backfill: mark existing split-origin tasks
--- A split-origin task is deleted=true, has a url, and at least one segment sibling
--- exists with the same url and user_id
-UPDATE tasks t
-SET split_origin = true
-WHERE t.deleted = true
-  AND t.completed = false
-  AND t.url IS NOT NULL
-  AND t.segment IS NULL
-  AND EXISTS (
-    SELECT 1 FROM tasks seg
-    WHERE seg.user_id = t.user_id
-      AND seg.url = t.url
-      AND seg.segment IS NOT NULL
-  );
-
--- ============================================================
--- PlanAssist Migration: Account & Analytics Revamp
--- Run in Supabase SQL Editor
--- ============================================================
-
--- 1. Add 'ignored' column to tasks table
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ignored BOOLEAN DEFAULT FALSE;
-
--- 2. Add 'enabled' column to courses table (controls visibility everywhere)
-ALTER TABLE courses ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE;
-
--- 3. Add help_content table (global, admin-editable)
-CREATE TABLE IF NOT EXISTS help_content (
-  id INTEGER PRIMARY KEY DEFAULT 1,
-  content TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_by INTEGER REFERENCES users(id)
-);
-
--- Seed a default row so there's always one to UPDATE
-INSERT INTO help_content (id, content) VALUES (1, '')
-ON CONFLICT (id) DO NOTHING;
-
--- ============================================================
--- Done. Deploy server.js and App.jsx after running this.
--- ============================================================
-
--- Add grade_id column to tasks for tracking grade detection order
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grade_id INTEGER DEFAULT NULL;
-
--- Index for efficient lookup of max grade_id per user
-CREATE INDEX IF NOT EXISTS idx_tasks_user_grade_id ON tasks (user_id, grade_id) WHERE grade_id IS NOT NULL;
-
--- ============================================================
--- Agendas v2 migration
--- Replaces task_ids[] with a rows JSONB column and adds
--- per-row progress tracking columns.
--- ============================================================
-
--- Add new columns
-ALTER TABLE agendas
-  ADD COLUMN IF NOT EXISTS rows        JSONB    NOT NULL DEFAULT '[]',
-  ADD COLUMN IF NOT EXISTS current_row INTEGER  NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS current_row_elapsed  INTEGER  NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS current_row_countdown INTEGER  DEFAULT NULL;
-
--- Migrate existing agendas: convert task_ids[] → rows JSONB
--- Each task becomes a row with action='Work on Task' and
--- timeMins = the task's estimated_time (or 25 if null).
-UPDATE agendas a
-SET rows = (
-  SELECT jsonb_agg(
-    jsonb_build_object(
-      'rowIndex',  ordinality - 1,
-      'taskId',    tid,
-      'action',    'Work on Task',
-      'timeMins',  COALESCE(
-                     (SELECT COALESCE(user_estimated_time, estimated_time)
-                      FROM tasks
-                      WHERE id = tid AND user_id = a.user_id
-                      LIMIT 1),
-                     25
-                   )
-    )
-    ORDER BY ordinality
-  )
-  FROM unnest(a.task_ids) WITH ORDINALITY AS t(tid, ordinality)
-)
-WHERE array_length(task_ids, 1) > 0;
-
--- Drop the old column (safe after migration)
-ALTER TABLE agendas DROP COLUMN IF EXISTS task_ids;
-
--- Update the comment
-COMMENT ON TABLE agendas IS 'User-created agenda blocks with ordered rows of task+action+time.';
-COMMENT ON COLUMN agendas.rows IS 'JSONB array of {rowIndex, taskId, action, timeMins}. Max 10 rows.';
-COMMENT ON COLUMN agendas.current_row IS '0-based index of the row currently being worked on.';
-COMMENT ON COLUMN agendas.current_row_elapsed IS 'Seconds spent on in-session timer for current row (saved on exit).';
-COMMENT ON COLUMN agendas.current_row_countdown IS 'Seconds remaining on countdown timer when user saved and exited. NULL = full timeMins.';
-
--- Widen grading_type column to accommodate all Canvas grading type strings
--- Canvas values include: 'points', 'percent', 'letter_grade', 'gpa_scale', 'not_graded', 'pass_fail'
--- Previous VARCHAR(10) was too narrow for 'letter_grade' (12 chars)
-ALTER TABLE tasks ALTER COLUMN grading_type TYPE VARCHAR(200);
-
--- Fix VARCHAR columns that are too narrow for Canvas API data
--- current_grade: Canvas can return values longer than 10 chars
-ALTER TABLE tasks ALTER COLUMN current_grade TYPE VARCHAR(50);
-
--- courses table has the same issue  
-ALTER TABLE courses ALTER COLUMN current_grade TYPE VARCHAR(50);
-ALTER TABLE courses ALTER COLUMN final_grade TYPE VARCHAR(50);
-
--- grading_type: was VARCHAR(20) in schema but VARCHAR(10) may have been applied
--- 'letter_grade' is 12 chars, set generously
-ALTER TABLE tasks ALTER COLUMN grading_type TYPE VARCHAR(50);
-
--- completion_feed and leaderboard grade columns (if they exist)
-ALTER TABLE weekly_leaderboard ALTER COLUMN grade TYPE VARCHAR(50);
-ALTER TABLE completion_feed ALTER COLUMN user_grade TYPE VARCHAR(50);
-
-SELECT 
-  'Tasks table migration complete' as status,
-  COUNT(*) as total_tasks,
-  COUNT(deadline_time) as tasks_with_time,
-  COUNT(*) - COUNT(deadline_time) as tasks_date_only
-FROM tasks;
-
-SELECT 
-  'Tasks completed table migration complete' as status,
-  COUNT(*) as total_tasks,
-  COUNT(deadline_time) as tasks_with_time,
-  COUNT(*) - COUNT(deadline_time) as tasks_date_only
-FROM tasks_completed;
-
--- UPDATE!
-
-
--- Feature 1: Itinerary date column
-ALTER TABLE itinerary_slots ADD COLUMN IF NOT EXISTS date DATE;
-UPDATE itinerary_slots SET date = NULL;
-ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
-ALTER TABLE itinerary_slots ADD CONSTRAINT itinerary_slots_user_date_period_unique UNIQUE (user_id, date, period);
-
--- Feature 1: Tutorials date column (replace day)
-ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS date DATE;
-UPDATE tutorials SET date = NULL;
-ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
-ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
-
--- Feature 2: Calendar week toggle columns
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS calendar_show_prev_week BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN DEFAULT true,
-  ADD COLUMN IF NOT EXISTS calendar_show_next_week1 BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_next_week2 BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_weekends BOOLEAN DEFAULT true;
-
-
-
--- UPDATE!
-
-
--- 1. Remove the now-unused calendar_today_centered column
-ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
-
--- 2. Drop the day column from itinerary_slots
-ALTER TABLE itinerary_slots DROP COLUMN IF EXISTS day;
-
--- 3. Drop the day column from tutorials
-ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
-
--- 4. Drop the old day-based constraint on itinerary_slots (if it still exists)
-ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
-
--- 5. Drop the old day-based constraint on tutorials (if it still exists)
-ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
-
--- 6. Ensure tutorials has the date-based unique constraint
-ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
-
-
-
--- Feature 1: Itinerary date column
-ALTER TABLE itinerary_slots ADD COLUMN IF NOT EXISTS date DATE;
-UPDATE itinerary_slots SET date = NULL;
-ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
-ALTER TABLE itinerary_slots ADD CONSTRAINT itinerary_slots_user_date_period_unique UNIQUE (user_id, date, period);
-
--- Feature 1: Tutorials date column (replace day)
-ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS date DATE;
-UPDATE tutorials SET date = NULL;
-ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
-ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
-
--- Feature 2: Calendar week toggle columns
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS calendar_show_prev_week BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN DEFAULT true,
-  ADD COLUMN IF NOT EXISTS calendar_show_next_week1 BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_next_week2 BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS calendar_show_weekends BOOLEAN DEFAULT true;
-
-
-
--- 1. Remove the now-unused calendar_today_centered column
-ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
-
--- 2. Drop the day column from itinerary_slots
-ALTER TABLE itinerary_slots DROP COLUMN IF EXISTS day;
-
--- 3. Drop the day column from tutorials
-ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
-
--- 4. Drop the old day-based constraint on itinerary_slots (if it still exists)
-ALTER TABLE itinerary_slots DROP CONSTRAINT IF EXISTS itinerary_slots_user_id_day_period_key;
-
--- 5. Drop the old day-based constraint on tutorials (if it still exists)
-ALTER TABLE tutorials DROP CONSTRAINT IF EXISTS tutorials_user_id_day_period_key;
-
--- 6. Ensure tutorials has the date-based unique constraint
-ALTER TABLE tutorials ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
-
-
-
--- 1. Drop priority_order (already done if you ran the previous migration)
-ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
-
--- 2. Drop is_new — tasks are now always immediately visible, sorted by deadline
-ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
-
--- 3. Drop ignored — tasks are now marked deleted=true directly
---    (Keep this if you want to preserve the ignored→resolved distinction on the Resolved Tasks page)
--- ALTER TABLE tasks DROP COLUMN IF EXISTS ignored;
-
--- 4. Create session_priorities table
 CREATE TABLE IF NOT EXISTS session_priorities (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    date DATE NOT NULL,
-    task_ids JSONB NOT NULL DEFAULT '[]',
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date        DATE NOT NULL,
+    task_ids    JSONB NOT NULL DEFAULT '[]',
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, date)
 );
+
 CREATE INDEX IF NOT EXISTS idx_session_priorities_user_date ON session_priorities(user_id, date);
 
 
-
-ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
-
-
-
 -- ============================================================================
--- Migration: Add last_sync column to users table
--- Tracks when Main Sync or Background Sync last completed for a user.
--- Used by: Diagnostics "Stale Syncs" report, login-time sync decision,
---          Admin Console Users tab, Background Sync updated_since parameter.
--- ============================================================================
-ALTER TABLE users ADD COLUMN IF NOT EXISTS last_sync TIMESTAMP;
-
--- Backfill from MAX(tasks.created_at) for existing users so existing data
--- doesn't make everyone appear as "never synced"
-UPDATE users u
-SET last_sync = (
-  SELECT MAX(t.created_at)
-  FROM tasks t
-  WHERE t.user_id = u.id
-)
-WHERE u.last_sync IS NULL;
-
--- Index for Diagnostics query (ORDER BY last_sync ASC NULLS FIRST)
-CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRST);
-
-
-
-
-
--- ============================================================================
--- PlanAssist Feature Migration
--- Covers: Streak Shields, Feed Labels, Reactions, Announcements targeting,
---         Gallery badges, last_sync (if not already added)
+-- AGENDAS
+-- Structured work blocks with ordered rows of task + action + time budget.
 -- ============================================================================
 
--- ── 1. Users table additions ────────────────────────────────────────────────
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS streak_shields_available INTEGER DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS streak_shield_mode VARCHAR(10) DEFAULT 'manual'
-    CHECK (streak_shield_mode IN ('manual', 'automatic')),
-  ADD COLUMN IF NOT EXISTS feed_label_days INTEGER DEFAULT 0,      -- days with ≥1 task completed (never resets)
-  ADD COLUMN IF NOT EXISTS feed_label_selected VARCHAR(30) DEFAULT 'completed',
-  ADD COLUMN IF NOT EXISTS last_sync TIMESTAMP;                     -- idempotent if already added
-
--- Index for admin health score sort (last_sync)
-CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRST);
-
--- ── 2. Streak shields log ───────────────────────────────────────────────────
--- Each row records one day a shield was consumed (used to fill streak gaps).
-CREATE TABLE IF NOT EXISTS streak_shield_log (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    shield_date DATE NOT NULL,          -- The weekday the shield covered
-    consumed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, shield_date)        -- One shield per day per user
+CREATE TABLE IF NOT EXISTS agendas (
+    id                      SERIAL PRIMARY KEY,
+    user_id                 INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name                    TEXT NOT NULL,
+    rows                    JSONB NOT NULL DEFAULT '[]',    -- [{rowIndex, taskId, action, timeMins, zone?}]
+    current_row             INTEGER NOT NULL DEFAULT 0,     -- 0-based index of the active row
+    current_row_elapsed     INTEGER NOT NULL DEFAULT 0,     -- Seconds spent on current row's timer this session
+    current_row_countdown   INTEGER,                        -- Seconds remaining on countdown (NULL = full timeMins)
+    finished                BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_streak_shield_log_user ON streak_shield_log(user_id, shield_date DESC);
 
--- ── 3. Feed reactions ───────────────────────────────────────────────────────
--- One reaction per user per feed entry, replace on change.
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS rows                  JSONB   NOT NULL DEFAULT '[]';
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row_elapsed   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row_countdown INTEGER;
+ALTER TABLE agendas DROP COLUMN IF EXISTS task_ids;
+
+CREATE INDEX IF NOT EXISTS idx_agendas_user_id ON agendas(user_id);
+
+
+-- ============================================================================
+-- SCHEDULES
+-- User's weekly timetable. One row per period per day.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day         VARCHAR(20) NOT NULL,
+    period      INTEGER NOT NULL,
+    type        VARCHAR(20) NOT NULL,
+    course_id   INTEGER REFERENCES courses(id) ON DELETE SET NULL,
+    course_name TEXT,
+    UNIQUE(user_id, day, period)
+);
+
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS course_id   INTEGER REFERENCES courses(id) ON DELETE SET NULL;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS course_name TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_schedules_user_id ON schedules(user_id);
+
+
+-- ============================================================================
+-- ITINERARY SLOTS
+-- Maps Study period slots on a specific date to an agenda.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS itinerary_slots (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date        DATE NOT NULL,
+    period      INTEGER NOT NULL,
+    agenda_id   INTEGER REFERENCES agendas(id) ON DELETE SET NULL,
+    UNIQUE(user_id, date, period)
+);
+
+ALTER TABLE itinerary_slots DROP COLUMN IF EXISTS day;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'itinerary_slots_user_date_period_unique'
+    ) THEN
+        ALTER TABLE itinerary_slots
+            ADD CONSTRAINT itinerary_slots_user_date_period_unique UNIQUE (user_id, date, period);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_itinerary_slots_user ON itinerary_slots(user_id);
+
+
+-- ============================================================================
+-- TUTORIALS
+-- Booked tutorial sessions per date/period slot.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS tutorials (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date        DATE NOT NULL,
+    period      INTEGER NOT NULL,
+    zoom_number TEXT,
+    topic       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, date, period)
+);
+
+ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'tutorials_user_date_period_unique'
+    ) THEN
+        ALTER TABLE tutorials
+            ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_tutorials_user ON tutorials(user_id);
+
+
+-- ============================================================================
+-- COMPLETION FEED
+-- Live feed of recent Canvas task completions across opted-in users.
+-- The insignia column is stored at completion time but the feed query
+-- always joins users.insignia_selected live so the display is always current.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS completion_feed (
+    id           SERIAL PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_name    VARCHAR(255) NOT NULL,
+    user_grade   VARCHAR(50),
+    task_title   VARCHAR(500) NOT NULL,
+    task_class   VARCHAR(200) NOT NULL,
+    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    insignia     VARCHAR(30) DEFAULT 'Default'
+);
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'completion_feed' AND column_name = 'feed_label'
+    ) THEN
+        ALTER TABLE completion_feed RENAME COLUMN feed_label TO insignia;
+    END IF;
+END $$;
+
+ALTER TABLE completion_feed ADD COLUMN IF NOT EXISTS insignia VARCHAR(30) DEFAULT 'Default';
+ALTER TABLE completion_feed ALTER COLUMN insignia SET DEFAULT 'Default';
+ALTER TABLE completion_feed ALTER COLUMN user_grade TYPE VARCHAR(50);
+
+CREATE INDEX IF NOT EXISTS idx_completion_feed_completed_at ON completion_feed(completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_completion_feed_user_id      ON completion_feed(user_id);
+
+
+-- ============================================================================
+-- FEED REACTIONS
+-- Emoji reactions on completion feed entries. One per user per entry.
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS feed_reactions (
-    id SERIAL PRIMARY KEY,
-    feed_entry_id INTEGER NOT NULL REFERENCES completion_feed(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    emoji VARCHAR(10) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(feed_entry_id, user_id)      -- one reaction per user per entry
+    id              SERIAL PRIMARY KEY,
+    feed_entry_id   INTEGER NOT NULL REFERENCES completion_feed(id) ON DELETE CASCADE,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji           VARCHAR(10) NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(feed_entry_id, user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_feed_reactions_entry ON feed_reactions(feed_entry_id);
-CREATE INDEX IF NOT EXISTS idx_feed_reactions_user ON feed_reactions(user_id);
 
--- ── 4. Feed label unlock tracking ──────────────────────────────────────────
--- Records which labels each user has unlocked (for UI display).
-CREATE TABLE IF NOT EXISTS feed_label_unlocks (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    label VARCHAR(30) NOT NULL,
+CREATE INDEX IF NOT EXISTS idx_feed_reactions_entry ON feed_reactions(feed_entry_id);
+CREATE INDEX IF NOT EXISTS idx_feed_reactions_user  ON feed_reactions(user_id);
+
+
+-- ============================================================================
+-- WEEKLY LEADERBOARD
+-- Canvas-confirmed task completion counts by grade, reset each Monday.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS weekly_leaderboard (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_name       VARCHAR(255) NOT NULL,
+    grade           VARCHAR(50) NOT NULL,
+    tasks_completed INTEGER DEFAULT 0,
+    week_start      DATE NOT NULL,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, week_start)
+);
+
+ALTER TABLE weekly_leaderboard ALTER COLUMN grade TYPE VARCHAR(50);
+
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_week_start      ON weekly_leaderboard(week_start DESC);
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_grade           ON weekly_leaderboard(grade);
+CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_tasks_completed ON weekly_leaderboard(tasks_completed DESC);
+
+
+-- ============================================================================
+-- INSIGNIA UNLOCKS
+-- Records which insignia tiers each user has earned.
+-- Tiers (days required): Default=0 Copper=2 Silver=5 Gold=10 Emerald=20
+--                        Amethyst=30 Ruby=40 Diamond=50 Obsidian=75 Aether=100
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS insignia_unlocks (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    label       VARCHAR(30) NOT NULL,
     unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, label)
 );
-CREATE INDEX IF NOT EXISTS idx_feed_label_unlocks_user ON feed_label_unlocks(user_id);
 
--- ── 5. Gallery badges ───────────────────────────────────────────────────────
+-- Rename from old table name if it still exists and the new one does not
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'feed_label_unlocks')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'insignia_unlocks')
+    THEN
+        ALTER TABLE feed_label_unlocks RENAME TO insignia_unlocks;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_feed_label_unlocks_user') THEN
+        ALTER INDEX idx_feed_label_unlocks_user RENAME TO idx_insignia_unlocks_user;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_insignia_unlocks_user ON insignia_unlocks(user_id);
+
+
+-- ============================================================================
+-- STREAK SHIELD LOG
+-- One row per calendar day a streak shield was consumed.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS streak_shield_log (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    shield_date DATE NOT NULL,
+    consumed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, shield_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_streak_shield_log_user ON streak_shield_log(user_id, shield_date DESC);
+
+
+-- ============================================================================
+-- USER BADGES (Gallery)
+-- badge_key examples: first_completion, tasks_10, tasks_25, tasks_50,
+--   tasks_100, tasks_250, tasks_500, streak_7, streak_14, streak_30
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS user_badges (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    badge_key VARCHAR(60) NOT NULL,     -- e.g. 'first_completion', 'streak_7', 'tasks_50'
-    awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    badge_key   VARCHAR(60) NOT NULL,
+    awarded_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, badge_key)
 );
+
 CREATE INDEX IF NOT EXISTS idx_user_badges_user ON user_badges(user_id);
 
--- ── 6. Announcements: add targeting column ──────────────────────────────────
--- 'all' = everyone, 'existing' = users created before announcement, 'new' = after
-ALTER TABLE announcements
-  ADD COLUMN IF NOT EXISTS target_audience VARCHAR(20) DEFAULT 'all'
-    CHECK (target_audience IN ('all', 'existing', 'new'));
 
--- ── 7. Backfill: feed_label_days from existing tasks_completed data ─────────
--- Count distinct days each user has completed ≥1 task.
+-- ============================================================================
+-- FEEDBACK
+-- User-submitted feedback, bug reports, and feature requests.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_email      VARCHAR(255),
+    user_name       VARCHAR(255),
+    feedback_text   TEXT NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_user_id    ON feedback(user_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at DESC);
+
+
+-- ============================================================================
+-- HELP CONTENT
+-- Single-row table holding admin-editable help page markdown.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS help_content (
+    id          INTEGER PRIMARY KEY DEFAULT 1,
+    content     TEXT NOT NULL DEFAULT '',
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_by  INTEGER REFERENCES users(id)
+);
+
+INSERT INTO help_content (id, content) VALUES (1, '')
+ON CONFLICT (id) DO NOTHING;
+
+
+-- ============================================================================
+-- ANNOUNCEMENTS
+-- Admin-created persistent banners shown to all or targeted users.
+-- type:            'info' (dismissible, blue) | 'urgent' (non-dismissible, red)
+-- target_audience: 'all' | 'existing' (before creation) | 'new' (after creation)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS announcements (
+    id              SERIAL PRIMARY KEY,
+    author_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+    author_name     TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    type            TEXT NOT NULL DEFAULT 'info'
+                        CHECK (type IN ('info', 'urgent')),
+    target_audience VARCHAR(20) NOT NULL DEFAULT 'all'
+                        CHECK (target_audience IN ('all', 'existing', 'new')),
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deactivated_at  TIMESTAMPTZ
+);
+
+ALTER TABLE announcements ADD COLUMN IF NOT EXISTS target_audience VARCHAR(20) DEFAULT 'all';
+
+
+-- ============================================================================
+-- ANNOUNCEMENT DISMISSALS
+-- Tracks which dismissible announcements each user has already closed.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS announcement_dismissals (
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    announcement_id INTEGER NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+    dismissed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, announcement_id)
+);
+
+
+-- ============================================================================
+-- ADMIN AUDIT LOG
+-- Records all admin actions for accountability.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id               SERIAL PRIMARY KEY,
+    admin_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+    admin_name       TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    target_user_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    target_user_name TEXT,
+    details          JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- ============================================================================
+-- TRIGGERS
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+CREATE TRIGGER update_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+-- ============================================================================
+-- BACKFILLS
+-- Safe one-time data corrections. All guarded so they are harmless on re-run.
+-- ============================================================================
+
+-- Backfill last_sync from MAX(tasks.created_at) for users who appear to never have synced
 UPDATE users u
-SET feed_label_days = (
+SET last_sync = (SELECT MAX(t.created_at) FROM tasks t WHERE t.user_id = u.id)
+WHERE u.last_sync IS NULL;
+
+-- Backfill insignia_days from distinct completion days (for users still at 0)
+UPDATE users u
+SET insignia_days = (
     SELECT COUNT(DISTINCT tc.completed_at::date)
     FROM tasks_completed tc
     WHERE tc.user_id = u.id
 )
-WHERE feed_label_days = 0;
+WHERE u.insignia_days = 0;
 
--- ── 8. Backfill: feed_label_unlocks from current feed_label_days ────────────
--- Unlocks all labels the user has already earned.
+-- Backfill insignia_unlocks for all users from their current insignia_days
 DO $$
 DECLARE
-  label_thresholds INT[] := ARRAY[0,5,10,20,30,40,50,60,70,80,90,100,120,140,160,180,200,250,300,400,500];
-  label_words TEXT[] := ARRAY['completed','finished','did','handled','closed','processed','resolved',
-    'settled','finalized','accomplished','achieved','fulfilled','delivered','executed','cleared',
-    'dispatched','secured','conquered','crushed','dominated','mastered'];
-  rec RECORD;
-  i INT;
+    tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
+    tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald',
+                                    'Amethyst','Ruby','Diamond','Obsidian','Aether'];
+    rec RECORD;
+    i   INT;
 BEGIN
-  FOR rec IN SELECT id, feed_label_days FROM users LOOP
-    FOR i IN 1..array_length(label_thresholds, 1) LOOP
-      IF rec.feed_label_days >= label_thresholds[i] THEN
-        INSERT INTO feed_label_unlocks (user_id, label)
-        VALUES (rec.id, label_words[i])
-        ON CONFLICT (user_id, label) DO NOTHING;
-      END IF;
+    FOR rec IN SELECT id, insignia_days FROM users LOOP
+        FOR i IN 1..array_length(tier_thresholds, 1) LOOP
+            IF rec.insignia_days >= tier_thresholds[i] THEN
+                INSERT INTO insignia_unlocks (user_id, label)
+                VALUES (rec.id, tier_labels[i])
+                ON CONFLICT DO NOTHING;
+            END IF;
+        END LOOP;
     END LOOP;
-    -- Set selected label to highest unlocked
-    DECLARE highest TEXT := 'completed';
-    BEGIN
-      FOR i IN REVERSE array_length(label_thresholds, 1)..1 LOOP
-        IF rec.feed_label_days >= label_thresholds[i] THEN
-          highest := label_words[i];
-          EXIT;
-        END IF;
-      END LOOP;
-      UPDATE users SET feed_label_selected = highest WHERE id = rec.id;
-    END;
-  END LOOP;
 END $$;
 
--- ── 9. Backfill: gallery badges from existing data ──────────────────────────
--- Badge: first_completion
+-- Remove any stale insignia_unlocks rows with old tier names
+DELETE FROM insignia_unlocks
+WHERE label NOT IN ('Default','Copper','Silver','Gold','Emerald',
+                    'Amethyst','Ruby','Diamond','Obsidian','Aether');
+
+-- Reset any invalid insignia_selected values to Default
+UPDATE users
+SET insignia_selected = 'Default'
+WHERE insignia_selected NOT IN ('Default','Copper','Silver','Gold','Emerald',
+                                'Amethyst','Ruby','Diamond','Obsidian','Aether');
+
+-- Backfill first_completion gallery badge
 INSERT INTO user_badges (user_id, badge_key, awarded_at)
-SELECT DISTINCT tc.user_id, 'first_completion', MIN(tc.completed_at)
-FROM tasks_completed tc
-GROUP BY tc.user_id
+SELECT user_id, 'first_completion', MIN(completed_at)
+FROM tasks_completed
+GROUP BY user_id
 ON CONFLICT DO NOTHING;
 
--- Badge: tasks_10, tasks_25, tasks_50, tasks_100, tasks_250, tasks_500
+-- Backfill task-count gallery badges (10, 25, 50, 100, 250, 500)
 DO $$
 DECLARE
-  thresholds INT[] := ARRAY[10,25,50,100,250,500];
-  t INT;
-  rec RECORD;
-  cnt INT;
-  aw TIMESTAMP;
+    thresholds INT[] := ARRAY[10, 25, 50, 100, 250, 500];
+    t          INT;
+    rec        RECORD;
+    aw         TIMESTAMP;
 BEGIN
-  FOR rec IN SELECT user_id, COUNT(*) as total FROM tasks_completed GROUP BY user_id LOOP
-    FOREACH t IN ARRAY thresholds LOOP
-      IF rec.total >= t THEN
-        SELECT completed_at INTO aw FROM (
-          SELECT completed_at FROM tasks_completed WHERE user_id = rec.user_id
-          ORDER BY completed_at ASC LIMIT t
-        ) sub ORDER BY completed_at DESC LIMIT 1;
-        INSERT INTO user_badges (user_id, badge_key, awarded_at)
-        VALUES (rec.user_id, 'tasks_' || t, aw)
-        ON CONFLICT DO NOTHING;
-      END IF;
+    FOR rec IN SELECT user_id, COUNT(*) AS total FROM tasks_completed GROUP BY user_id LOOP
+        FOREACH t IN ARRAY thresholds LOOP
+            IF rec.total >= t THEN
+                SELECT completed_at INTO aw
+                FROM (
+                    SELECT completed_at FROM tasks_completed
+                    WHERE user_id = rec.user_id
+                    ORDER BY completed_at ASC LIMIT t
+                ) sub
+                ORDER BY completed_at DESC LIMIT 1;
+                INSERT INTO user_badges (user_id, badge_key, awarded_at)
+                VALUES (rec.user_id, 'tasks_' || t, aw)
+                ON CONFLICT DO NOTHING;
+            END IF;
+        END LOOP;
     END LOOP;
-  END LOOP;
 END $$;
-
--- Badge: streak_7, streak_14, streak_30 (best day streak from tasks_completed)
--- (streak calculation is done client-side; we award these badges via the backend on Hub load)
-
--- Badge: most_in_day (most tasks in a single day)
-INSERT INTO user_badges (user_id, badge_key, awarded_at)
-SELECT tc.user_id, 'most_in_day_' || MAX(daily.cnt), MIN(tc.completed_at)
-FROM tasks_completed tc
-JOIN (
-  SELECT user_id, completed_at::date AS day, COUNT(*) AS cnt
-  FROM tasks_completed
-  GROUP BY user_id, completed_at::date
-) daily ON daily.user_id = tc.user_id
-GROUP BY tc.user_id
-ON CONFLICT DO NOTHING;
-
--- ── 10. Completion_feed: add feed_label column ──────────────────────────────
-ALTER TABLE completion_feed
-  ADD COLUMN IF NOT EXISTS feed_label VARCHAR(30) DEFAULT 'completed';
-
-
--- Correction: Reset all users' feed_label_selected back to 'completed'
--- The previous backfill auto-selected the highest unlocked label, but the
--- spec says the default should always be 'completed' and users must manually choose.
--- Unlocked labels are preserved — only the active selection is reset.
-UPDATE users SET feed_label_selected = 'completed';
-
-
--- ============================================================================
--- MIGRATION: Feed Label → Insignia system
--- Replaces word-based feed labels with tiered name Insignias
--- ============================================================================
-
--- ── 11. Rename feed_label_unlocks table → insignia_unlocks ──────────────────
--- We keep the same structure but rename for clarity.
--- Existing rows (old label strings) are cleared since tier names changed.
-ALTER TABLE feed_label_unlocks RENAME TO insignia_unlocks;
-
--- Clear old label unlock records (old tier names are no longer valid)
-DELETE FROM insignia_unlocks;
-
--- ── 12. Rename columns: users table ─────────────────────────────────────────
-ALTER TABLE users
-  RENAME COLUMN feed_label_days TO insignia_days;
-ALTER TABLE users
-  RENAME COLUMN feed_label_selected TO insignia_selected;
-
--- ── 13. Rename column: completion_feed table ─────────────────────────────────
-ALTER TABLE completion_feed
-  RENAME COLUMN feed_label TO insignia;
-
--- ── 14. Reset insignia_selected to new default tier name 'Default' ───────────
-UPDATE users SET insignia_selected = 'Default';
-
--- ── 15. Backfill insignia_unlocks from current insignia_days ─────────────────
--- Re-run unlock logic for all users using new Insignia thresholds
-DO $$
-DECLARE
-  tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
-  tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald','Amethyst','Ruby','Diamond','Obsidian','Aether'];
-  rec RECORD;
-  i INT;
-BEGIN
-  FOR rec IN SELECT id, insignia_days FROM users LOOP
-    FOR i IN 1..array_length(tier_thresholds, 1) LOOP
-      IF rec.insignia_days >= tier_thresholds[i] THEN
-        INSERT INTO insignia_unlocks (user_id, label)
-        VALUES (rec.id, tier_labels[i])
-        ON CONFLICT DO NOTHING;
-      END IF;
-    END LOOP;
-  END LOOP;
-END $$;
-
--- ── 16. Set insignia_selected to highest unlocked Insignia per user ───────────
--- Gives each user their best earned Insignia automatically.
--- Users can override any time in the Insignia pane.
-DO $$
-DECLARE
-  tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
-  tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald','Amethyst','Ruby','Diamond','Obsidian','Aether'];
-  rec RECORD;
-  highest TEXT := 'Default';
-  i INT;
-BEGIN
-  FOR rec IN SELECT id, insignia_days FROM users LOOP
-    highest := 'Default';
-    FOR i IN array_length(tier_thresholds, 1) .. 1 BY -1 LOOP
-      IF rec.insignia_days >= tier_thresholds[i] THEN
-        highest := tier_labels[i];
-        EXIT;
-      END IF;
-    END LOOP;
-    UPDATE users SET insignia_selected = highest WHERE id = rec.id;
-  END LOOP;
-END $$;
-
--- ── 17. Update completion_feed.insignia default to new tier name ─────────────
-ALTER TABLE completion_feed
-  ALTER COLUMN insignia SET DEFAULT 'Default';
