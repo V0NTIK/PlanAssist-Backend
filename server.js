@@ -3686,7 +3686,7 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
 
     // Get user info
     const userResult = await pool.query(
-      'SELECT name, grade, show_in_feed FROM users WHERE id = $1',
+      'SELECT name, grade, show_in_feed, feed_label_selected FROM users WHERE id = $1',
       [userId]
     );
     
