@@ -739,7 +739,6 @@ app.post('/api/auth/login', async (req, res) => {
 
 
 // ── Campus → period range lookup ────────────────────────────────────────────
-// tz_periods = standard time range; tz_periods_dst = daylight saving time range
 const CAMPUS_PERIODS = {
   'Ashland':        '2-6',
   'Barbados':       '1-5',
@@ -778,52 +777,11 @@ const CAMPUS_PERIODS = {
   'Trinidad':       '1-5',
   'Vancouver':      '4-8',
 };
-const CAMPUS_PERIODS_DST = {
-  'Ashland':        '2-6',
-  'Barbados':       '2-6',
-  'Calgary':        '4-8',
-  'Chesapeake':     '2-6',
-  'Chicago':        '3-7',
-  'Council Bluffs': '3-7',
-  'Des Moines':     '3-7',
-  'Detroit':        '2-6',
-  'Edmonton':       '4-8',
-  'Gothenburg':     '3-7',
-  'Hamilton':       '2-6',
-  'Indianapolis':   '2-6',
-  'Jamaica':        '3-7',
-  'Kalispell':      '4-8',
-  'Knoxville':      '2-6',
-  'Los Angeles':    '4-8',
-  'Maple Creek':    '3-7',
-  'Minneapolis':    '3-7',
-  'Montreal':       '2-6',
-  'Mossley':        '2-6',
-  'New England':    '2-6',
-  'New York':       '2-6',
-  'Oxbow':          '3-7',
-  'Pembina':        '3-7',
-  'Portland':       '4-8',
-  'Redwood Falls':  '3-7',
-  'Regina':         '3-7',
-  'Rideau Lakes':   '2-6',
-  'Rochester':      '2-6',
-  'San Antonio':    '3-7',
-  'San Francisco':  '4-8',
-  'Seattle':        '4-8',
-  'St. Vincent':    '2-6',
-  'Stonewall':      '3-7',
-  'Trinidad':       '2-6',
-  'Vancouver':      '4-8',
-};
 const VALID_CAMPUSES = Object.keys(CAMPUS_PERIODS);
 
-// Returns the standard-time and DST period range strings for the given campus.
+// Returns the period range string for the given campus.
 function getCampusPeriods(campus) {
   return CAMPUS_PERIODS[campus] || CAMPUS_PERIODS['Ashland'];
-}
-function getCampusPeriodsDST(campus) {
-  return CAMPUS_PERIODS_DST[campus] || CAMPUS_PERIODS_DST['Ashland'];
 }
 
 // ============================================================================
@@ -834,7 +792,7 @@ function getCampusPeriodsDST(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, tz_periods_dst, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -901,7 +859,6 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     // Derive period ranges from campus
     const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
     const tzPeriods = CAMPUS_PERIODS[resolvedCampus];
-    const tzPeriodsDST = CAMPUS_PERIODS_DST[resolvedCampus];
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -928,13 +885,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     if (canvasApiToken && canvasApiToken.trim()) {
       await pool.query(
         `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
-          campus = $4, tz_periods = $5, tz_periods_dst = $6, is_new_user = false,
-          calendar_show_homeroom = $7, calendar_show_completed = $8,
-          calendar_show_prev_week = $9, calendar_show_current_week = $10,
-          calendar_show_next_week1 = $11, calendar_show_next_week2 = $12,
-          calendar_show_weekends = $13
-         WHERE id = $14`,
-        [grade, encryptedToken, iv, resolvedCampus, tzPeriods, tzPeriodsDST,
+          campus = $4, tz_periods = $5, is_new_user = false,
+          calendar_show_homeroom = $6, calendar_show_completed = $7,
+          calendar_show_prev_week = $8, calendar_show_current_week = $9,
+          calendar_show_next_week1 = $10, calendar_show_next_week2 = $11,
+          calendar_show_weekends = $12
+         WHERE id = $13`,
+        [grade, encryptedToken, iv, resolvedCampus, tzPeriods,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
@@ -948,13 +905,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
       // No token provided — update everything except the token columns
       await pool.query(
         `UPDATE users SET grade = $1,
-          campus = $2, tz_periods = $3, tz_periods_dst = $4, is_new_user = false,
-          calendar_show_homeroom = $5, calendar_show_completed = $6,
-          calendar_show_prev_week = $7, calendar_show_current_week = $8,
-          calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
-          calendar_show_weekends = $11
-         WHERE id = $12`,
-        [grade, resolvedCampus, tzPeriods, tzPeriodsDST,
+          campus = $2, tz_periods = $3, is_new_user = false,
+          calendar_show_homeroom = $4, calendar_show_completed = $5,
+          calendar_show_prev_week = $6, calendar_show_current_week = $7,
+          calendar_show_next_week1 = $8, calendar_show_next_week2 = $9,
+          calendar_show_weekends = $10
+         WHERE id = $11`,
+        [grade, resolvedCampus, tzPeriods,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
@@ -3365,6 +3322,35 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // STREAK SHIELDS
 // ============================================================================
 
+// GET /api/streak/data — returns all raw data needed for streak calculation on the frontend.
+// Returns completed_at UTC timestamps, consumed_at UTC timestamps, campus, shield count & mode.
+app.get('/api/streak/data', authenticateToken, async (req, res) => {
+  try {
+    const [userR, completionsR, shieldsR] = await Promise.all([
+      pool.query(
+        'SELECT campus, streak_shields_available, streak_shield_mode FROM users WHERE id = $1',
+        [req.user.id]
+      ),
+      pool.query(
+        'SELECT completed_at FROM tasks_completed WHERE user_id = $1',
+        [req.user.id]
+      ),
+      pool.query(
+        'SELECT consumed_at FROM streak_shield_log WHERE user_id = $1',
+        [req.user.id]
+      ),
+    ]);
+    const u = userR.rows[0] || {};
+    res.json({
+      campus:           u.campus || 'Ashland',
+      shieldsAvailable: u.streak_shields_available ?? 0,
+      shieldMode:       u.streak_shield_mode ?? 'manual',
+      completedAt:      completionsR.rows.map(r => r.completed_at.toISOString()),
+      consumedAt:       shieldsR.rows.map(r => r.consumed_at.toISOString()),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/streak/shields — get user's shield count and mode
 app.get('/api/streak/shields', authenticateToken, async (req, res) => {
   try {
@@ -4636,7 +4622,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
   try {
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
-              u.is_new_user, u.campus, u.tz_periods, u.tz_periods_dst, u.schedule_enhanced, u.created_at, u.last_sync,
+              u.is_new_user, u.campus, u.tz_periods, u.schedule_enhanced, u.created_at, u.last_sync,
               u.streak_shields_available,
               u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
@@ -4662,7 +4648,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   try {
     const userRes = await pool.query(
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
-              campus, tz_periods, tz_periods_dst, schedule_enhanced, created_at,
+              campus, tz_periods, schedule_enhanced, created_at,
               streak_shields_available, insignia_days, insignia_selected
        FROM users WHERE id = $1`,
       [req.params.id]
@@ -4708,9 +4694,8 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
     if (grade !== undefined)  { fields.push(`grade = $${idx++}`);  vals.push(grade); }
     if (campus !== undefined) {
       const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
-      fields.push(`campus = $${idx++}`);         vals.push(resolvedCampus);
-      fields.push(`tz_periods = $${idx++}`);     vals.push(CAMPUS_PERIODS[resolvedCampus]);
-      fields.push(`tz_periods_dst = $${idx++}`); vals.push(CAMPUS_PERIODS_DST[resolvedCampus]);
+      fields.push(`campus = $${idx++}`);     vals.push(resolvedCampus);
+      fields.push(`tz_periods = $${idx++}`); vals.push(CAMPUS_PERIODS[resolvedCampus]);
     }
     if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
