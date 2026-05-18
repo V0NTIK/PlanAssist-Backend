@@ -3290,17 +3290,23 @@ app.post('/api/streak/shields/use', authenticateToken, async (req, res) => {
     const user = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
     if ((user.rows[0]?.streak_shields_available ?? 0) < 1) return res.status(400).json({ error: 'No shields available' });
     await pool.query('BEGIN');
-    await pool.query(
-      'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+    const ins = await pool.query(
+      'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING shield_date',
       [req.user.id, date]
     );
+    if (ins.rowCount === 0) {
+      // Shield for this date already exists — don't double-decrement the counter
+      await pool.query('COMMIT');
+      const cur = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+      return res.json({ success: true, alreadyShielded: true, shieldedDate: date, remaining: cur.rows[0].streak_shields_available });
+    }
     await pool.query(
       'UPDATE users SET streak_shields_available = streak_shields_available - 1 WHERE id = $1 AND streak_shields_available > 0',
       [req.user.id]
     );
     await pool.query('COMMIT');
     const updated = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
-    res.json({ success: true, remaining: updated.rows[0].streak_shields_available });
+    res.json({ success: true, alreadyShielded: false, shieldedDate: date, remaining: updated.rows[0].streak_shields_available });
   } catch (err) { await pool.query('ROLLBACK').catch(() => {}); res.status(500).json({ error: err.message }); }
 });
 
