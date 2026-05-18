@@ -45,6 +45,17 @@ pool.on('connect', client => {
 
 // Canvas API base URL
 const CANVAS_API_BASE = 'https://canvas.oneschoolglobal.com/api/v1';
+const CANVAS_BASE_URL = 'https://canvas.oneschoolglobal.com';
+
+// Build a usable URL for a Canvas assignment, falling back if html_url is null.
+// Old quizzes use /quizzes/:quiz_id; all others use /assignments/:assignment_id.
+const buildAssignmentUrl = (a, courseId) => {
+  if (a.html_url) return a.html_url;
+  const cid = courseId || a.course_id;
+  if (a.quiz_id) return `${CANVAS_BASE_URL}/courses/${cid}/quizzes/${a.quiz_id}`;
+  if (a.id)      return `${CANVAS_BASE_URL}/courses/${cid}/assignments/${a.id}`;
+  return CANVAS_BASE_URL;
+};
 
 
 // JWT Secret - ENFORCE in production
@@ -1178,8 +1189,11 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
           console.log(`  [MAIN SYNC] ${course.name}: ${all.length} assignments`);
           return all
             .filter(a => {
-              if (!a.due_at) return false;
-              const d = new Date(a.due_at);
+              // Old-style Canvas quizzes often have due_at=null but lock_at set.
+              // Fall back to lock_at as the effective deadline so they aren't silently dropped.
+              const effectiveDue = a.due_at || a.lock_at;
+              if (!effectiveDue) return false;
+              const d = new Date(effectiveDue);
               return d >= now && d <= ninetyDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
@@ -1196,7 +1210,8 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     console.log('[MAIN SYNC] Estimating task times...');
     const tasks = [];
     for (const a of allAssignments) {
-      const dueDate = new Date(a.due_at);
+      const effectiveDue = a.due_at || a.lock_at;   // lock_at fallback for old quizzes
+      const dueDate = new Date(effectiveDue);
       const isoStr = dueDate.toISOString();
       const deadlineDate = isoStr.split('T')[0];
       const deadlineTime = isoStr.split('T')[1].split('.')[0];
@@ -1213,7 +1228,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
         estimatedTime = existingEst.rows[0].estimated_time;
       } else {
         estimatedTime = await estimateTaskTime({
-          title: a.name, class: a.course_name, url: a.html_url,
+          title: a.name, class: a.course_name, url: buildAssignmentUrl(a, a.course_id),
           assignmentId: a.id, courseId: a.course_id,
           pointsPossible: a.points_possible, gradingType: a.grading_type,
           description: a.description || ''
@@ -1222,9 +1237,10 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
 
       tasks.push({
         title: a.name, segment: null, class: a.course_name,
-        description: a.description || '', url: a.html_url,
+        description: a.description || '', url: buildAssignmentUrl(a, a.course_id),
         deadlineDate, deadlineTime, estimatedTime,
         courseId: a.course_id, assignmentId: a.id,
+        quizId: a.quiz_id ?? null,             // classic quiz ID (null for non-quiz assignments)
         pointsPossible: a.points_possible ?? null,
         assignmentGroupId: a.assignment_group_id ?? null,
         currentScore: sub.score ?? null,
@@ -1308,8 +1324,9 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
           const all = Array.isArray(resp.data) ? resp.data : [];
           return all
             .filter(a => {
-              if (!a.due_at) return false;
-              const d = new Date(a.due_at);
+              const effectiveDue = a.due_at || a.lock_at;
+              if (!effectiveDue) return false;
+              const d = new Date(effectiveDue);
               return d >= now && d <= fourteenDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
@@ -1325,7 +1342,8 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
     // Estimate times
     const tasks = [];
     for (const a of allAssignments) {
-      const dueDate = new Date(a.due_at);
+      const effectiveDue = a.due_at || a.lock_at;   // lock_at fallback for old quizzes
+      const dueDate = new Date(effectiveDue);
       const isoStr = dueDate.toISOString();
       const sub = a.submission || {};
       const isSubmitted = sub.workflow_state === 'submitted' || sub.workflow_state === 'graded';
@@ -1339,7 +1357,7 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
         estimatedTime = existingEst.rows[0].estimated_time;
       } else {
         estimatedTime = await estimateTaskTime({
-          title: a.name, class: a.course_name, url: a.html_url,
+          title: a.name, class: a.course_name, url: buildAssignmentUrl(a, a.course_id),
           assignmentId: a.id, courseId: a.course_id,
           pointsPossible: a.points_possible, gradingType: a.grading_type,
           description: a.description || ''
@@ -1348,9 +1366,10 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
 
       tasks.push({
         title: a.name, segment: null, class: a.course_name,
-        description: a.description || '', url: a.html_url,
+        description: a.description || '', url: buildAssignmentUrl(a, a.course_id),
         deadlineDate: isoStr.split('T')[0], deadlineTime: isoStr.split('T')[1].split('.')[0],
         estimatedTime, courseId: a.course_id, assignmentId: a.id,
+        quizId: a.quiz_id ?? null,             // classic quiz ID (null for non-quiz assignments)
         pointsPossible: a.points_possible ?? null, assignmentGroupId: a.assignment_group_id ?? null,
         currentScore: sub.score ?? null, currentGrade: sub.grade ? String(sub.grade).slice(0, 50) : null,
         gradingType: (a.grading_type || 'points').slice(0, 50),
@@ -1790,31 +1809,55 @@ app.get('/api/canvas/check-completed/:taskId', authenticateToken, async (req, re
   try {
     const { taskId } = req.params;
     const taskResult = await pool.query(
-      'SELECT assignment_id, course_id, canvas_api_token, canvas_api_token_iv FROM tasks t JOIN users u ON u.id = t.user_id WHERE t.id = $1 AND t.user_id = $2',
+      'SELECT assignment_id, quiz_id, course_id, canvas_api_token, canvas_api_token_iv FROM tasks t JOIN users u ON u.id = t.user_id WHERE t.id = $1 AND t.user_id = $2',
       [taskId, req.user.id]
     );
     if (taskResult.rows.length === 0) return res.json({ completed: false });
     const task = taskResult.rows[0];
-    if (!task.assignment_id || !task.course_id) return res.json({ completed: false });
+    if (!task.course_id) return res.json({ completed: false });
     if (!task.canvas_api_token || !task.canvas_api_token_iv) return res.json({ completed: false });
     const encParts = task.canvas_api_token.split(':');
     if (encParts.length < 2) return res.json({ completed: false });
     const token = decryptToken(encParts[0], task.canvas_api_token_iv, encParts[1]);
+    const authHeader = { Authorization: `Bearer ${token}` };
+
+    // Old-style Canvas quizzes (quiz_id present): use quiz submission endpoint.
+    // New-style assignments: use the standard assignments/submissions/self endpoint.
+    if (task.quiz_id) {
+      try {
+        const subResp = await axios.get(
+          `${CANVAS_API_BASE}/courses/${task.course_id}/quizzes/${task.quiz_id}/submission`,
+          { headers: authHeader, timeout: 8000 }
+        );
+        // Canvas returns quiz_submissions array; a submitted quiz has workflow_state = 'complete'
+        const submissions = subResp.data?.quiz_submissions ?? [];
+        const latest = submissions[0];
+        const done = latest?.workflow_state === 'complete' || latest?.workflow_state === 'pending_review';
+        return res.json({ completed: done });
+      } catch (err) {
+        const status = err.response?.status;
+        if (status === 401 || status === 403 || status === 404) {
+          return res.json({ completed: false });
+        }
+        // Unexpected error — fall through to try the assignment endpoint as a backstop
+      }
+    }
+
+    // Standard assignment submission check
+    if (!task.assignment_id) return res.json({ completed: false });
     const subResp = await axios.get(
       `${CANVAS_API_BASE}/courses/${task.course_id}/assignments/${task.assignment_id}/submissions/self`,
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+      { headers: authHeader, timeout: 8000 }
     );
     const wf = subResp.data?.workflow_state;
     res.json({ completed: wf === 'submitted' || wf === 'graded' });
   } catch (err) {
     const status = err.response?.status;
     // 401: Canvas token expired/invalid; 403: assignment type doesn't support submissions/self
-    // (e.g. quizzes, external tools); 404: assignment deleted/archived on Canvas.
-    // All are expected for certain task types — return false silently rather than polluting logs.
+    // (e.g. external tools); 404: assignment deleted/archived on Canvas.
     if (status === 401 || status === 403 || status === 404) {
       return res.json({ completed: false });
     }
-    // Unexpected error (5xx, network timeout, decrypt failure) — worth logging
     console.error('Canvas check-completed error:', err.message);
     res.json({ completed: false });
   }
@@ -2064,15 +2107,15 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             `UPDATE tasks SET
                title=$1, class=$2, description=$3, url=$4,
                deadline_date=$5, deadline_time=$6, course_id=$7, assignment_id=$8,
-               points_possible=$9, assignment_group_id=$10,
-               current_score=$11, current_grade=$12, grading_type=$13,
-               unlock_at=$14, lock_at=$15, submitted_at=$16,
-               is_missing=$17, is_late=$18, grade_id=$19,
-               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
-             WHERE id=$21 AND user_id=$22`,
+               quiz_id=$9, points_possible=$10, assignment_group_id=$11,
+               current_score=$12, current_grade=$13, grading_type=$14,
+               unlock_at=$15, lock_at=$16, submitted_at=$17,
+               is_missing=$18, is_late=$19, grade_id=$20,
+               completed=$21, deleted=CASE WHEN $21 THEN true ELSE deleted END
+             WHERE id=$22 AND user_id=$23`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
-             t.pointsPossible ?? null, t.assignmentGroupId ?? null,
+             t.quizId ?? null, t.pointsPossible ?? null, t.assignmentGroupId ?? null,
              t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
              t.unlockAt ?? null, t.lockAt ?? null, t.submittedAt ?? null,
              t.isMissing ?? false, t.isLate ?? false, gradeIdToUse,
@@ -2098,16 +2141,17 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
           `INSERT INTO tasks
              (user_id, title, segment, class, description, url,
               deadline_date, deadline_time, estimated_time, user_estimated_time,
-              course_id, assignment_id, points_possible, assignment_group_id,
+              course_id, assignment_id, quiz_id, points_possible, assignment_group_id,
               current_score, current_grade, grading_type,
               unlock_at, lock_at, submitted_at, is_missing, is_late,
               completed, deleted, manually_created, is_new)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
            RETURNING id`,
           [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
-           t.courseId ?? null, t.assignmentId ?? null, t.pointsPossible ?? null,
-           t.assignmentGroupId ?? null, t.currentScore ?? null, t.currentGrade ?? null,
+           t.courseId ?? null, t.assignmentId ?? null, t.quizId ?? null,
+           t.pointsPossible ?? null, t.assignmentGroupId ?? null,
+           t.currentScore ?? null, t.currentGrade ?? null,
            t.gradingType || 'points', t.unlockAt ?? null, t.lockAt ?? null,
            t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
            t.completed ?? false, t.completed ?? false, // deleted if already completed
@@ -2462,8 +2506,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
         const result = await pool.query(
           `INSERT INTO tasks 
            (user_id, title, segment, class, description, url, deadline_date, deadline_time, estimated_time, user_estimated_time, accumulated_time, completed, deleted,
-            course_id, assignment_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+            course_id, assignment_id, quiz_id, points_possible, assignment_group_id, current_score, current_grade, grading_type, unlock_at, lock_at, submitted_at, is_missing, is_late)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
            ON CONFLICT (user_id, assignment_id) DO UPDATE SET
              title = EXCLUDED.title,
              description = EXCLUDED.description,
@@ -2474,6 +2518,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
              deadline_date = EXCLUDED.deadline_date,
              deadline_time = EXCLUDED.deadline_time,
              course_id = EXCLUDED.course_id,
+             quiz_id = EXCLUDED.quiz_id,
              points_possible = EXCLUDED.points_possible,
              assignment_group_id = EXCLUDED.assignment_group_id,
              current_score = EXCLUDED.current_score,
@@ -2501,6 +2546,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             false, // Not deleted
             incomingTask.courseId ?? null,
             incomingTask.assignmentId ?? null,
+            incomingTask.quizId ?? null,
             incomingTask.pointsPossible ?? null,
             incomingTask.assignmentGroupId ?? null,
             incomingTask.currentScore ?? null,
