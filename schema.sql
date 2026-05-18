@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS users (
     streak_shields_available    INTEGER         DEFAULT 0,
     streak_shield_mode          VARCHAR(10)     DEFAULT 'manual'
                                     CHECK (streak_shield_mode IN ('manual', 'automatic')),
+    -- Campus & period offsets (replaces present_periods)
+    campus                      VARCHAR(50)     DEFAULT 'Ashland',
+    tz_periods                  VARCHAR(10)     DEFAULT '2-6',      -- Present periods
     -- Calendar preferences
     calendar_show_homeroom      BOOLEAN         DEFAULT FALSE,
     calendar_show_completed     BOOLEAN         DEFAULT TRUE,
@@ -63,6 +66,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_days              INTEGER   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_selected          VARCHAR(30)  DEFAULT 'Default';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER      DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed    BOOLEAN      DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_prev_week    BOOLEAN      DEFAULT FALSE;
@@ -72,6 +77,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week2   BOOLEAN   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_weekends     BOOLEAN      DEFAULT TRUE;
 
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
+ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
+ALTER TABLE users DROP COLUMN IF EXISTS tz_periods_dst;
 ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
 ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
 
