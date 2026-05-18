@@ -3538,7 +3538,7 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
     const INSIGNIA_THRESHOLDS = [
       [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
-      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Aether']
+      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Antimatter']
     ];
     const userR = await pool.query('SELECT insignia_days FROM users WHERE id = $1', [req.user.id]);
     const days = userR.rows[0]?.insignia_days ?? 0;
