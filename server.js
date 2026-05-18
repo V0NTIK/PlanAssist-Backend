@@ -737,6 +737,71 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+
+// ── Campus → period range lookup ────────────────────────────────────────────
+const CAMPUS_PERIODS = {
+  'Ashland':        { std: '2-6', dst: '2-6' },
+  'Barbados':       { std: '1-5', dst: '2-6' },
+  'Calgary':        { std: '3-7', dst: '3-7' },
+  'Chesapeake':     { std: '2-6', dst: '2-6' },
+  'Chicago':        { std: '3-7', dst: '3-7' },
+  'Council Bluffs': { std: '3-7', dst: '3-7' },
+  'Des Moines':     { std: '3-7', dst: '3-7' },
+  'Detroit':        { std: '2-6', dst: '2-6' },
+  'Edmonton':       { std: '3-7', dst: '3-7' },
+  'Gothenburg':     { std: '3-7', dst: '3-7' },
+  'Hamilton':       { std: '2-6', dst: '2-6' },
+  'Indianapolis':   { std: '2-6', dst: '2-6' },
+  'Jamaica':        { std: '2-6', dst: '3-7' },
+  'Kalispell':      { std: '4-8', dst: '4-8' },
+  'Knoxville':      { std: '2-6', dst: '2-6' },
+  'Los Angeles':    { std: '4-8', dst: '4-8' },
+  'Maple Creek':    { std: '3-7', dst: '3-7' },
+  'Minneapolis':    { std: '3-7', dst: '3-7' },
+  'Montreal':       { std: '2-6', dst: '2-6' },
+  'Mossley':        { std: '2-6', dst: '2-6' },
+  'New England':    { std: '2-6', dst: '2-6' },
+  'New York':       { std: '2-6', dst: '2-6' },
+  'Oxbow':          { std: '3-7', dst: '3-7' },
+  'Pembina':        { std: '3-7', dst: '3-7' },
+  'Portland':       { std: '4-8', dst: '4-8' },
+  'Redwood Falls':  { std: '3-7', dst: '3-7' },
+  'Regina':         { std: '3-7', dst: '3-7' },
+  'Rideau Lakes':   { std: '2-6', dst: '2-6' },
+  'Rochester':      { std: '2-6', dst: '2-6' },
+  'San Antonio':    { std: '3-7', dst: '3-7' },
+  'San Francisco':  { std: '4-8', dst: '4-8' },
+  'Seattle':        { std: '4-8', dst: '4-8' },
+  'St. Vincent':    { std: '1-5', dst: '2-6' },
+  'Stonewall':      { std: '3-7', dst: '3-7' },
+  'Trinidad':       { std: '1-5', dst: '2-6' },
+  'Vancouver':      { std: '4-8', dst: '4-8' },
+};
+const VALID_CAMPUSES = Object.keys(CAMPUS_PERIODS);
+
+// Returns the campus period range string for the given campus, accounting for DST.
+// Uses the server's current date to determine whether DST is in effect (North America).
+function getCampusPeriods(campus) {
+  const entry = CAMPUS_PERIODS[campus] || CAMPUS_PERIODS['Ashland'];
+  // Approximate North American DST: second Sunday of March → first Sunday of November
+  const now = new Date();
+  const year = now.getFullYear();
+  const dstStart = nthSundayOfMonth(year, 2, 2);  // March, 2nd Sunday
+  const dstEnd   = nthSundayOfMonth(year, 10, 1); // November, 1st Sunday
+  const inDST = now >= dstStart && now < dstEnd;
+  return inDST ? entry.dst : entry.std;
+}
+
+function nthSundayOfMonth(year, month, n) {
+  // month: 0-indexed (2=March, 10=November)
+  const d = new Date(year, month, 1);
+  let count = 0;
+  while (true) {
+    if (d.getDay() === 0) { count++; if (count === n) return d; }
+    d.setDate(d.getDate() + 1);
+  }
+}
+
 // ============================================================================
 // ACCOUNT SETUP ROUTES
 // ============================================================================
@@ -745,7 +810,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, present_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, tz_periods_dst, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -783,7 +848,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       name: user.name || '',
       grade: user.grade || '',
       canvasApiToken: canvasApiToken,
-      presentPeriods: user.present_periods || '2-6',
+      campus: user.campus || 'Ashland',
       schedule,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true,
@@ -806,8 +871,14 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 // Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const { grade, canvasApiToken, presentPeriods, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
+    const { grade, canvasApiToken, campus, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
             calendarShowPrevWeek, calendarShowCurrentWeek, calendarShowNextWeek1, calendarShowNextWeek2, calendarShowWeekends } = req.body;
+
+    // Derive period ranges from campus
+    const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
+    const campusEntry = CAMPUS_PERIODS[resolvedCampus];
+    const tzPeriods    = campusEntry.std;
+    const tzPeriodsDst = campusEntry.dst;
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -834,13 +905,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     if (canvasApiToken && canvasApiToken.trim()) {
       await pool.query(
         `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
-          present_periods = $4, is_new_user = false,
-          calendar_show_homeroom = $5, calendar_show_completed = $6,
-          calendar_show_prev_week = $7, calendar_show_current_week = $8,
-          calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
-          calendar_show_weekends = $11
-         WHERE id = $12`,
-        [grade, encryptedToken, iv, presentPeriods,
+          campus = $4, tz_periods = $5, tz_periods_dst = $6, is_new_user = false,
+          calendar_show_homeroom = $7, calendar_show_completed = $8,
+          calendar_show_prev_week = $9, calendar_show_current_week = $10,
+          calendar_show_next_week1 = $11, calendar_show_next_week2 = $12,
+          calendar_show_weekends = $13
+         WHERE id = $14`,
+        [grade, encryptedToken, iv, resolvedCampus, tzPeriods, tzPeriodsDst,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
@@ -854,13 +925,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
       // No token provided — update everything except the token columns
       await pool.query(
         `UPDATE users SET grade = $1,
-          present_periods = $2, is_new_user = false,
-          calendar_show_homeroom = $3, calendar_show_completed = $4,
-          calendar_show_prev_week = $5, calendar_show_current_week = $6,
-          calendar_show_next_week1 = $7, calendar_show_next_week2 = $8,
-          calendar_show_weekends = $9
-         WHERE id = $10`,
-        [grade, presentPeriods,
+          campus = $2, tz_periods = $3, tz_periods_dst = $4, is_new_user = false,
+          calendar_show_homeroom = $5, calendar_show_completed = $6,
+          calendar_show_prev_week = $7, calendar_show_current_week = $8,
+          calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
+          calendar_show_weekends = $11
+         WHERE id = $12`,
+        [grade, resolvedCampus, tzPeriods, tzPeriodsDst,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
@@ -4542,7 +4613,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
   try {
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
-              u.is_new_user, u.present_periods, u.schedule_enhanced, u.created_at, u.last_sync,
+              u.is_new_user, u.campus, u.tz_periods, u.tz_periods_dst, u.schedule_enhanced, u.created_at, u.last_sync,
               u.streak_shields_available,
               u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
@@ -4568,7 +4639,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   try {
     const userRes = await pool.query(
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
-              present_periods, schedule_enhanced, created_at,
+              campus, tz_periods, tz_periods_dst, schedule_enhanced, created_at,
               streak_shields_available, insignia_days, insignia_selected
        FROM users WHERE id = $1`,
       [req.params.id]
@@ -4596,10 +4667,10 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   }
 });
 
-// PATCH /api/admin/users/:id — edit user fields (name, grade, present_periods, is_admin)
+// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin)
 app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, grade, present_periods, is_admin } = req.body;
+    const { name, grade, campus, is_admin } = req.body;
     const targetId = parseInt(req.params.id);
 
     // Prevent self-demotion
@@ -4610,10 +4681,16 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
     const fields = [];
     const vals = [];
     let idx = 1;
-    if (name !== undefined)            { fields.push(`name = $${idx++}`);            vals.push(name); }
-    if (grade !== undefined)           { fields.push(`grade = $${idx++}`);           vals.push(grade); }
-    if (present_periods !== undefined) { fields.push(`present_periods = $${idx++}`); vals.push(present_periods); }
-    if (is_admin !== undefined)        { fields.push(`is_admin = $${idx++}`);        vals.push(is_admin); }
+    if (name !== undefined)   { fields.push(`name = $${idx++}`);   vals.push(name); }
+    if (grade !== undefined)  { fields.push(`grade = $${idx++}`);  vals.push(grade); }
+    if (campus !== undefined) {
+      const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
+      const campusEntry = CAMPUS_PERIODS[resolvedCampus];
+      fields.push(`campus = $${idx++}`);         vals.push(resolvedCampus);
+      fields.push(`tz_periods = $${idx++}`);     vals.push(campusEntry.std);
+      fields.push(`tz_periods_dst = $${idx++}`); vals.push(campusEntry.dst);
+    }
+    if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
     vals.push(targetId);
