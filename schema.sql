@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS users (
     grade                       VARCHAR(50),
     canvas_api_token            TEXT,                           -- AES-256-GCM encrypted Canvas personal access token
     canvas_api_token_iv         TEXT,                           -- GCM initialisation vector
-    present_periods             VARCHAR(20)     DEFAULT '2-6',  -- OSG periods the student attends (e.g. '2-6')
     is_new_user                 BOOLEAN         DEFAULT TRUE,   -- Cleared on first account setup save
     is_admin                    BOOLEAN         DEFAULT FALSE,
     is_banned                   BOOLEAN         DEFAULT FALSE,
@@ -36,9 +35,6 @@ CREATE TABLE IF NOT EXISTS users (
     streak_shields_available    INTEGER         DEFAULT 0,
     streak_shield_mode          VARCHAR(10)     DEFAULT 'manual'
                                     CHECK (streak_shield_mode IN ('manual', 'automatic')),
-    -- Campus & period offsets (replaces present_periods)
-    campus                      VARCHAR(50)     DEFAULT 'Ashland',
-    tz_periods                  VARCHAR(10)     DEFAULT '2-6',      -- Present periods
     -- Calendar preferences
     calendar_show_homeroom      BOOLEAN         DEFAULT FALSE,
     calendar_show_completed     BOOLEAN         DEFAULT TRUE,
@@ -47,6 +43,11 @@ CREATE TABLE IF NOT EXISTS users (
     calendar_show_next_week1    BOOLEAN         DEFAULT FALSE,
     calendar_show_next_week2    BOOLEAN         DEFAULT FALSE,
     calendar_show_weekends      BOOLEAN         DEFAULT TRUE,
+    -- Period timezone offsets (derived from campus)
+    -- tz_periods:     period range during standard time  (e.g. '2-6')
+    -- tz_periods_dst: period range during daylight time  (e.g. '2-6'); NULL = same as tz_periods
+    tz_periods                  VARCHAR(20),
+    tz_periods_dst              VARCHAR(20),
     -- Timestamps
     created_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
     updated_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
@@ -54,7 +55,6 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token_iv        TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS present_periods            VARCHAR(20)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_user                BOOLEAN      DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin                   BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned                  BOOLEAN      DEFAULT FALSE;
@@ -66,8 +66,6 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_days              INTEGER   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_selected          VARCHAR(30)  DEFAULT 'Default';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER      DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed    BOOLEAN      DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_prev_week    BOOLEAN      DEFAULT FALSE;
@@ -75,10 +73,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week1   BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week2   BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_weekends     BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                     VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                 VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods_dst             VARCHAR(20);
 
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
-ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
-ALTER TABLE users DROP COLUMN IF EXISTS tz_periods_dst;
 ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
 ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
 
@@ -498,7 +497,7 @@ CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_tasks_completed ON weekly_lead
 -- INSIGNIA UNLOCKS
 -- Records which insignia tiers each user has earned.
 -- Tiers (days required): Default=0 Copper=2 Silver=5 Gold=10 Emerald=20
---                        Amethyst=30 Ruby=40 Diamond=50 Obsidian=75 Aether=100
+--                        Amethyst=30 Ruby=40 Diamond=50 Obsidian=75 Antimatter=100
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS insignia_unlocks (
@@ -692,7 +691,7 @@ DO $$
 DECLARE
     tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
     tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald',
-                                    'Amethyst','Ruby','Diamond','Obsidian','Aether'];
+                                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter'];
     rec RECORD;
     i   INT;
 BEGIN
@@ -710,13 +709,13 @@ END $$;
 -- Remove any stale insignia_unlocks rows with old tier names
 DELETE FROM insignia_unlocks
 WHERE label NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                    'Amethyst','Ruby','Diamond','Obsidian','Aether');
+                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
 
 -- Reset any invalid insignia_selected values to Default
 UPDATE users
 SET insignia_selected = 'Default'
 WHERE insignia_selected NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                                'Amethyst','Ruby','Diamond','Obsidian','Aether');
+                                'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
 
 -- Backfill first_completion gallery badge
 INSERT INTO user_badges (user_id, badge_key, awarded_at)
