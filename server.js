@@ -3325,8 +3325,10 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // GET /api/streak/data — single endpoint that returns all data needed for client-side streak calc.
-// Returns campus, shields, shield mode, all completion timestamps, and all shield timestamps.
-// The client converts UTC → campus-tz, strips weekends, computes the streak, and handles auto-shield.
+// Returns campus, shields, shield mode, all completion timestamps, and all shield dates.
+// The client converts completion UTC timestamps → campus-tz dates.
+// Shield dates are returned as plain YYYY-MM-DD strings (they are stored as DATE in Postgres —
+// no timezone conversion is needed; they were stored as the campus-tz date when the shield was used).
 app.get('/api/streak/data', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -3338,34 +3340,33 @@ app.get('/api/streak/data', authenticateToken, async (req, res) => {
     );
     const row = userR.rows[0] || {};
 
-    // All completion timestamps (UTC ISO strings) — one per completed task
+    // All completion timestamps (UTC) — client converts to campus-tz dates
     const completionsR = await pool.query(
       'SELECT completed_at FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at ASC',
       [userId]
     );
 
-    // All shield dates (stored as DATE; return as YYYY-MM-DD strings)
+    // Shield dates stored as DATE (YYYY-MM-DD) — already campus-tz, no conversion needed
     const shieldsR = await pool.query(
       'SELECT shield_date FROM streak_shield_log WHERE user_id = $1 ORDER BY shield_date ASC',
       [userId]
     );
 
     res.json({
-      campus:          row.campus ?? 'Ashland',
+      campus:           row.campus ?? 'Ashland',
       shieldsAvailable: row.streak_shields_available ?? 0,
-      shieldMode:      row.streak_shield_mode ?? 'manual',
-      // UTC ISO strings — client uses getCampusOffsetHours to convert to local dates
-      completedAt:     completionsR.rows.map(r => r.completed_at instanceof Date
-                         ? r.completed_at.toISOString()
-                         : String(r.completed_at)),
-      // Shield dates are stored as DATE (YYYY-MM-DD); return as plain date strings
-      // Append T00:00:00Z so toCampusDate() can parse them as UTC midnight
-      consumedAt:      shieldsR.rows.map(r => {
-                         const d = r.shield_date instanceof Date
-                           ? r.shield_date.toISOString().slice(0, 10)
-                           : String(r.shield_date).slice(0, 10);
-                         return `${d}T00:00:00Z`;
-                       }),
+      shieldMode:       row.streak_shield_mode ?? 'manual',
+      // UTC ISO strings — client uses getCampusOffsetHours + utcToCampusDateStr to convert
+      completedAt: completionsR.rows.map(r =>
+        r.completed_at instanceof Date ? r.completed_at.toISOString() : String(r.completed_at)
+      ),
+      // Plain YYYY-MM-DD strings — no UTC conversion; these are already campus-tz dates
+      shieldDates: shieldsR.rows.map(r => {
+        const raw = r.shield_date instanceof Date
+          ? r.shield_date.toISOString().slice(0, 10)
+          : String(r.shield_date).slice(0, 10);
+        return raw;
+      }),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
