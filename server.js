@@ -3324,6 +3324,52 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // STREAK SHIELDS
 // ============================================================================
 
+// GET /api/streak/data — single endpoint that returns all data needed for client-side streak calc.
+// Returns campus, shields, shield mode, all completion timestamps, and all shield timestamps.
+// The client converts UTC → campus-tz, strips weekends, computes the streak, and handles auto-shield.
+app.get('/api/streak/data', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // User's campus and shield info
+    const userR = await pool.query(
+      'SELECT campus, streak_shields_available, streak_shield_mode FROM users WHERE id = $1',
+      [userId]
+    );
+    const row = userR.rows[0] || {};
+
+    // All completion timestamps (UTC ISO strings) — one per completed task
+    const completionsR = await pool.query(
+      'SELECT completed_at FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at ASC',
+      [userId]
+    );
+
+    // All shield dates (stored as DATE; return as YYYY-MM-DD strings)
+    const shieldsR = await pool.query(
+      'SELECT shield_date FROM streak_shield_log WHERE user_id = $1 ORDER BY shield_date ASC',
+      [userId]
+    );
+
+    res.json({
+      campus:          row.campus ?? 'Ashland',
+      shieldsAvailable: row.streak_shields_available ?? 0,
+      shieldMode:      row.streak_shield_mode ?? 'manual',
+      // UTC ISO strings — client uses getCampusOffsetHours to convert to local dates
+      completedAt:     completionsR.rows.map(r => r.completed_at instanceof Date
+                         ? r.completed_at.toISOString()
+                         : String(r.completed_at)),
+      // Shield dates are stored as DATE (YYYY-MM-DD); return as plain date strings
+      // Append T00:00:00Z so toCampusDate() can parse them as UTC midnight
+      consumedAt:      shieldsR.rows.map(r => {
+                         const d = r.shield_date instanceof Date
+                           ? r.shield_date.toISOString().slice(0, 10)
+                           : String(r.shield_date).slice(0, 10);
+                         return `${d}T00:00:00Z`;
+                       }),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/streak/shields — get user's shield count and mode
 app.get('/api/streak/shields', authenticateToken, async (req, res) => {
   try {
@@ -3477,14 +3523,28 @@ app.delete('/api/feed-reactions/:entryId', authenticateToken, async (req, res) =
 // GET /api/insignia — get current insignia, days count, and all unlocked insignias
 app.get('/api/insignia', authenticateToken, async (req, res) => {
   try {
+    // Compute distinct completion days dynamically from tasks_completed so the counter
+    // is always accurate even if insignia_days was never incremented for historical entries.
+    const daysR = await pool.query(
+      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
+      [req.user.id]
+    );
+    const computedDays = parseInt(daysR.rows[0]?.days ?? 0);
+
+    // Keep the stored insignia_days column in sync (catches any drift from the counter approach)
+    await pool.query(
+      'UPDATE users SET insignia_days = $1 WHERE id = $2 AND insignia_days != $1',
+      [computedDays, req.user.id]
+    );
+
     const userR = await pool.query(
-      'SELECT insignia_days, insignia_selected FROM users WHERE id = $1', [req.user.id]
+      'SELECT insignia_selected FROM users WHERE id = $1', [req.user.id]
     );
     const unlocksR = await pool.query(
       'SELECT label, unlocked_at FROM insignia_unlocks WHERE user_id = $1 ORDER BY unlocked_at ASC', [req.user.id]
     );
     res.json({
-      days: userR.rows[0]?.insignia_days ?? 0,
+      days: computedDays,
       selected: userR.rows[0]?.insignia_selected ?? 'Default',
       unlocked: unlocksR.rows
     });
@@ -3513,8 +3573,17 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
       [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
       [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Aether']
     ];
-    const userR = await pool.query('SELECT insignia_days FROM users WHERE id = $1', [req.user.id]);
-    const days = userR.rows[0]?.insignia_days ?? 0;
+    // Compute dynamically from tasks_completed (same approach as GET /api/insignia)
+    const daysR = await pool.query(
+      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
+      [req.user.id]
+    );
+    const days = parseInt(daysR.rows[0]?.days ?? 0);
+    // Keep stored value in sync
+    await pool.query(
+      'UPDATE users SET insignia_days = $1 WHERE id = $2 AND insignia_days != $1',
+      [days, req.user.id]
+    );
     const newlyUnlocked = [];
     for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
       if (days >= threshold) {
