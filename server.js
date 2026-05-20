@@ -646,7 +646,8 @@ const estimateTaskTime = async (task, userId) => {
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email: rawEmail, password } = req.body;
+    const email = rawEmail?.trim().toLowerCase();
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -694,7 +695,8 @@ app.post('/api/auth/register', async (req, res) => {
 // Login
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email: rawEmail, password } = req.body;
+    const email = rawEmail?.trim().toLowerCase();
 
     if (!isValidOneSchoolEmail(email)) {
       return res.status(400).json({ error: 'Invalid email format' });
@@ -3322,35 +3324,6 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // STREAK SHIELDS
 // ============================================================================
 
-// GET /api/streak/data — returns all raw data needed for streak calculation on the frontend.
-// Returns completed_at UTC timestamps, consumed_at UTC timestamps, campus, shield count & mode.
-app.get('/api/streak/data', authenticateToken, async (req, res) => {
-  try {
-    const [userR, completionsR, shieldsR] = await Promise.all([
-      pool.query(
-        'SELECT campus, streak_shields_available, streak_shield_mode FROM users WHERE id = $1',
-        [req.user.id]
-      ),
-      pool.query(
-        'SELECT completed_at FROM tasks_completed WHERE user_id = $1',
-        [req.user.id]
-      ),
-      pool.query(
-        'SELECT consumed_at FROM streak_shield_log WHERE user_id = $1',
-        [req.user.id]
-      ),
-    ]);
-    const u = userR.rows[0] || {};
-    res.json({
-      campus:           u.campus || 'Ashland',
-      shieldsAvailable: u.streak_shields_available ?? 0,
-      shieldMode:       u.streak_shield_mode ?? 'manual',
-      completedAt:      completionsR.rows.map(r => r.completed_at.toISOString()),
-      consumedAt:       shieldsR.rows.map(r => r.consumed_at.toISOString()),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // GET /api/streak/shields — get user's shield count and mode
 app.get('/api/streak/shields', authenticateToken, async (req, res) => {
   try {
@@ -3538,7 +3511,7 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
     const INSIGNIA_THRESHOLDS = [
       [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
-      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Antimatter']
+      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Aether']
     ];
     const userR = await pool.query('SELECT insignia_days FROM users WHERE id = $1', [req.user.id]);
     const days = userR.rows[0]?.insignia_days ?? 0;
@@ -3619,11 +3592,13 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
       }
     }
 
-    // Streak badges (pass current streak in request body from client calculation)
-    const { currentStreak } = req.body;
-    if (currentStreak) {
+    // Streak badges — use the highest of current streak and personal record so badges
+    // earned during a past streak are never lost when the current streak is lower.
+    const { currentStreak, personalRecord } = req.body;
+    const bestStreak = Math.max(parseInt(currentStreak) || 0, parseInt(personalRecord) || 0);
+    if (bestStreak > 0) {
       for (const t of [7,14,30,60,100]) {
-        if (currentStreak >= t) await award('streak_' + t);
+        if (bestStreak >= t) await award('streak_' + t);
       }
     }
 
