@@ -1293,7 +1293,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       console.log(`[MAIN SYNC] ${courses.length} active courses found`);
     } catch (err) {
       if (err.response?.status === 401) {
-        return res.status(401).json({ error: 'Canvas API token is invalid or expired. Please update your token in Settings.' });
+        return res.status(400).json({ error: 'Canvas API token is invalid or expired. Please update your token in Settings.' });
       }
       return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: err.message });
     }
@@ -1545,7 +1545,7 @@ app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
       console.log(`[COURSE SYNC] ${courses.length} courses fetched`);
     } catch (err) {
       if (err.response?.status === 401) {
-        return res.status(401).json({ error: 'Canvas token invalid or expired.' });
+        return res.status(400).json({ error: 'Canvas token invalid or expired. Please update your token in Settings.' });
       }
       return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
     }
