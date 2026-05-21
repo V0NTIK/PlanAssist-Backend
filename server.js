@@ -87,6 +87,77 @@ if (!ENCRYPTION_KEY) {
 const ENCRYPTION_KEY_BUFFER = Buffer.from(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
 
 // ============================================================================
+// CAMPUS TIMEZONE HELPERS (for streak shield timestamp generation)
+// ============================================================================
+
+// Campus UTC offsets — dst = hours during Daylight Saving Time (Mar–Nov),
+// standard = hours during Standard Time (Nov–Mar).
+// All OSG NA campuses that observe DST follow the US/Canada schedule.
+const CAMPUS_UTC_OFFSETS = {
+  'Ashland':        { standard: -5, dst: -4 },
+  'Barbados':       { standard: -4, dst: -4 },
+  'Calgary':        { standard: -7, dst: -6 },
+  'Chesapeake':     { standard: -5, dst: -4 },
+  'Chicago':        { standard: -6, dst: -5 },
+  'Council Bluffs': { standard: -6, dst: -5 },
+  'Des Moines':     { standard: -6, dst: -5 },
+  'Detroit':        { standard: -5, dst: -4 },
+  'Edmonton':       { standard: -7, dst: -6 },
+  'Gothenburg':     { standard: -6, dst: -5 },
+  'Hamilton':       { standard: -5, dst: -4 },
+  'Indianapolis':   { standard: -5, dst: -4 },
+  'Jamaica':        { standard: -5, dst: -5 },
+  'Kalispell':      { standard: -7, dst: -6 },
+  'Knoxville':      { standard: -5, dst: -4 },
+  'Los Angeles':    { standard: -8, dst: -7 },
+  'Maple Creek':    { standard: -6, dst: -6 },
+  'Minneapolis':    { standard: -6, dst: -5 },
+  'Montreal':       { standard: -5, dst: -4 },
+  'Mossley':        { standard: -5, dst: -4 },
+  'New England':    { standard: -5, dst: -4 },
+  'New York':       { standard: -5, dst: -4 },
+  'Oxbow':          { standard: -6, dst: -6 },
+  'Pembina':        { standard: -6, dst: -5 },
+  'Portland':       { standard: -8, dst: -7 },
+  'Redwood Falls':  { standard: -6, dst: -5 },
+  'Regina':         { standard: -6, dst: -6 },
+  'Rideau Lakes':   { standard: -5, dst: -4 },
+  'Rochester':      { standard: -5, dst: -4 },
+  'San Antonio':    { standard: -6, dst: -5 },
+  'San Francisco':  { standard: -8, dst: -7 },
+  'Seattle':        { standard: -8, dst: -7 },
+  'St. Vincent':    { standard: -4, dst: -4 },
+  'Stonewall':      { standard: -6, dst: -5 },
+  'Trinidad':       { standard: -4, dst: -4 },
+  'Vancouver':      { standard: -8, dst: -7 },
+};
+
+// Returns true if the given date is in US/Canada DST (2nd Sun March → 1st Sun November).
+function isDSTOnDate(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  // DST starts: 2nd Sunday of March
+  const dstStart = new Date(y, 2, 1); // March 1
+  dstStart.setDate(1 + (7 - dstStart.getDay()) % 7 + 7); // 2nd Sunday
+  // DST ends: 1st Sunday of November
+  const dstEnd = new Date(y, 10, 1); // November 1
+  dstEnd.setDate(1 + (7 - dstEnd.getDay()) % 7); // 1st Sunday
+  const check = new Date(y, m - 1, d);
+  return check >= dstStart && check < dstEnd;
+}
+
+// Given a campus-tz YYYY-MM-DD date string and a campus name, returns a UTC
+// timestamp (Date object) representing noon on that campus date.
+// Noon campus-time is safely within the day regardless of DST transitions.
+function campusDateToUTC(dateStr, campus) {
+  const entry = CAMPUS_UTC_OFFSETS[campus] || CAMPUS_UTC_OFFSETS['Ashland'];
+  const offsetHours = isDSTOnDate(dateStr) ? entry.dst : entry.standard;
+  // noon campus-time = 12:00:00 campus = (12 - offsetHours) UTC
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const utcHour = 12 - offsetHours; // e.g. UTC-4: noon EDT = 16:00 UTC
+  return new Date(Date.UTC(y, m - 1, d, utcHour, 0, 0));
+}
+
+// ============================================================================
 // ENCRYPTION HELPERS FOR CANVAS API TOKENS
 // ============================================================================
 
@@ -3325,15 +3396,14 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // GET /api/streak/data — single endpoint that returns all data needed for client-side streak calc.
-// Returns campus, shields, shield mode, all completion timestamps, and all shield dates.
-// The client converts completion UTC timestamps → campus-tz dates.
-// Shield dates are returned as plain YYYY-MM-DD strings (they are stored as DATE in Postgres —
-// no timezone conversion is needed; they were stored as the campus-tz date when the shield was used).
+// Returns campus, shields, shield mode, all completion timestamps, and all shield consumed_at timestamps.
+// The client converts ALL timestamps (completions and shields) from UTC → campus-tz dates.
+// Per spec: consumed_at is the UTC timestamp of when the shield was used; its campus-tz date
+// is the day that gets covered in the streak. shield_date is not used for streak calculations.
 app.get('/api/streak/data', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // User's campus and shield info
     const userR = await pool.query(
       'SELECT campus, streak_shields_available, streak_shield_mode FROM users WHERE id = $1',
       [userId]
@@ -3346,9 +3416,10 @@ app.get('/api/streak/data', authenticateToken, async (req, res) => {
       [userId]
     );
 
-    // Shield dates stored as DATE (YYYY-MM-DD) — already campus-tz, no conversion needed
+    // Shield consumed_at timestamps (UTC) — client converts to campus-tz dates.
+    // The campus-tz date of consumed_at is the day the shield covers, per spec.
     const shieldsR = await pool.query(
-      'SELECT shield_date FROM streak_shield_log WHERE user_id = $1 ORDER BY shield_date ASC',
+      'SELECT consumed_at FROM streak_shield_log WHERE user_id = $1 ORDER BY consumed_at ASC',
       [userId]
     );
 
@@ -3356,17 +3427,13 @@ app.get('/api/streak/data', authenticateToken, async (req, res) => {
       campus:           row.campus ?? 'Ashland',
       shieldsAvailable: row.streak_shields_available ?? 0,
       shieldMode:       row.streak_shield_mode ?? 'manual',
-      // UTC ISO strings — client uses getCampusOffsetHours + utcToCampusDateStr to convert
       completedAt: completionsR.rows.map(r =>
         r.completed_at instanceof Date ? r.completed_at.toISOString() : String(r.completed_at)
       ),
-      // Plain YYYY-MM-DD strings — no UTC conversion; these are already campus-tz dates
-      shieldDates: shieldsR.rows.map(r => {
-        const raw = r.shield_date instanceof Date
-          ? r.shield_date.toISOString().slice(0, 10)
-          : String(r.shield_date).slice(0, 10);
-        return raw;
-      }),
+      // consumed_at is a TIMESTAMP — return as UTC ISO strings, same as completedAt
+      consumedAt: shieldsR.rows.map(r =>
+        r.consumed_at instanceof Date ? r.consumed_at.toISOString() : String(r.consumed_at)
+      ),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3385,17 +3452,20 @@ app.get('/api/streak/shields', authenticateToken, async (req, res) => {
 // POST /api/streak/shields/use — manually consume one shield for a specific date
 app.post('/api/streak/shields/use', authenticateToken, async (req, res) => {
   try {
-    const { date } = req.body; // YYYY-MM-DD local date
+    const { date } = req.body; // YYYY-MM-DD campus-tz date to shield
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date' });
-    const user = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+    const user = await pool.query('SELECT streak_shields_available, campus FROM users WHERE id = $1', [req.user.id]);
     if ((user.rows[0]?.streak_shields_available ?? 0) < 1) return res.status(400).json({ error: 'No shields available' });
+    // Compute consumed_at as noon on the campus-tz date, converted to UTC.
+    // This ensures toCampusDate(consumed_at) always yields back the correct campus date.
+    const campus = user.rows[0]?.campus || 'Ashland';
+    const consumedAt = campusDateToUTC(date, campus);
     await pool.query('BEGIN');
     const ins = await pool.query(
-      'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING shield_date',
-      [req.user.id, date]
+      'INSERT INTO streak_shield_log (user_id, shield_date, consumed_at) VALUES ($1, $2, $3) ON CONFLICT (user_id, shield_date) DO NOTHING RETURNING shield_date',
+      [req.user.id, date, consumedAt]
     );
     if (ins.rowCount === 0) {
-      // Shield for this date already exists — don't double-decrement the counter
       await pool.query('COMMIT');
       const cur = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
       return res.json({ success: true, alreadyShielded: true, shieldedDate: date, remaining: cur.rows[0].streak_shields_available });
@@ -3413,17 +3483,21 @@ app.post('/api/streak/shields/use', authenticateToken, async (req, res) => {
 // POST /api/streak/shields/auto-consume — consume shields for gap dates (automatic mode)
 app.post('/api/streak/shields/auto-consume', authenticateToken, async (req, res) => {
   try {
-    const { gapDates } = req.body; // array of YYYY-MM-DD strings
+    const { gapDates } = req.body; // array of YYYY-MM-DD campus-tz strings
     if (!Array.isArray(gapDates) || gapDates.length === 0) return res.json({ consumed: 0 });
-    const user = await pool.query('SELECT streak_shields_available FROM users WHERE id = $1', [req.user.id]);
+    const user = await pool.query('SELECT streak_shields_available, campus FROM users WHERE id = $1', [req.user.id]);
     let available = user.rows[0]?.streak_shields_available ?? 0;
+    const campus = user.rows[0]?.campus || 'Ashland';
     let consumed = 0;
     await pool.query('BEGIN');
     for (const date of gapDates) {
       if (available <= 0) break;
+      // Set consumed_at to noon on the campus-tz gap date, converted to UTC,
+      // so that toCampusDate(consumed_at) always yields the correct campus date.
+      const consumedAt = campusDateToUTC(date, campus);
       const ins = await pool.query(
-        'INSERT INTO streak_shield_log (user_id, shield_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
-        [req.user.id, date]
+        'INSERT INTO streak_shield_log (user_id, shield_date, consumed_at) VALUES ($1, $2, $3) ON CONFLICT (user_id, shield_date) DO NOTHING RETURNING id',
+        [req.user.id, date, consumedAt]
       );
       if (ins.rowCount > 0) { available--; consumed++; }
     }
