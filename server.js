@@ -1617,14 +1617,17 @@ app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
 // ============================================================================
 // POST /api/canvas/grade-sync — GRADE SYNC
 // Triggered: opening Activity pane on Account & Analytics page.
-// Fetches submissions for courses with recent tasks, updates grades.
-// ============================================================================
+// POST /api/canvas/grade-sync — triggered when user opens the Activity/Grades pane.
+// Fetches ALL graded submissions for ALL of the user's enrolled courses from Canvas,
+// and upserts them into grade_history keyed by (user_id, assignment_id).
+// This captures full historical grades regardless of whether PlanAssist has ever
+// had a corresponding task row — fixes the "only future tasks" limitation.
 app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     console.log(`\n=== GRADE SYNC for user ${userId} ===`);
 
-    // Get Canvas token
+    // Step 1: Check and decrypt Canvas token
     const userResult = await pool.query(
       'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id = $1',
       [userId]
@@ -1634,56 +1637,86 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
 
     const headers = { Authorization: `Bearer ${canvasToken}` };
 
-    // Get course IDs with tasks in last 60 days
-    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    // Step 2: Get all enrolled course IDs from the courses table.
+    // Using courses table (not tasks) means we get ALL courses, not just those
+    // with tasks due in the last 60 days — enabling full historical grade coverage.
     const coursesRes = await pool.query(
-      'SELECT DISTINCT course_id FROM tasks WHERE user_id = $1 AND course_id IS NOT NULL AND deadline_date >= $2',
-      [userId, sixtyDaysAgo]
+      'SELECT DISTINCT course_id FROM courses WHERE user_id = $1 AND enabled = true',
+      [userId]
     );
     const courseIds = coursesRes.rows.map(r => r.course_id);
-    if (courseIds.length === 0) return res.json({ updated: 0 });
+    if (courseIds.length === 0) {
+      console.log('[GRADE SYNC] No enrolled courses found.');
+      return res.json({ updated: 0, total: 0 });
+    }
+    console.log(`[GRADE SYNC] Fetching submissions for ${courseIds.length} course(s)`);
 
-    // Fetch submissions in parallel
+    // Step 3: Fetch all submissions for each course in parallel.
+    // include[]=assignment pulls in assignment metadata (title, points_possible, html_url).
+    // per_page=100 is Canvas's max; most courses have well under 100 assignments.
     const submissionResults = await Promise.allSettled(
       courseIds.map(cid =>
         axios.get(
-          `${CANVAS_API_BASE}/courses/${cid}/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
-          { headers, timeout: 10000 }
+          `${CANVAS_API_BASE}/courses/${cid}/students/submissions?student_ids[]=self&include[]=assignment&per_page=100`,
+          { headers, timeout: 15000 }
         ).then(r => r.data.map(s => ({ ...s, _courseId: cid })))
+         .catch(err => {
+           console.warn(`[GRADE SYNC] Course ${cid} fetch failed: ${err.message}`);
+           return [];
+         })
       )
     );
-    const allSubs = submissionResults.filter(r => r.status === 'fulfilled').flatMap(r => r.value);
-    if (allSubs.length === 0) return res.json({ updated: 0 });
+    const allSubs = submissionResults.flatMap(r => r.status === 'fulfilled' ? r.value : []);
+    console.log(`[GRADE SYNC] Total submissions fetched: ${allSubs.length}`);
 
-    // Get max grade_id
-    const maxGradeRes = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+    // Step 4: Build a course_id → course_name lookup from the courses table
+    // so we can store a human-readable course name in grade_history.
+    const courseNameRes = await pool.query(
+      'SELECT course_id, name FROM courses WHERE user_id = $1',
       [userId]
     );
-    let nextGradeId = parseInt(maxGradeRes.rows[0].max_id) + 1;
-    let updatedCount = 0;
+    const courseNameMap = {};
+    courseNameRes.rows.forEach(r => { courseNameMap[r.course_id] = r.name; });
 
+    // Step 5: Upsert each graded submission into grade_history.
+    // Only process submissions that have a score OR a grade — unsubmitted work is skipped.
+    let upsertedCount = 0;
     for (const sub of allSubs) {
       if (sub.score == null && !sub.grade) continue;
-      const taskRes = await pool.query(
-        'SELECT id, current_score, current_grade FROM tasks WHERE user_id = $1 AND assignment_id = $2 LIMIT 1',
-        [userId, sub.assignment_id]
+
+      const assignment = sub.assignment || {};
+      const title       = assignment.name || `Assignment ${sub.assignment_id}`;
+      const courseName  = courseNameMap[sub._courseId] || null;
+      const htmlUrl     = assignment.html_url || sub.preview_url || null;
+      const pointsPoss  = assignment.points_possible != null ? parseFloat(assignment.points_possible) : null;
+      const score       = sub.score != null ? parseFloat(sub.score) : null;
+      const grade       = sub.grade || null;
+      const gradingType = assignment.grading_type || 'points';
+      const submittedAt = sub.submitted_at || null;
+
+      await pool.query(
+        `INSERT INTO grade_history
+           (user_id, course_id, assignment_id, title, course_name, html_url,
+            score, points_possible, grade, grading_type, submitted_at, synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         ON CONFLICT (user_id, assignment_id) DO UPDATE SET
+           title          = EXCLUDED.title,
+           course_name    = EXCLUDED.course_name,
+           html_url       = EXCLUDED.html_url,
+           score          = EXCLUDED.score,
+           points_possible = EXCLUDED.points_possible,
+           grade          = EXCLUDED.grade,
+           grading_type   = EXCLUDED.grading_type,
+           submitted_at   = EXCLUDED.submitted_at,
+           synced_at      = NOW()`,
+        [userId, sub._courseId, sub.assignment_id, title, courseName, htmlUrl,
+         score, pointsPoss, grade, gradingType, submittedAt]
       );
-      if (taskRes.rows.length === 0) continue;
-      const task = taskRes.rows[0];
-      const scoreChanged = sub.score != null && String(sub.score) !== String(task.current_score);
-      const gradeChanged = sub.grade != null && sub.grade !== task.current_grade;
-      if (scoreChanged || gradeChanged) {
-        await pool.query(
-          'UPDATE tasks SET current_score=$1, current_grade=$2, grade_id=$3 WHERE id=$4 AND user_id=$5',
-          [sub.score, sub.grade, nextGradeId++, task.id, userId]
-        );
-        updatedCount++;
-      }
+      upsertedCount++;
     }
 
-    console.log(`[GRADE SYNC] Complete: ${updatedCount} grades updated`);
-    res.json({ updated: updatedCount });
+    console.log(`[GRADE SYNC] Complete: ${upsertedCount} grades upserted`);
+    res.json({ updated: upsertedCount, total: allSubs.length });
 
   } catch (err) {
     console.error('[GRADE SYNC] Error:', err.message);
@@ -2254,13 +2287,10 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         insertedTaskIds.push(newId);
         newCount++;
         console.log(`  ✓ Inserted task ID ${newId}: "${t.title}"`);
-
-        // If inserted task already completed on Canvas, update leaderboard
-        if (t.completed === true) {
-          completionFlips++;
-          incrementLeaderboardForUser(userId).catch(err =>
-            console.error('[LEADERBOARD] new completed task error:', err.message));
-        }
+        // Do NOT fire leaderboard for tasks that arrive already completed on first insert —
+        // these are historical completions from before PlanAssist started tracking the user.
+        // The leaderboard only increments on a FALSE→TRUE flip on a task that PlanAssist
+        // already knew about (i.e. it existed in the DB as incomplete first).
       }
     }
 
@@ -2900,10 +2930,11 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    // Mark task as deleted
-    // This preserves the URL in the database so it won't be re-imported during sync
+    // Mark task completed and deleted.
+    // completed=true must be set so sync-save's wasCompleted check sees it
+    // and does not re-fire the leaderboard increment on the next sync.
     await pool.query(
-      'UPDATE tasks SET deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET completed = true, deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -3165,10 +3196,12 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       );
     }
     
-    // Mark task as deleted instead of removing from database
-    // This preserves the URL in the database so it won't be re-imported during sync
+    // Mark task as completed AND deleted.
+    // Setting completed=true is critical: sync-save checks existing.completed before
+    // firing the leaderboard increment. If completed stays false, every subsequent sync
+    // that sees Canvas has it submitted will re-fire the leaderboard (double-count).
     await pool.query(
-      'UPDATE tasks SET deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET completed = true, deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
@@ -5129,32 +5162,32 @@ app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => 
   }
 });
 
-// GET grade_id-ordered grades from DB (last 20 graded tasks by grade_id)
+// GET /api/canvas/grades — returns all graded submissions from grade_history,
+// ordered by most-recently-synced first. grade_history is populated by Grade Sync
+// (POST /canvas/grade-sync) and covers full historical grades for all courses,
+// not just tasks that are currently in the tasks table.
 app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, assignment_id, title, class, url, points_possible,
-              current_score, current_grade, grading_type, submitted_at, grade_id
-       FROM tasks
+      `SELECT id, course_id, assignment_id, title, course_name, html_url,
+              score, points_possible, grade, grading_type, submitted_at, synced_at
+       FROM grade_history
        WHERE user_id = $1
-         AND grade_id IS NOT NULL
-       ORDER BY grade_id DESC
-       LIMIT 20`,
+       ORDER BY synced_at DESC, submitted_at DESC NULLS LAST`,
       [req.user.id]
     );
 
     const graded = result.rows.map(t => ({
-      id: t.id,
-      assignmentId: t.assignment_id,
-      assignmentName: t.title,
-      courseName: t.class,
-      score: t.current_score != null ? parseFloat(t.current_score) : null,
-      pointsPossible: t.points_possible != null ? parseFloat(t.points_possible) : null,
-      grade: t.current_grade,
-      gradingType: t.grading_type || 'points',
-      gradedAt: t.submitted_at,
-      htmlUrl: t.url,
-      gradeId: t.grade_id,
+      id:              t.id,
+      assignmentId:    t.assignment_id,
+      assignmentName:  t.title,
+      courseName:      t.course_name,
+      score:           t.score != null ? parseFloat(t.score) : null,
+      pointsPossible:  t.points_possible != null ? parseFloat(t.points_possible) : null,
+      grade:           t.grade,
+      gradingType:     t.grading_type || 'points',
+      gradedAt:        t.submitted_at,
+      htmlUrl:         t.html_url,
     }));
 
     res.json(graded);
