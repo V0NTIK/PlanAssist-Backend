@@ -1516,24 +1516,11 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
 // ============================================================================
 // POST /api/canvas/course-sync — COURSE SYNC
 // Triggered: opening Marks page, opening Goals pane, 60-min silent interval.
-// clearSessionActive=true only for Marks/Goals triggers (not the silent interval).
 // ============================================================================
 app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { clearSessionActive = false } = req.body;
-    console.log(`\n=== COURSE SYNC for user ${userId} clearSessionActive=${clearSessionActive} ===`);
-
-    // Optionally clear stale session_active flags (only for UI-triggered syncs)
-    if (clearSessionActive) {
-      const cleared = await pool.query(
-        'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
-        [userId]
-      );
-      if (cleared.rowCount > 0) {
-        console.log(`[COURSE SYNC] Cleared ${cleared.rowCount} stale session_active flag(s)`);
-      }
-    }
+    console.log(`\n=== COURSE SYNC for user ${userId} ===`);
 
     // Get Canvas token
     const userResult = await pool.query(
@@ -1636,15 +1623,6 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     console.log(`\n=== GRADE SYNC for user ${userId} ===`);
-
-    // Clear stale session_active flags
-    const cleared = await pool.query(
-      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
-      [userId]
-    );
-    if (cleared.rowCount > 0) {
-      console.log(`[GRADE SYNC] Cleared ${cleared.rowCount} stale session_active flag(s)`);
-    }
 
     // Get Canvas token
     const userResult = await pool.query(
@@ -2127,15 +2105,6 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
 
     const userId = req.user.id;
     console.log(`\n=== SYNC-SAVE [${syncType}] partial=${partial}: ${tasks.length} tasks for user ${userId} ===`);
-
-    // ── Step 0: Clear stale session_active flags at start of every sync ──
-    const staleCleared = await pool.query(
-      'UPDATE tasks SET session_active = false WHERE user_id = $1 AND session_active = true RETURNING id',
-      [userId]
-    );
-    if (staleCleared.rowCount > 0) {
-      console.log(`[SYNC-SAVE] Cleared ${staleCleared.rowCount} stale session_active flag(s)`);
-    }
 
     // ── Step 1: Batch-load all existing tasks for this user by assignment_id + url ──
     const assignmentIds = tasks.map(t => t.assignmentId).filter(Boolean);
@@ -3093,6 +3062,23 @@ app.post('/api/sessions/agenda-end/:taskId', authenticateToken, async (req, res)
   } catch (error) {
     console.error('Agenda end error:', error);
     res.status(500).json({ error: 'Failed to clear agenda session active' });
+  }
+});
+
+// POST /api/sessions/heartbeat — called every 30s while a timer is running.
+// Writes a fresh timestamp to session_heartbeat on the active task so the admin
+// panel can distinguish a genuinely live session from a stale session_active flag.
+app.post('/api/sessions/heartbeat', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE tasks SET session_heartbeat = NOW()
+       WHERE user_id = $1 AND session_active = true`,
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Heartbeat error:', error);
+    res.status(500).json({ error: 'Failed to write heartbeat' });
   }
 });
 
@@ -4748,7 +4734,12 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
               MAX(tc.completed_at) AS last_completion,
               COUNT(DISTINCT tc.id) AS total_completed,
               COUNT(DISTINCT tc.id) FILTER (WHERE tc.completed_at >= NOW() - INTERVAL '7 days') AS completed_this_week,
-              EXISTS(SELECT 1 FROM tasks st WHERE st.user_id = u.id AND st.session_active = true) AS in_session
+              EXISTS(
+                SELECT 1 FROM tasks st
+                WHERE st.user_id = u.id
+                  AND st.session_active = true
+                  AND st.session_heartbeat > NOW() - INTERVAL '60 seconds'
+              ) AS in_session
        FROM users u
        LEFT JOIN tasks t ON t.user_id = u.id
        LEFT JOIN tasks_completed tc ON tc.user_id = u.id
