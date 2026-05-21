@@ -5173,7 +5173,7 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
               score, points_possible, grade, grading_type, submitted_at, synced_at
        FROM grade_history
        WHERE user_id = $1
-       ORDER BY synced_at DESC, submitted_at DESC NULLS LAST`,
+       ORDER BY submitted_at DESC NULLS LAST, id DESC`,
       [req.user.id]
     );
 
