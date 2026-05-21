@@ -792,3 +792,28 @@ SET shield_date = (
         END
     )
 )::date;
+
+-- ============================================================================
+-- GRADE HISTORY TABLE
+-- Stores all graded Canvas submissions for a user, keyed by (user_id, assignment_id).
+-- Populated by Grade Sync; persists historical grades regardless of task lifecycle.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS grade_history (
+    id               SERIAL PRIMARY KEY,
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id        BIGINT  NOT NULL,
+    assignment_id    BIGINT  NOT NULL,
+    title            TEXT    NOT NULL,
+    course_name      TEXT,
+    html_url         TEXT,
+    score            NUMERIC(8,2),
+    points_possible  NUMERIC(8,2),
+    grade            VARCHAR(50),
+    grading_type     VARCHAR(50) DEFAULT 'points',
+    submitted_at     TIMESTAMPTZ,
+    synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, assignment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_grade_history_user_id    ON grade_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_grade_history_synced_at  ON grade_history(user_id, synced_at DESC);
