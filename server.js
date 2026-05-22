@@ -850,11 +850,74 @@ const CAMPUS_PERIODS = {
   'Trinidad':       '1-5',
   'Vancouver':      '4-8',
 };
+const CAMPUS_PERIODS_DST = {
+  'Ashland':        '2-6',
+  'Barbados':       '2-6',
+  'Calgary':        '4-8',
+  'Chesapeake':     '2-6',
+  'Chicago':        '3-7',
+  'Council Bluffs': '3-7',
+  'Des Moines':     '3-7',
+  'Detroit':        '2-6',
+  'Edmonton':       '4-8',
+  'Gothenburg':     '3-7',
+  'Hamilton':       '2-6',
+  'Indianapolis':   '2-6',
+  'Jamaica':        '3-7',
+  'Kalispell':      '4-8',
+  'Knoxville':      '2-6',
+  'Los Angeles':    '4-8',
+  'Maple Creek':    '3-7',
+  'Minneapolis':    '3-7',
+  'Montreal':       '2-6',
+  'Mossley':        '2-6',
+  'New England':    '2-6',
+  'New York':       '2-6',
+  'Oxbow':          '3-7',
+  'Pembina':        '3-7',
+  'Portland':       '4-8',
+  'Redwood Falls':  '3-7',
+  'Regina':         '3-7',
+  'Rideau Lakes':   '2-6',
+  'Rochester':      '2-6',
+  'San Antonio':    '3-7',
+  'San Francisco':  '4-8',
+  'Seattle':        '4-8',
+  'St. Vincent':    '2-6',
+  'Stonewall':      '3-7',
+  'Trinidad':       '2-6',
+  'Vancouver':      '4-8',
+};
+
 const VALID_CAMPUSES = Object.keys(CAMPUS_PERIODS);
+
+// Returns true if North American DST is currently active, based purely on the
+// UTC date — independent of the server's local timezone.
+// NA DST: 2nd Sunday in March 02:00 local → 1st Sunday in November 02:00 local.
+// We use noon UTC on transition dates as a safe threshold (all NA campuses have
+// transitioned by then regardless of their exact UTC offset).
+function isNADST(date = new Date()) {
+  const year = date.getUTCFullYear();
+  const march1Day = new Date(Date.UTC(year, 2, 1)).getUTCDay();
+  const secondSunMarch = (march1Day === 0 ? 1 : 8 - march1Day) + 7;
+  const dstStart = new Date(Date.UTC(year, 2, secondSunMarch, 12, 0, 0));
+  const nov1Day = new Date(Date.UTC(year, 10, 1)).getUTCDay();
+  const firstSunNov = nov1Day === 0 ? 1 : 8 - nov1Day;
+  const dstEnd = new Date(Date.UTC(year, 10, firstSunNov, 12, 0, 0));
+  return date >= dstStart && date < dstEnd;
+}
 
 // Returns the period range string for the given campus.
 function getCampusPeriods(campus) {
   return CAMPUS_PERIODS[campus] || CAMPUS_PERIODS['Ashland'];
+}
+
+// Returns the DST-aware period range string for the given campus.
+// This is the value that should be stored in tz_periods and returned to clients.
+function getEffectivePeriods(campus) {
+  return isNADST()
+    ? (CAMPUS_PERIODS_DST[campus] || CAMPUS_PERIODS_DST['Ashland'])
+    : (CAMPUS_PERIODS[campus]     || CAMPUS_PERIODS['Ashland']);
 }
 
 // ============================================================================
@@ -915,7 +978,11 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       schedule_enhanced: user.schedule_enhanced || false,
       is_admin: user.is_admin || false,
       showInFeed: user.show_in_feed !== false,
-      lastSync: user.last_sync || null
+      lastSync: user.last_sync || null,
+      // Return the DST-aware period range so the frontend can use it directly.
+      // Recomputed at request time so it stays current across DST transitions
+      // without requiring the user to re-save their settings.
+      tzPeriods: getEffectivePeriods(user.campus || 'Ashland')
     });
   } catch (error) {
     console.error('Get account setup error:', error);
@@ -929,9 +996,9 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     const { grade, canvasApiToken, campus, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
             calendarShowPrevWeek, calendarShowCurrentWeek, calendarShowNextWeek1, calendarShowNextWeek2, calendarShowWeekends } = req.body;
 
-    // Derive period ranges from campus
+    // Derive DST-aware period ranges from campus
     const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
-    const tzPeriods = CAMPUS_PERIODS[resolvedCampus];
+    const tzPeriods = getEffectivePeriods(resolvedCampus);
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -3649,6 +3716,12 @@ app.get('/api/insignia', authenticateToken, async (req, res) => {
 app.put('/api/insignia', authenticateToken, async (req, res) => {
   try {
     const { label } = req.body;
+    // Whitelist guard — only known tier names are accepted
+    const VALID_INSIGNIA = ['Default','Copper','Silver','Gold','Emerald',
+                            'Amethyst','Ruby','Diamond','Obsidian','Antimatter'];
+    if (!VALID_INSIGNIA.includes(label)) {
+      return res.status(400).json({ error: 'Invalid insignia label' });
+    }
     // Verify user has unlocked this label
     const check = await pool.query(
       'SELECT 1 FROM insignia_unlocks WHERE user_id = $1 AND label = $2', [req.user.id, label]
@@ -3665,7 +3738,7 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
     const INSIGNIA_THRESHOLDS = [
       [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
-      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Aether']
+      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Antimatter']
     ];
     // Compute dynamically from tasks_completed (same approach as GET /api/insignia)
     const daysR = await pool.query(
@@ -4771,7 +4844,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
                 SELECT 1 FROM tasks st
                 WHERE st.user_id = u.id
                   AND st.session_active = true
-                  AND st.session_heartbeat > NOW() - INTERVAL '60 seconds'
+                  AND st.session_heartbeat > NOW() - INTERVAL '90 seconds'
               ) AS in_session
        FROM users u
        LEFT JOIN tasks t ON t.user_id = u.id
@@ -4838,7 +4911,7 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
     if (campus !== undefined) {
       const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
       fields.push(`campus = $${idx++}`);     vals.push(resolvedCampus);
-      fields.push(`tz_periods = $${idx++}`); vals.push(CAMPUS_PERIODS[resolvedCampus]);
+      fields.push(`tz_periods = $${idx++}`); vals.push(getEffectivePeriods(resolvedCampus));
     }
     if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
@@ -4932,6 +5005,8 @@ app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (r
 // GET /api/admin/diagnostics
 app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, res) => {
   try {
+    // Admin's timezone offset in minutes east of UTC (e.g. -300 for EST, +330 for IST)
+    const tzOffsetMinutes = parseInt(req.query.tzOffset) || 0;
     // a) Users who haven't synced recently (no Main/Background Sync in 7 days)
     // Uses last_sync column updated by sync-save endpoint
     const staleSyncRes = await pool.query(
@@ -4990,17 +5065,33 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
        ORDER BY created_at DESC`
     );
 
-    // Activity heatmap: completions by hour of day (UTC, collapsed across all days)
+    // Activity heatmap: completions by hour of day stored as UTC in DB.
+    // We fetch all completions bucketed by UTC hour, then shift them into the
+    // admin's local timezone on the JS side so bars show their local clock time.
     const heatmapRes = await pool.query(
-      `SELECT EXTRACT(HOUR FROM completed_at)::int AS hour, COUNT(*) AS count
+      `SELECT EXTRACT(HOUR FROM completed_at AT TIME ZONE 'UTC')::int AS hour, COUNT(*) AS count
        FROM tasks_completed
        GROUP BY hour
        ORDER BY hour ASC`
     );
-    // Fill all 24 hours (0-23) so the chart has no gaps
-    const heatmapFull = Array.from({ length: 24 }, (_, h) => {
-      const found = heatmapRes.rows.find(r => r.hour === h);
-      return { hour: h, count: found ? parseInt(found.count) : 0 };
+    // Build a 24-slot UTC array first
+    const utcCounts = Array.from({ length: 24 }, (_, h) => {
+      const found = heatmapRes.rows.find(r => parseInt(r.hour) === h);
+      return found ? parseInt(found.count) : 0;
+    });
+    // Shift UTC hours → admin local hours using their tzOffset (minutes)
+    const tzOffsetHours = tzOffsetMinutes / 60; // may be fractional for e.g. India (+5.5)
+    const heatmapFull = Array.from({ length: 24 }, (_, localH) => {
+      // Sum all UTC hours that map to this local hour
+      let count = 0;
+      for (let utcH = 0; utcH < 24; utcH++) {
+        // localH = (utcH + tzOffsetHours) mod 24 — check if it rounds to localH
+        const mapped = ((utcH + tzOffsetHours) % 24 + 24) % 24;
+        if (Math.round(mapped) % 24 === localH) {
+          count += utcCounts[utcH];
+        }
+      }
+      return { hour: localH, count };
     });
 
     res.json({
