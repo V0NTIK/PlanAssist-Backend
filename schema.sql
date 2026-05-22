@@ -500,7 +500,7 @@ CREATE INDEX IF NOT EXISTS idx_weekly_leaderboard_tasks_completed ON weekly_lead
 -- INSIGNIA UNLOCKS
 -- Records which insignia tiers each user has earned.
 -- Tiers (days required): Default=0 Copper=2 Silver=5 Gold=10 Emerald=20
---                        Amethyst=30 Ruby=40 Diamond=50 Obsidian=75 Aether=100
+--                        Amethyst=30 Ruby=40 Diamond=50 Obsidian=75 Antimatter=100
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS insignia_unlocks (
@@ -694,7 +694,7 @@ DO $$
 DECLARE
     tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
     tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald',
-                                    'Amethyst','Ruby','Diamond','Obsidian','Aether'];
+                                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter'];
     rec RECORD;
     i   INT;
 BEGIN
@@ -709,16 +709,20 @@ BEGIN
     END LOOP;
 END $$;
 
--- Remove any stale insignia_unlocks rows with old tier names
+-- Remove any stale insignia_unlocks rows with old or invalid tier names
 DELETE FROM insignia_unlocks
 WHERE label NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                    'Amethyst','Ruby','Diamond','Obsidian','Aether');
+                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
 
--- Reset any invalid insignia_selected values to Default
+-- Rename Aether → Antimatter in both tables (label was renamed in a prior release)
+UPDATE insignia_unlocks SET label = 'Antimatter' WHERE label = 'Aether';
+UPDATE users SET insignia_selected = 'Antimatter' WHERE insignia_selected = 'Aether';
+
+-- Reset any invalid insignia_selected values to Default (catches 'completed' and other garbage)
 UPDATE users
 SET insignia_selected = 'Default'
 WHERE insignia_selected NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                                'Amethyst','Ruby','Diamond','Obsidian','Aether');
+                                'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
 
 -- Backfill first_completion gallery badge
 INSERT INTO user_badges (user_id, badge_key, awarded_at)
