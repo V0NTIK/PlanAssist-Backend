@@ -1353,10 +1353,13 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     let courses;
     try {
       const resp = await axios.get(
-        `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
+        `${CANVAS_API_BASE}/courses?per_page=100`,
         { headers, timeout: 15000 }
       );
-      courses = resp.data;
+      courses = (resp.data || []).filter(c => {
+        const enrollmentState = c.enrollments?.[0]?.enrollment_state;
+        return !enrollmentState || enrollmentState === 'active' || enrollmentState === 'invited';
+      });
       console.log(`[MAIN SYNC] ${courses.length} active courses found`);
     } catch (err) {
       if (err.response?.status === 401) {
@@ -1483,10 +1486,13 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
     let courses;
     try {
       const resp = await axios.get(
-        `${CANVAS_API_BASE}/courses?enrollment_state=active&per_page=100`,
+        `${CANVAS_API_BASE}/courses?per_page=100`,
         { headers, timeout: 15000 }
       );
-      courses = resp.data;
+      courses = (resp.data || []).filter(c => {
+        const enrollmentState = c.enrollments?.[0]?.enrollment_state;
+        return !enrollmentState || enrollmentState === 'active' || enrollmentState === 'invited';
+      });
     } catch (err) {
       console.warn('[BG SYNC] Failed to fetch courses:', err.message);
       return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
@@ -1605,11 +1611,18 @@ app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
     let courses;
     try {
       const resp = await axios.get(
-        `${CANVAS_API_BASE}/courses?enrollment_state=active&include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
+        `${CANVAS_API_BASE}/courses?include[]=total_scores&include[]=current_grading_period_scores&per_page=100`,
         { headers, timeout: 15000 }
       );
-      courses = resp.data;
-      console.log(`[COURSE SYNC] ${courses.length} courses fetched`);
+      // Filter out courses where the user's own enrollment is concluded/inactive.
+      // Without enrollment_state=active, Canvas returns all-time enrollments; we only
+      // want courses the student is currently attending (active or invited), not archived
+      // courses from prior years.
+      courses = (resp.data || []).filter(c => {
+        const enrollmentState = c.enrollments?.[0]?.enrollment_state;
+        return !enrollmentState || enrollmentState === 'active' || enrollmentState === 'invited';
+      });
+      console.log(`[COURSE SYNC] ${courses.length} courses fetched (after enrollment filter)`);
     } catch (err) {
       if (err.response?.status === 401) {
         return res.status(400).json({ error: 'Canvas token invalid or expired. Please update your token in Settings.' });
