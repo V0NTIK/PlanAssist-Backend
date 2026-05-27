@@ -1660,6 +1660,24 @@ app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
       );
     }
 
+    // Auto-link: if any newly upserted course matches a 'course'-type studio, ensure
+    // the hpt_studio_members table is NOT involved (course studios derive live), but
+    // for 'key'-type studios we still don't auto-add. Log for diagnostics only.
+    try {
+      const courseIds = courses.map(c => c.id);
+      if (courseIds.length > 0) {
+        const linked = await pool.query(
+          `SELECT s.id, s.name FROM hpt_studios s WHERE s.setup_type='course' AND s.course_id = ANY($1::bigint[])`,
+          [courseIds]
+        );
+        if (linked.rows.length > 0) {
+          console.log(`[COURSE SYNC] User ${userId} linked to ${linked.rows.length} HPT studio(s) via course_id`);
+        }
+      }
+    } catch (linkErr) {
+      console.warn('[COURSE SYNC] Studio auto-link check failed (non-fatal):', linkErr.message);
+    }
+
     // Fetch assignment groups IN PARALLEL
     console.log('[COURSE SYNC] Fetching assignment groups in parallel...');
     await Promise.all(
@@ -5492,6 +5510,485 @@ app.get('/api/canvas/activity', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Canvas activity stream error:', error.message);
     res.status(500).json({ error: 'Failed to fetch activity stream' });
+  }
+});
+
+// ============================================================================
+// HPT (HIGH PERFORMING TEAM) — AUTHENTICATION & MIDDLEWARE
+// ============================================================================
+
+const authenticateHPT = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err || !decoded.hptUser) return res.status(403).json({ error: 'Invalid HPT token' });
+    req.hptUser = decoded;
+    next();
+  });
+};
+
+// Helper: check HPT user has access to a studio (creator or shared)
+async function hptHasStudioAccess(hptUserId, studioId) {
+  const r = await pool.query(
+    `SELECT 1 FROM hpt_studios WHERE id=$1 AND created_by=$2
+     UNION
+     SELECT 1 FROM hpt_studio_shares WHERE studio_id=$1 AND hpt_user_id=$2`,
+    [studioId, hptUserId]
+  );
+  return r.rows.length > 0;
+}
+
+// POST /api/hpt/auth/login
+app.post('/api/hpt/auth/login', async (req, res) => {
+  try {
+    const { passcode } = req.body;
+    if (!passcode) return res.status(400).json({ error: 'Passcode required' });
+    const result = await pool.query('SELECT * FROM hpt_users WHERE id > 0 LIMIT 100');
+    let matchedUser = null;
+    for (const user of result.rows) {
+      const valid = await bcrypt.compare(passcode, user.passcode_hash);
+      if (valid) { matchedUser = user; break; }
+    }
+    if (!matchedUser) return res.status(401).json({ error: 'Invalid passcode' });
+    const token = jwt.sign({ id: matchedUser.id, name: matchedUser.name, hptUser: true }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, id: matchedUser.id, name: matchedUser.name });
+  } catch (err) {
+    console.error('[HPT LOGIN]', err.message);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// ============================================================================
+// HPT STUDIOS — CRUD
+// ============================================================================
+
+// GET /api/hpt/studios — list all studios accessible to this HPT user (with live member data)
+app.get('/api/hpt/studios', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    // Studios created by or shared with this HPT user
+    const studiosRes = await pool.query(
+      `SELECT DISTINCT s.*,
+         (SELECT name FROM hpt_users WHERE id = s.created_by) AS creator_name
+       FROM hpt_studios s
+       LEFT JOIN hpt_studio_shares sh ON sh.studio_id = s.id AND sh.hpt_user_id = $1
+       WHERE s.created_by = $1 OR sh.hpt_user_id = $1
+       ORDER BY s.created_at ASC`,
+      [hptUserId]
+    );
+
+    const studios = await Promise.all(studiosRes.rows.map(async (studio) => {
+      let members = [];
+      if (studio.setup_type === 'course' && studio.course_id) {
+        // Derive live from courses table
+        const mRes = await pool.query(
+          `SELECT DISTINCT u.id, u.name, u.grade,
+             c.current_period_score, c.current_period_grade,
+             c.final_score, c.final_grade, c.course_code, c.name AS course_name,
+             c.zoom_number
+           FROM courses c
+           JOIN users u ON u.id = c.user_id
+           WHERE c.course_id = $1 AND u.is_banned = false
+           ORDER BY u.name`,
+          [studio.course_id]
+        );
+        members = mRes.rows;
+      } else {
+        // Key-type: explicit members
+        const mRes = await pool.query(
+          `SELECT u.id, u.name, u.grade,
+             c.current_period_score, c.current_period_grade,
+             c.final_score, c.final_grade, c.course_code, c.name AS course_name
+           FROM hpt_studio_members sm
+           JOIN users u ON u.id = sm.user_id
+           LEFT JOIN courses c ON c.user_id = u.id AND c.course_id = $2
+           WHERE sm.studio_id = $1 AND u.is_banned = false
+           ORDER BY u.name`,
+          [studio.id, studio.course_id]
+        );
+        members = mRes.rows;
+      }
+
+      // Active banners for this studio
+      const bannersRes = await pool.query(
+        `SELECT id, message, author_name, created_at FROM hpt_studio_banners
+         WHERE studio_id = $1 AND is_active = true ORDER BY created_at DESC`,
+        [studio.id]
+      );
+
+      // Shared HPT users
+      const sharesRes = await pool.query(
+        `SELECT hu.id, hu.name FROM hpt_studio_shares ss
+         JOIN hpt_users hu ON hu.id = ss.hpt_user_id
+         WHERE ss.studio_id = $1`,
+        [studio.id]
+      );
+
+      return {
+        ...studio,
+        members,
+        banners: bannersRes.rows,
+        sharedWith: sharesRes.rows,
+      };
+    }));
+
+    res.json(studios);
+  } catch (err) {
+    console.error('[HPT STUDIOS GET]', err.message);
+    res.status(500).json({ error: 'Failed to load studios' });
+  }
+});
+
+// POST /api/hpt/studios/preview-course — preview members for a course_id before creating
+app.post('/api/hpt/studios/preview-course', authenticateHPT, async (req, res) => {
+  try {
+    const { courseId } = req.body;
+    if (!courseId) return res.status(400).json({ error: 'courseId required' });
+
+    const mRes = await pool.query(
+      `SELECT DISTINCT u.id, u.name, u.grade,
+         c.current_period_score, c.current_period_grade,
+         c.final_score, c.final_grade, c.course_code, c.name AS course_name,
+         c.zoom_number
+       FROM courses c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.course_id = $1 AND u.is_banned = false
+       ORDER BY u.name`,
+      [courseId]
+    );
+
+    if (mRes.rows.length === 0) return res.status(404).json({ error: 'No students found for that course ID' });
+
+    // Determine consensus zoom number
+    const zoomNums = mRes.rows.map(r => r.zoom_number).filter(Boolean);
+    const zoomFreq = {};
+    zoomNums.forEach(z => { zoomFreq[z] = (zoomFreq[z] || 0) + 1; });
+    const topZoom = Object.entries(zoomFreq).sort((a,b) => b[1]-a[1])[0];
+    const consensusZoom = topZoom && topZoom[1] > 1 ? topZoom[0] : (zoomNums[0] || '');
+
+    const courseName = mRes.rows[0].course_name || '';
+    const courseCode = mRes.rows[0].course_code || '';
+
+    res.json({
+      courseId,
+      courseName,
+      courseCode,
+      consensusZoom,
+      members: mRes.rows,
+    });
+  } catch (err) {
+    console.error('[HPT PREVIEW COURSE]', err.message);
+    res.status(500).json({ error: 'Preview failed' });
+  }
+});
+
+// POST /api/hpt/studios/generate-key — generate a unique studio key
+app.post('/api/hpt/studios/generate-key', authenticateHPT, async (req, res) => {
+  try {
+    let key, exists = true;
+    while (exists) {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      key = Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+      const r = await pool.query('SELECT 1 FROM hpt_studios WHERE studio_key = $1', [key]);
+      exists = r.rows.length > 0;
+    }
+    res.json({ key });
+  } catch (err) {
+    res.status(500).json({ error: 'Key generation failed' });
+  }
+});
+
+// POST /api/hpt/studios — create a new studio
+app.post('/api/hpt/studios', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const { setupType, courseId, studioKey, name, color, zoomNumber } = req.body;
+    if (!name || !studioKey || !setupType) return res.status(400).json({ error: 'Missing required fields' });
+
+    const result = await pool.query(
+      `INSERT INTO hpt_studios (studio_key, setup_type, course_id, name, color, zoom_number, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [studioKey, setupType, courseId || null, name, color || '#7C3AED', zoomNumber || null, hptUserId]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[HPT CREATE STUDIO]', err.message);
+    res.status(500).json({ error: 'Failed to create studio' });
+  }
+});
+
+// PATCH /api/hpt/studios/:id — update studio info
+app.patch('/api/hpt/studios/:id', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    const { name, color, zoomNumber } = req.body;
+    const result = await pool.query(
+      `UPDATE hpt_studios SET name=$1, color=$2, zoom_number=$3, updated_at=NOW()
+       WHERE id=$4 RETURNING *`,
+      [name, color, zoomNumber || null, studioId]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update studio' });
+  }
+});
+
+// DELETE /api/hpt/studios/:id — delete studio
+app.delete('/api/hpt/studios/:id', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    await pool.query('DELETE FROM hpt_studios WHERE id=$1', [studioId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete studio' });
+  }
+});
+
+// POST /api/hpt/studios/:id/share — share studio with another HPT user
+app.post('/api/hpt/studios/:id/share', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    const { shareWithId } = req.body;
+    if (!shareWithId) return res.status(400).json({ error: 'shareWithId required' });
+    await pool.query(
+      `INSERT INTO hpt_studio_shares (studio_id, hpt_user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [studioId, shareWithId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to share studio' });
+  }
+});
+
+// DELETE /api/hpt/studios/:id/share/:hptUserId — revoke share
+app.delete('/api/hpt/studios/:id/share/:hptUserId', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    await pool.query('DELETE FROM hpt_studio_shares WHERE studio_id=$1 AND hpt_user_id=$2', [studioId, req.params.hptUserId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to revoke share' });
+  }
+});
+
+// POST /api/hpt/studios/:id/banner — post a banner to a studio
+app.post('/api/hpt/studios/:id/banner', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId, name: hptName } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    const { message } = req.body;
+    if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+    // Deactivate old banners for this studio first
+    await pool.query('UPDATE hpt_studio_banners SET is_active=false WHERE studio_id=$1', [studioId]);
+    const result = await pool.query(
+      `INSERT INTO hpt_studio_banners (studio_id, message, author_name) VALUES ($1,$2,$3) RETURNING *`,
+      [studioId, message.trim(), hptName]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to post banner' });
+  }
+});
+
+// DELETE /api/hpt/studios/:id/banner — deactivate studio banner
+app.delete('/api/hpt/studios/:id/banner', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+    await pool.query('UPDATE hpt_studio_banners SET is_active=false WHERE studio_id=$1', [studioId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to remove banner' });
+  }
+});
+
+// GET /api/hpt/users — list all HPT users (for share picker)
+app.get('/api/hpt/users', authenticateHPT, async (req, res) => {
+  try {
+    const { id } = req.hptUser;
+    const result = await pool.query('SELECT id, name FROM hpt_users WHERE id != $1 ORDER BY name', [id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load HPT users' });
+  }
+});
+
+// ============================================================================
+// STUDENT: join a studio by key
+// ============================================================================
+
+// POST /api/studios/join — student joins a key-type studio
+app.post('/api/studios/join', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { studioKey } = req.body;
+    if (!studioKey) return res.status(400).json({ error: 'Studio key required' });
+
+    const studioRes = await pool.query(
+      'SELECT * FROM hpt_studios WHERE studio_key = $1 AND setup_type = $2',
+      [studioKey.toUpperCase().trim(), 'key']
+    );
+    if (studioRes.rows.length === 0) return res.status(404).json({ error: 'Studio not found or this key is for a course-type studio' });
+    const studio = studioRes.rows[0];
+
+    await pool.query(
+      'INSERT INTO hpt_studio_members (studio_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [studio.id, userId]
+    );
+    res.json({ success: true, studioName: studio.name });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to join studio' });
+  }
+});
+
+// GET /api/studios/mine — student: list studios they are in
+app.get('/api/studios/mine', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    // Key-type studios via explicit membership
+    const keyStudios = await pool.query(
+      `SELECT s.id, s.name, s.color, s.setup_type, s.studio_key,
+         (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name
+       FROM hpt_studio_members sm
+       JOIN hpt_studios s ON s.id = sm.studio_id
+       WHERE sm.user_id = $1`,
+      [userId]
+    );
+    // Course-type studios where user has a matching course enrollment
+    const courseStudios = await pool.query(
+      `SELECT DISTINCT s.id, s.name, s.color, s.setup_type, s.studio_key,
+         (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name
+       FROM hpt_studios s
+       JOIN courses c ON c.course_id = s.course_id
+       WHERE c.user_id = $1 AND s.setup_type = 'course'`,
+      [userId]
+    );
+
+    const all = [...keyStudios.rows, ...courseStudios.rows];
+    const seen = new Set();
+    const unique = all.filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true; });
+
+    // Attach active banners and dismissal state
+    const withBanners = await Promise.all(unique.map(async (studio) => {
+      const bannersRes = await pool.query(
+        `SELECT b.id, b.message, b.author_name, b.created_at,
+           EXISTS(SELECT 1 FROM hpt_studio_banner_dismissals d WHERE d.banner_id=b.id AND d.user_id=$2) AS dismissed
+         FROM hpt_studio_banners b
+         WHERE b.studio_id=$1 AND b.is_active=true
+         ORDER BY b.created_at DESC LIMIT 1`,
+        [studio.id, userId]
+      );
+      return { ...studio, activeBanner: bannersRes.rows[0] || null };
+    }));
+
+    res.json(withBanners);
+  } catch (err) {
+    console.error('[STUDIOS MINE]', err.message);
+    res.status(500).json({ error: 'Failed to load studios' });
+  }
+});
+
+// POST /api/studios/banners/:bannerId/dismiss — student dismisses a banner
+app.post('/api/studios/banners/:bannerId/dismiss', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      'INSERT INTO hpt_studio_banner_dismissals (user_id, banner_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [req.user.id, req.params.bannerId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to dismiss banner' });
+  }
+});
+
+// ============================================================================
+// ADMIN: HPT User Management
+// ============================================================================
+
+// GET /api/admin/hpt-users
+app.get('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT h.id, h.name, h.created_at,
+         COUNT(DISTINCT s.id) AS studio_count
+       FROM hpt_users h
+       LEFT JOIN hpt_studios s ON s.created_by = h.id
+       GROUP BY h.id ORDER BY h.name`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load HPT users' });
+  }
+});
+
+// POST /api/admin/hpt-users — create HPT user
+app.post('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, passcode } = req.body;
+    if (!name || !passcode) return res.status(400).json({ error: 'Name and passcode required' });
+    const hash = await bcrypt.hash(passcode, 10);
+    const result = await pool.query(
+      'INSERT INTO hpt_users (name, passcode_hash) VALUES ($1,$2) RETURNING id, name, created_at',
+      [name, hash]
+    );
+    await auditLog(req.user.id, req.user.name || 'Admin', 'hpt_user_created', null, name, { name });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create HPT user' });
+  }
+});
+
+// DELETE /api/admin/hpt-users/:id
+app.delete('/api/admin/hpt-users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT name FROM hpt_users WHERE id=$1', [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'HPT user not found' });
+    await pool.query('DELETE FROM hpt_users WHERE id=$1', [req.params.id]);
+    await auditLog(req.user.id, req.user.name || 'Admin', 'hpt_user_deleted', null, r.rows[0].name, {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete HPT user' });
+  }
+});
+
+// ============================================================================
+// STUDENT STUDIO BANNERS: fetch for Hub display
+// ============================================================================
+
+// GET /api/studios/hub-banners — active, undismissed banners for the current user
+app.get('/api/studios/hub-banners', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(
+      `SELECT b.id, b.message, b.author_name, s.name AS studio_name, s.color AS studio_color, b.created_at
+       FROM hpt_studio_banners b
+       JOIN hpt_studios s ON s.id = b.studio_id
+       WHERE b.is_active = true
+         AND NOT EXISTS (
+           SELECT 1 FROM hpt_studio_banner_dismissals d WHERE d.banner_id=b.id AND d.user_id=$1
+         )
+         AND (
+           (s.setup_type='course' AND EXISTS(SELECT 1 FROM courses c WHERE c.course_id=s.course_id AND c.user_id=$1))
+           OR
+           (s.setup_type='key' AND EXISTS(SELECT 1 FROM hpt_studio_members m WHERE m.studio_id=s.id AND m.user_id=$1))
+         )
+       ORDER BY b.created_at DESC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load studio banners' });
   }
 });
 
