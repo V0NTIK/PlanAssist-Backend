@@ -5992,6 +5992,222 @@ app.get('/api/studios/hub-banners', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// HPT MONITOR — live student activity for a studio
+// ============================================================================
+
+// GET /api/hpt/studios/:id/monitor
+// Returns every student in the studio with their current session state,
+// today's session priorities, today's completions, and upcoming urgent tasks.
+app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+
+    const studioRes = await pool.query('SELECT * FROM hpt_studios WHERE id=$1', [studioId]);
+    if (!studioRes.rows[0]) return res.status(404).json({ error: 'Studio not found' });
+    const studio = studioRes.rows[0];
+
+    // Get member user IDs
+    let userIds = [];
+    if (studio.setup_type === 'course' && studio.course_id) {
+      const r = await pool.query(
+        `SELECT DISTINCT c.user_id FROM courses c
+         JOIN users u ON u.id=c.user_id WHERE c.course_id=$1 AND u.is_banned=false`,
+        [studio.course_id]
+      );
+      userIds = r.rows.map(r => r.user_id);
+    } else {
+      const r = await pool.query(
+        `SELECT sm.user_id FROM hpt_studio_members sm
+         JOIN users u ON u.id=sm.user_id WHERE sm.studio_id=$1 AND u.is_banned=false`,
+        [studioId]
+      );
+      userIds = r.rows.map(r => r.user_id);
+    }
+    if (userIds.length === 0) return res.json([]);
+
+    const now = new Date();
+    // Heartbeat threshold — if last heartbeat > 3 min ago, session is considered stale
+    const heartbeatCutoff = new Date(now.getTime() - 3 * 60 * 1000).toISOString();
+    const todayDate = now.toISOString().slice(0, 10);
+
+    const students = await Promise.all(userIds.map(async (userId) => {
+      // Basic user info
+      const uRes = await pool.query(
+        `SELECT id, name, grade, last_sync, streak_shields_available FROM users WHERE id=$1`,
+        [userId]
+      );
+      const user = uRes.rows[0];
+      if (!user) return null;
+
+      // Active task (session_active=true AND heartbeat fresh)
+      const activeRes = await pool.query(
+        `SELECT id, title, class, estimated_time, user_estimated_time, accumulated_time,
+                deadline_date, session_heartbeat
+         FROM tasks
+         WHERE user_id=$1 AND session_active=true AND session_heartbeat > $2
+         ORDER BY session_heartbeat DESC LIMIT 1`,
+        [userId, heartbeatCutoff]
+      );
+      const activeTask = activeRes.rows[0] || null;
+
+      // Today's session priorities (ordered task list)
+      const priRes = await pool.query(
+        `SELECT sp.task_ids FROM session_priorities sp WHERE sp.user_id=$1 AND sp.date=$2`,
+        [userId, todayDate]
+      );
+      let priorities = [];
+      if (priRes.rows[0]) {
+        const taskIds = priRes.rows[0].task_ids;
+        if (taskIds && taskIds.length > 0) {
+          const tRes = await pool.query(
+            `SELECT id, title, class, estimated_time, user_estimated_time,
+                    accumulated_time, deadline_date, completed
+             FROM tasks WHERE id=ANY($1) AND user_id=$2`,
+            [taskIds, userId]
+          );
+          const tMap = {};
+          tRes.rows.forEach(t => { tMap[t.id] = t; });
+          priorities = taskIds.map(id => tMap[id]).filter(Boolean);
+        }
+      }
+
+      // Today's completions count + total time
+      const compRes = await pool.query(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(actual_time),0) AS total_mins
+         FROM tasks_completed WHERE user_id=$1 AND completed_at::date=$2`,
+        [userId, todayDate]
+      );
+      const todayCompletions = {
+        count: parseInt(compRes.rows[0].cnt),
+        totalMins: parseInt(compRes.rows[0].total_mins),
+      };
+
+      // Upcoming urgent tasks (due today or overdue, not completed)
+      const urgentRes = await pool.query(
+        `SELECT id, title, class, deadline_date, estimated_time, user_estimated_time
+         FROM tasks
+         WHERE user_id=$1 AND completed=false AND deleted=false
+           AND deadline_date <= $2
+           AND LOWER(class) NOT LIKE '%homeroom%'
+         ORDER BY deadline_date ASC LIMIT 5`,
+        [userId, todayDate]
+      );
+
+      return {
+        user: { id: user.id, name: user.name, grade: user.grade, lastSync: user.last_sync },
+        isActive: !!activeTask,
+        activeTask,
+        priorities,
+        todayCompletions,
+        urgentTasks: urgentRes.rows,
+      };
+    }));
+
+    res.json(students.filter(Boolean));
+  } catch (err) {
+    console.error('[HPT MONITOR]', err.message);
+    res.status(500).json({ error: 'Failed to load monitor data' });
+  }
+});
+
+// ============================================================================
+// HPT MARKS — grade data for all students in a studio
+// ============================================================================
+
+// GET /api/hpt/studios/:id/marks
+// Returns every student with their full course list and grade summaries.
+app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+    const studioId = parseInt(req.params.id);
+    if (!await hptHasStudioAccess(hptUserId, studioId)) return res.status(403).json({ error: 'No access' });
+
+    const studioRes = await pool.query('SELECT * FROM hpt_studios WHERE id=$1', [studioId]);
+    if (!studioRes.rows[0]) return res.status(404).json({ error: 'Studio not found' });
+    const studio = studioRes.rows[0];
+
+    let userIds = [];
+    if (studio.setup_type === 'course' && studio.course_id) {
+      const r = await pool.query(
+        `SELECT DISTINCT c.user_id FROM courses c
+         JOIN users u ON u.id=c.user_id WHERE c.course_id=$1 AND u.is_banned=false`,
+        [studio.course_id]
+      );
+      userIds = r.rows.map(r => r.user_id);
+    } else {
+      const r = await pool.query(
+        `SELECT sm.user_id FROM hpt_studio_members sm
+         JOIN users u ON u.id=sm.user_id WHERE sm.studio_id=$1 AND u.is_banned=false`,
+        [studioId]
+      );
+      userIds = r.rows.map(r => r.user_id);
+    }
+    if (userIds.length === 0) return res.json([]);
+
+    const students = await Promise.all(userIds.map(async (userId) => {
+      const uRes = await pool.query(
+        `SELECT id, name, grade, last_sync FROM users WHERE id=$1`, [userId]
+      );
+      const user = uRes.rows[0];
+      if (!user) return null;
+
+      // All courses for this user (exclude homeroom)
+      const cRes = await pool.query(
+        `SELECT id, name, course_code, course_id,
+                current_score, current_grade,
+                current_period_score, current_period_grade,
+                final_score, final_grade,
+                zoom_number
+         FROM courses
+         WHERE user_id=$1
+           AND LOWER(COALESCE(name,'')) NOT LIKE '%homeroom%'
+           AND LOWER(COALESCE(course_code,'')) NOT LIKE '%homeroom%'
+         ORDER BY name`,
+        [userId]
+      );
+
+      // Recent graded submissions (last 10) from grade_history
+      const ghRes = await pool.query(
+        `SELECT gh.assignment_title, gh.course_name, gh.score, gh.points_possible,
+                gh.grade, gh.graded_at
+         FROM grade_history gh
+         WHERE gh.user_id=$1
+           AND gh.graded_at IS NOT NULL
+         ORDER BY gh.graded_at DESC LIMIT 10`,
+        [userId]
+      );
+
+      // Missing / late task count
+      const missingRes = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM tasks
+         WHERE user_id=$1 AND is_missing=true AND completed=false AND deleted=false`,
+        [userId]
+      );
+      const lateRes = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM tasks
+         WHERE user_id=$1 AND is_late=true AND completed=false AND deleted=false`,
+        [userId]
+      );
+
+      return {
+        user: { id: user.id, name: user.name, grade: user.grade, lastSync: user.last_sync },
+        courses: cRes.rows,
+        recentGrades: ghRes.rows,
+        missingCount: parseInt(missingRes.rows[0].cnt),
+        lateCount: parseInt(lateRes.rows[0].cnt),
+      };
+    }));
+
+    res.json(students.filter(Boolean));
+  } catch (err) {
+    console.error('[HPT MARKS]', err.message);
+    res.status(500).json({ error: 'Failed to load marks data' });
+  }
+});
+
 app.listen(PORT, () => {
   // Ensure user_goals table exists (migration-safe, runs once on startup)
   pool.query(`
