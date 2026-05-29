@@ -6518,18 +6518,19 @@ async function runActivityRefreshForUser(userId, canvasToken) {
            WHERE iu.user_id=$1
              AND NOT EXISTS (
                SELECT 1 FROM notifications n
-               WHERE n.user_id=$1 AND n.type='insignia' AND n.title ILIKE '%' || iu.label || '%'
+               WHERE n.user_id=$1 AND n.type='insignia' AND n.title = '🎖️ ' || iu.label || ' Insignia Unlocked'
              )`,
           [userId]
         );
         for (const row of insigniaRes.rows) {
+          // Achievements are never pre-read — a user always wants to see a new tier as "New"
           await pool.query(
             `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-             VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',$3,$4)`,
-            [userId, `🎖️ ${row.label} Insignia Unlocked`, isFirstRun, row.unlocked_at || new Date()]
+             VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',false,$3)`,
+            [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
           );
         }
-      } catch (e) { /* silently ignore */ }
+      } catch (e) { console.warn(`[ACTIVITY REFRESH] Insignia check failed for user ${userId}: ${e.message}`); }
     }
 
     // --- Badges — only if notif_achievements is enabled ---
@@ -6540,19 +6541,20 @@ async function runActivityRefreshForUser(userId, canvasToken) {
            WHERE ub.user_id=$1
              AND NOT EXISTS (
                SELECT 1 FROM notifications n
-               WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '%' || ub.badge_key || '%'
+               WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '🏆 ' || REPLACE(ub.badge_key, '_', ' ') || '%'
              )`,
           [userId]
         );
         for (const row of badgeRes.rows) {
           const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+          // Achievements are never pre-read
           await pool.query(
             `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-             VALUES ($1,'badge',$2,'You earned a new Gallery badge!',$3,$4)`,
-            [userId, `🏆 ${friendlyKey} Badge Earned`, isFirstRun, row.awarded_at || new Date()]
+             VALUES ($1,'badge',$2,'You earned a new Gallery badge!',false,$3)`,
+            [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
           );
         }
-      } catch (e) { /* silently ignore */ }
+      } catch (e) { console.warn(`[ACTIVITY REFRESH] Badge check failed for user ${userId}: ${e.message}`); }
     }
 
   } catch (err) {
@@ -6560,23 +6562,84 @@ async function runActivityRefreshForUser(userId, canvasToken) {
   }
 }
 
+// Achievement-only refresh for users without Canvas tokens
+// Checks insignia_unlocks and user_badges and inserts missing notification rows
+async function runAchievementNotificationsForUser(userId) {
+  try {
+    const prefsRes = await pool.query(
+      `SELECT notif_achievements FROM users WHERE id=$1`, [userId]
+    );
+    if (!prefsRes.rows[0]?.notif_achievements) return;
+
+    // Insignia
+    const insigniaRes = await pool.query(
+      `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
+       WHERE iu.user_id=$1
+         AND NOT EXISTS (
+           SELECT 1 FROM notifications n
+           WHERE n.user_id=$1 AND n.type='insignia' AND n.title = '🎖️ ' || iu.label || ' Insignia Unlocked'
+         )`,
+      [userId]
+    );
+    for (const row of insigniaRes.rows) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, body, read, created_at)
+         VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',false,$3)`,
+        [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
+      );
+    }
+
+    // Badges
+    const badgeRes = await pool.query(
+      `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
+       WHERE ub.user_id=$1
+         AND NOT EXISTS (
+           SELECT 1 FROM notifications n
+           WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '🏆 ' || REPLACE(ub.badge_key, '_', ' ') || '%'
+         )`,
+      [userId]
+    );
+    for (const row of badgeRes.rows) {
+      const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\w/g, c => c.toUpperCase());
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, body, read, created_at)
+         VALUES ($1,'badge',$2,'You earned a new Gallery badge!',false,$3)`,
+        [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
+      );
+    }
+  } catch (err) {
+    console.warn(`[ACHIEVEMENT NOTIF] User ${userId} failed: ${err.message}`);
+  }
+}
+
 // Background job: stagger users at 2-second intervals to avoid hammering Canvas
 async function runGlobalActivityRefresh() {
   try {
-    const usersRes = await pool.query(
+    // Canvas-dependent refresh (grades, announcements, discussions, messages)
+    const canvasUsersRes = await pool.query(
       `SELECT u.id, u.canvas_api_token, u.canvas_api_token_iv
        FROM users u
        WHERE u.is_banned = false
          AND u.canvas_api_token IS NOT NULL
          AND u.canvas_api_token != ''`
     );
-    console.log(`[ACTIVITY REFRESH] Starting for ${usersRes.rows.length} users`);
+    console.log(`[ACTIVITY REFRESH] Starting for ${canvasUsersRes.rows.length} Canvas users`);
     let delay = 0;
-    for (const row of usersRes.rows) {
+    for (const row of canvasUsersRes.rows) {
       const token = getDecryptedCanvasToken(row.id, row);
       if (!token) continue;
       setTimeout(() => runActivityRefreshForUser(row.id, token), delay);
       delay += 2000; // 2-second stagger between users
+    }
+
+    // Achievement notifications run for ALL non-banned users (no Canvas token needed)
+    const allUsersRes = await pool.query(
+      `SELECT id FROM users WHERE is_banned = false`
+    );
+    let achDelay = 500; // start slightly offset from Canvas refresh
+    for (const row of allUsersRes.rows) {
+      setTimeout(() => runAchievementNotificationsForUser(row.id), achDelay);
+      achDelay += 200; // lighter stagger — no external API calls
     }
   } catch (err) {
     console.error('[ACTIVITY REFRESH] Global run failed:', err.message);
@@ -6594,9 +6657,13 @@ app.post('/api/activity/refresh', authenticateToken, async (req, res) => {
       'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id=$1', [req.user.id]
     );
     const token = getDecryptedCanvasToken(req.user.id, userRes.rows[0]);
-    if (!token) return res.json({ skipped: true, reason: 'no canvas token' });
-    // Run async — don't wait for it to complete before responding
-    runActivityRefreshForUser(req.user.id, token).catch(e => console.warn('[ACTIVITY REFRESH]', e.message));
+    if (token) {
+      // Full Canvas refresh (grades, announcements, discussions, messages, achievements)
+      runActivityRefreshForUser(req.user.id, token).catch(e => console.warn('[ACTIVITY REFRESH]', e.message));
+    } else {
+      // No Canvas token — still check for new achievement notifications
+      runAchievementNotificationsForUser(req.user.id).catch(e => console.warn('[ACHIEVEMENT NOTIF]', e.message));
+    }
     res.json({ started: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to start refresh' });
