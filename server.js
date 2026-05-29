@@ -6208,6 +6208,213 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
 });
 
 // ============================================================================
+// HPT HUB — aggregate stats across ALL studios the HPT user has access to
+// ============================================================================
+
+// GET /api/hpt/hub
+// Returns all data needed by the HPT Hub page in a single request:
+//   stats        — today/week completions, total study time, accuracy, streak (no shields)
+//   feed         — recent completion_feed entries (from all connected users)
+//   leaderboard  — weekly_leaderboard sorted by tasks_completed DESC (all connected users)
+//   goalSnapshot — one random user's goal + course data for Goal Snapshot widget
+//   inProgress   — count of tasks with accumulated_time > 0 across all connected users
+app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
+  try {
+    const { id: hptUserId } = req.hptUser;
+
+    // ── Step 1: Resolve all unique student user IDs across ALL accessible studios ──
+    const studiosRes = await pool.query(
+      `SELECT DISTINCT s.id, s.setup_type, s.course_id
+       FROM hpt_studios s
+       LEFT JOIN hpt_studio_shares sh ON sh.studio_id = s.id AND sh.hpt_user_id = $1
+       WHERE s.created_by = $1 OR sh.hpt_user_id = $1`,
+      [hptUserId]
+    );
+
+    const allUserIds = new Set();
+    for (const studio of studiosRes.rows) {
+      if (studio.setup_type === 'course' && studio.course_id) {
+        const r = await pool.query(
+          `SELECT DISTINCT c.user_id FROM courses c
+           JOIN users u ON u.id = c.user_id
+           WHERE c.course_id = $1 AND u.is_banned = false`,
+          [studio.course_id]
+        );
+        r.rows.forEach(row => allUserIds.add(row.user_id));
+      } else {
+        const r = await pool.query(
+          `SELECT sm.user_id FROM hpt_studio_members sm
+           JOIN users u ON u.id = sm.user_id
+           WHERE sm.studio_id = $1 AND u.is_banned = false`,
+          [studio.id]
+        );
+        r.rows.forEach(row => allUserIds.add(row.user_id));
+      }
+    }
+
+    const userIds = [...allUserIds];
+    if (userIds.length === 0) {
+      return res.json({
+        stats: { tasksToday: 0, tasksWeek: 0, totalStudyMins: 0, accuracy: 0, streak: 0 },
+        feed: [], leaderboard: [], goalSnapshot: null, inProgress: 0, studentCount: 0,
+      });
+    }
+
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const weekStart = new Date(now);
+    const dow = weekStart.getDay();
+    weekStart.setDate(weekStart.getDate() - (dow === 0 ? 6 : dow - 1));
+    weekStart.setHours(0, 0, 0, 0);
+
+    // ── Step 2: Stats ─────────────────────────────────────────────────────────
+
+    // Today completions
+    const todayR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id = ANY($1) AND completed_at::date = $2`,
+      [userIds, todayStr]
+    );
+    const tasksToday = parseInt(todayR.rows[0].cnt);
+
+    // This week completions
+    const weekR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id = ANY($1) AND completed_at >= $2`,
+      [userIds, weekStart.toISOString()]
+    );
+    const tasksWeek = parseInt(weekR.rows[0].cnt);
+
+    // Total study time (all time, minutes)
+    const timeR = await pool.query(
+      `SELECT COALESCE(SUM(actual_time), 0) AS total_mins FROM tasks_completed
+       WHERE user_id = ANY($1) AND actual_time IS NOT NULL`,
+      [userIds]
+    );
+    const totalStudyMins = parseInt(timeR.rows[0].total_mins);
+
+    // Accuracy: avg(min(est/actual, actual/est)) across tasks with both values
+    const accR = await pool.query(
+      `SELECT estimated_time, actual_time FROM tasks_completed
+       WHERE user_id = ANY($1)
+         AND estimated_time > 0 AND actual_time > 0`,
+      [userIds]
+    );
+    let accuracy = 0;
+    if (accR.rows.length > 0) {
+      const sum = accR.rows.reduce((s, r) => {
+        const ratio = Math.min(r.estimated_time / r.actual_time, r.actual_time / r.estimated_time);
+        return s + ratio * 100;
+      }, 0);
+      accuracy = Math.round(sum / accR.rows.length);
+    }
+
+    // Streak: count consecutive weekdays (Mon–Fri) backwards from today/yesterday
+    // where at least one completion exists for ANY connected student. No shields.
+    const compDatesR = await pool.query(
+      `SELECT DISTINCT completed_at::date AS day
+       FROM tasks_completed
+       WHERE user_id = ANY($1)
+       ORDER BY day ASC`,
+      [userIds]
+    );
+    const compDateSet = new Set(compDatesR.rows.map(r => r.day.toISOString().slice(0, 10)));
+
+    const isWeekend = (d) => { const day = new Date(d + 'T12:00:00').getDay(); return day === 0 || day === 6; };
+    const prevWD = (dateStr) => {
+      const d = new Date(dateStr + 'T12:00:00');
+      do { d.setDate(d.getDate() - 1); } while (isWeekend(d.toISOString().slice(0, 10)));
+      return d.toISOString().slice(0, 10);
+    };
+
+    let streak = 0;
+    // Anchor: if today (weekday) has a completion use it; else use prev weekday
+    let anchor = isWeekend(todayStr) ? prevWD(todayStr) : (compDateSet.has(todayStr) ? todayStr : prevWD(todayStr));
+    if (compDateSet.has(anchor)) {
+      let cur = anchor;
+      while (compDateSet.has(cur)) {
+        streak++;
+        cur = prevWD(cur);
+      }
+    }
+
+    // ── Step 3: In Progress ───────────────────────────────────────────────────
+    const inProgressR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks
+       WHERE user_id = ANY($1)
+         AND completed = false AND deleted = false
+         AND (inactive = false OR inactive IS NULL)
+         AND accumulated_time > 0`,
+      [userIds]
+    );
+    const inProgress = parseInt(inProgressR.rows[0].cnt);
+
+    // ── Step 4: Live Activity Feed ────────────────────────────────────────────
+    const feedR = await pool.query(
+      `SELECT cf.id, cf.user_id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class,
+              cf.completed_at, cf.insignia
+       FROM completion_feed cf
+       JOIN users u ON cf.user_id = u.id
+       WHERE cf.user_id = ANY($1)
+         AND u.show_in_feed = true
+         AND cf.completed_at > NOW() - INTERVAL '7 days'
+       ORDER BY cf.completed_at DESC
+       LIMIT 50`,
+      [userIds]
+    );
+
+    // ── Step 5: Leaderboard (all connected users, this week, ALL grades combined) ──
+    const lbR = await pool.query(
+      `SELECT wl.user_id, wl.user_name, wl.grade, wl.tasks_completed,
+              u.insignia_selected AS insignia
+       FROM weekly_leaderboard wl
+       JOIN users u ON u.id = wl.user_id
+       WHERE wl.user_id = ANY($1)
+         AND wl.week_start = DATE_TRUNC('week', CURRENT_DATE)::date
+       ORDER BY wl.tasks_completed DESC, wl.user_name ASC
+       LIMIT 20`,
+      [userIds]
+    );
+
+    // ── Step 6: Goal Snapshot — pick a random student with at least one goal ──
+    // Fetch goals + courses for all connected users, then pick one randomly
+    let goalSnapshot = null;
+    const goalsR = await pool.query(
+      `SELECT ug.user_id, ug.course_id, ug.target_score,
+              c.name AS course_name, c.current_period_score, c.grading_period_title,
+              c.color,
+              u.name AS user_name, u.grade AS user_grade
+       FROM user_goals ug
+       JOIN courses c ON c.user_id = ug.user_id AND c.course_id = ug.course_id
+       JOIN users u ON u.id = ug.user_id
+       WHERE ug.user_id = ANY($1)
+         AND c.current_period_score IS NOT NULL
+         AND c.enabled = true
+       ORDER BY RANDOM()
+       LIMIT 20`,
+      [userIds]
+    );
+    if (goalsR.rows.length > 0) {
+      // Pick a deterministic-random entry (rotates every 5 minutes)
+      const idx = Math.floor(Date.now() / 1000 / 60 / 5) % goalsR.rows.length;
+      goalSnapshot = goalsR.rows[idx];
+    }
+
+    res.json({
+      stats: { tasksToday, tasksWeek, totalStudyMins, accuracy, streak },
+      feed: feedR.rows,
+      leaderboard: lbR.rows,
+      goalSnapshot,
+      inProgress,
+      studentCount: userIds.length,
+    });
+  } catch (err) {
+    console.error('[HPT HUB]', err.message);
+    res.status(500).json({ error: 'Failed to load hub data' });
+  }
+});
+
+// ============================================================================
 // HPT MARKS — grade data for all students in a studio
 // ============================================================================
 
