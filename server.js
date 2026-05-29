@@ -1778,9 +1778,14 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
 
     // Step 5: Upsert each graded submission into grade_history.
     // Only process submissions that have a score OR a grade — unsubmitted work is skipped.
+    // Date restriction: only process submissions graded/submitted within the last 2 months.
+    const twoMonthsAgo = new Date();
+    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
     let upsertedCount = 0;
     for (const sub of allSubs) {
       if (sub.score == null && !sub.grade) continue;
+      // Skip submissions outside the 2-month window (by submitted_at)
+      if (sub.submitted_at && new Date(sub.submitted_at) < twoMonthsAgo) continue;
 
       const assignment = sub.assignment || {};
       const title       = assignment.name || `Assignment ${sub.assignment_id}`;
@@ -4667,22 +4672,24 @@ app.patch('/api/tasks/:id/segment-deadline', authenticateToken, async (req, res)
 
 app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
   try {
-    const { title, deadlineDate, deadlineTime, estimatedTime, description, url } = req.body;
+    const { title, deadlineDate, deadlineTime, estimatedTime, description, url, course } = req.body;
     if (!title || !deadlineDate || !deadlineTime || !estimatedTime) {
       return res.status(400).json({ error: 'title, deadlineDate, deadlineTime, and estimatedTime are required' });
     }
+    // course defaults to 'Personal' which keeps existing behaviour unchanged
+    const taskClass = course && course.trim() ? course.trim() : 'Personal';
     const result = await pool.query(
       `INSERT INTO tasks
          (user_id, title, segment, class, description, url, deadline_date, deadline_time,
           estimated_time, user_estimated_time, accumulated_time,
           completed, deleted, manually_created,
           course_id, assignment_id, points_possible, assignment_group_id, grading_type)
-       VALUES ($1, $2, NULL, 'Personal', $3, $4, $5, $6, $7, $7, 0,
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $8, 0,
                false, false, true,
                NULL, NULL, NULL, NULL, 'not_graded')
        RETURNING *`,
       [
-        req.user.id, title, description || null, url || 'https://planassist.onrender.com/',
+        req.user.id, title, taskClass, description || null, url || 'https://planassist.onrender.com/',
         deadlineDate, deadlineTime || null, estimatedTime
       ]
     );
@@ -5295,6 +5302,7 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
               score, points_possible, grade, grading_type, submitted_at, synced_at
        FROM grade_history
        WHERE user_id = $1
+         AND (submitted_at IS NULL OR submitted_at >= NOW() - INTERVAL '2 months')
        ORDER BY submitted_at DESC NULLS LAST, id DESC`,
       [req.user.id]
     );
@@ -5846,6 +5854,17 @@ app.post('/api/studios/join', authenticateToken, async (req, res) => {
       'INSERT INTO hpt_studio_members (studio_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
       [studio.id, userId]
     );
+    // Notify student they were added to a studio (respect notif_studios pref)
+    try {
+      const pref = await pool.query('SELECT notif_studios FROM users WHERE id=$1', [userId]);
+      if (pref.rows[0]?.notif_studios !== false) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body)
+           VALUES ($1,'studio',$2,$3) ON CONFLICT DO NOTHING`,
+          [userId, `📚 Joined Studio: ${studio.name}`, 'You have been added to a new Studio in PlanAssist.']
+        );
+      }
+    } catch (e) { /* non-fatal */ }
     res.json({ success: true, studioName: studio.name });
   } catch (err) {
     res.status(500).json({ error: 'Failed to join studio' });
@@ -5942,7 +5961,9 @@ app.post('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, re
       'INSERT INTO hpt_users (name, passcode_hash) VALUES ($1,$2) RETURNING id, name, created_at',
       [name, hash]
     );
-    await auditLog(req.user.id, req.user.name || 'Admin', 'hpt_user_created', null, name, { name });
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name || 'Admin';
+    await auditLog(req.user.id, adminName, 'hpt_user_created', null, name, { name });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create HPT user' });
@@ -5955,7 +5976,9 @@ app.delete('/api/admin/hpt-users/:id', authenticateToken, requireAdmin, async (r
     const r = await pool.query('SELECT name FROM hpt_users WHERE id=$1', [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'HPT user not found' });
     await pool.query('DELETE FROM hpt_users WHERE id=$1', [req.params.id]);
-    await auditLog(req.user.id, req.user.name || 'Admin', 'hpt_user_deleted', null, r.rows[0].name, {});
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name || 'Admin';
+    await auditLog(req.user.id, adminName, 'hpt_user_deleted', null, r.rows[0].name, {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete HPT user' });
@@ -6205,6 +6228,304 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
   } catch (err) {
     console.error('[HPT MARKS]', err.message);
     res.status(500).json({ error: 'Failed to load marks data' });
+  }
+});
+
+// ============================================================================
+// NOTIFICATIONS
+// ============================================================================
+
+// GET /api/notifications — fetch user's notifications (last 100, newest first)
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, type, title, body, link_url, read, created_at
+       FROM notifications WHERE user_id=$1
+       ORDER BY created_at DESC LIMIT 100`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Failed to load notifications' }); }
+});
+
+// POST /api/notifications/read-all — mark all as read
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('UPDATE notifications SET read=true WHERE user_id=$1 AND read=false', [req.user.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
+});
+
+// GET /api/notifications/unread-count
+app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND read=false', [req.user.id]);
+    res.json({ count: parseInt(r.rows[0].count) });
+  } catch (err) { res.status(500).json({ error: 'Failed to count' }); }
+});
+
+// GET /api/user/notification-prefs — get notification preferences
+app.get('/api/user/notification-prefs', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages, notif_achievements, notif_studios
+       FROM users WHERE id=$1`, [req.user.id]
+    );
+    res.json(r.rows[0] || {});
+  } catch (err) { res.status(500).json({ error: 'Failed to load prefs' }); }
+});
+
+// PUT /api/user/notification-prefs — update notification preferences
+app.put('/api/user/notification-prefs', authenticateToken, async (req, res) => {
+  try {
+    const { notif_grades, notif_announcements, notif_discussions, notif_messages, notif_achievements, notif_studios } = req.body;
+    await pool.query(
+      `UPDATE users SET
+         notif_grades=$1, notif_announcements=$2, notif_discussions=$3,
+         notif_messages=$4, notif_achievements=$5, notif_studios=$6
+       WHERE id=$7`,
+      [
+        notif_grades ?? true, notif_announcements ?? true, notif_discussions ?? true,
+        notif_messages ?? true, notif_achievements ?? true, notif_studios ?? true,
+        req.user.id
+      ]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to update prefs' }); }
+});
+
+// ============================================================================
+// BACKGROUND ACTIVITY REFRESH — runs every 15 minutes, staggered across users
+// Writes new items to the notifications table respecting user preferences.
+// ============================================================================
+
+async function runActivityRefreshForUser(userId, canvasToken) {
+  try {
+    const headers = { Authorization: `Bearer ${canvasToken}` };
+    const twoMonthsAgo = new Date();
+    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+
+    // Fetch user preferences
+    const prefsRes = await pool.query(
+      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages, name
+       FROM users WHERE id=$1`, [userId]
+    );
+    if (!prefsRes.rows[0]) return;
+    const prefs = prefsRes.rows[0];
+
+    const insertNotif = async (type, title, body, link_url) => {
+      // Dedup: skip if identical notification in last hour
+      const dedup = await pool.query(
+        `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND title=$3 AND created_at > NOW()-INTERVAL '1 hour'`,
+        [userId, type, title]
+      );
+      if (dedup.rows.length > 0) return;
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, body, link_url) VALUES ($1,$2,$3,$4,$5)`,
+        [userId, type, title, body || null, link_url || null]
+      );
+    };
+
+    // --- Grade Sync (if enabled) ---
+    if (prefs.notif_grades) {
+      try {
+        const coursesRes = await pool.query(
+          'SELECT DISTINCT course_id FROM courses WHERE user_id=$1 AND enabled=true AND course_id IS NOT NULL', [userId]
+        );
+        const courseIds = coursesRes.rows.map(r => r.course_id);
+        for (const cid of courseIds) {
+          const subsRes = await axios.get(
+            `${CANVAS_API_BASE}/courses/${cid}/students/submissions?student_ids[]=self&include[]=assignment&per_page=50`,
+            { headers, timeout: 12000 }
+          ).catch(() => ({ data: [] }));
+          for (const sub of subsRes.data) {
+            if (!sub.score && !sub.grade) continue;
+            if (sub.submitted_at && new Date(sub.submitted_at) < twoMonthsAgo) continue;
+            const assignment = sub.assignment || {};
+            const title = assignment.name || `Assignment ${sub.assignment_id}`;
+            const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, cid])).rows[0]?.name || '';
+            const pct = assignment.points_possible > 0 ? Math.round((sub.score / assignment.points_possible) * 100) : null;
+            const body = [courseName, pct != null ? `${pct}%` : sub.grade].filter(Boolean).join(' · ');
+            await insertNotif('grade', title, body, assignment.html_url || null);
+
+            // Also upsert into grade_history (date-restricted)
+            await pool.query(
+              `INSERT INTO grade_history
+                 (user_id, course_id, assignment_id, title, course_name, html_url, score, points_possible, grade, grading_type, submitted_at, synced_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+               ON CONFLICT (user_id, assignment_id) DO UPDATE SET
+                 title=EXCLUDED.title, course_name=EXCLUDED.course_name, score=EXCLUDED.score,
+                 points_possible=EXCLUDED.points_possible, grade=EXCLUDED.grade,
+                 submitted_at=EXCLUDED.submitted_at, synced_at=NOW()`,
+              [userId, cid, sub.assignment_id, title, courseName,
+               assignment.html_url || null,
+               sub.score != null ? parseFloat(sub.score) : null,
+               assignment.points_possible != null ? parseFloat(assignment.points_possible) : null,
+               sub.grade || null, assignment.grading_type || 'points', sub.submitted_at || null]
+            );
+          }
+        }
+      } catch (e) { console.warn(`[ACTIVITY REFRESH] Grade sync failed for user ${userId}: ${e.message}`); }
+    }
+
+    // --- Announcements (if enabled) ---
+    if (prefs.notif_announcements) {
+      try {
+        const annRes = await axios.get(
+          `${CANVAS_API_BASE}/announcements?per_page=10`,
+          { headers, timeout: 8000 }
+        ).catch(() => ({ data: [] }));
+        for (const ann of (annRes.data || [])) {
+          if (!ann.posted_at || new Date(ann.posted_at) < twoMonthsAgo) continue;
+          await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null);
+        }
+      } catch (e) { /* silently ignore */ }
+    }
+
+    // --- Discussions (if enabled) ---
+    if (prefs.notif_discussions) {
+      try {
+        const coursesRes = await pool.query(
+          'SELECT DISTINCT course_id FROM courses WHERE user_id=$1 AND enabled=true AND course_id IS NOT NULL LIMIT 10', [userId]
+        );
+        for (const { course_id } of coursesRes.rows) {
+          const discRes = await axios.get(
+            `${CANVAS_API_BASE}/courses/${course_id}/discussion_topics?per_page=5&order_by=recent_activity`,
+            { headers, timeout: 8000 }
+          ).catch(() => ({ data: [] }));
+          for (const disc of (discRes.data || [])) {
+            if (!disc.last_reply_at || new Date(disc.last_reply_at) < twoMonthsAgo) continue;
+            const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id])).rows[0]?.name || '';
+            await insertNotif('discussion', disc.title || 'Discussion', courseName || null, disc.html_url || null);
+          }
+        }
+      } catch (e) { /* silently ignore */ }
+    }
+
+    // --- Canvas Activity Stream for messages (if enabled) ---
+    if (prefs.notif_messages) {
+      try {
+        const actRes = await axios.get(
+          `${CANVAS_API_BASE}/users/self/activity_stream?per_page=10`,
+          { headers, timeout: 8000 }
+        ).catch(() => ({ data: [] }));
+        for (const item of (actRes.data || [])) {
+          if (item.type !== 'Message' && item.type !== 'Conversation') continue;
+          if (!item.updated_at || new Date(item.updated_at) < twoMonthsAgo) continue;
+          await insertNotif('message', item.title || 'New message', item.message || null, item.html_url || null);
+        }
+      } catch (e) { /* silently ignore */ }
+    }
+
+    // --- Insignia unlocks (check insignia_unlocks for records without a notification) ---
+    try {
+      const insigniaRes = await pool.query(
+        `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
+         WHERE iu.user_id=$1
+           AND NOT EXISTS (
+             SELECT 1 FROM notifications n WHERE n.user_id=$1 AND n.type='insignia' AND n.title ILIKE '%' || iu.label || '%'
+           )`,
+        [userId]
+      );
+      for (const row of insigniaRes.rows) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, created_at)
+           VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',$3)
+           ON CONFLICT DO NOTHING`,
+          [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
+        );
+      }
+    } catch (e) { /* silently ignore */ }
+
+    // --- Badges (check user_badges for records without a notification) ---
+    try {
+      const badgeRes = await pool.query(
+        `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
+         WHERE ub.user_id=$1
+           AND NOT EXISTS (
+             SELECT 1 FROM notifications n WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '%' || ub.badge_key || '%'
+           )`,
+        [userId]
+      );
+      for (const row of badgeRes.rows) {
+        const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, body, created_at)
+           VALUES ($1,'badge',$2,'You earned a new Gallery badge!',$3)
+           ON CONFLICT DO NOTHING`,
+          [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
+        );
+      }
+    } catch (e) { /* silently ignore */ }
+
+  } catch (err) {
+    console.warn(`[ACTIVITY REFRESH] User ${userId} failed: ${err.message}`);
+  }
+}
+
+// Background job: stagger users at 2-second intervals to avoid hammering Canvas
+async function runGlobalActivityRefresh() {
+  try {
+    const usersRes = await pool.query(
+      `SELECT u.id, u.canvas_api_token, u.canvas_api_token_iv
+       FROM users u
+       WHERE u.is_banned = false
+         AND u.canvas_api_token IS NOT NULL
+         AND u.canvas_api_token != ''`
+    );
+    console.log(`[ACTIVITY REFRESH] Starting for ${usersRes.rows.length} users`);
+    let delay = 0;
+    for (const row of usersRes.rows) {
+      const token = getDecryptedCanvasToken(row.id, row);
+      if (!token) continue;
+      setTimeout(() => runActivityRefreshForUser(row.id, token), delay);
+      delay += 2000; // 2-second stagger between users
+    }
+  } catch (err) {
+    console.error('[ACTIVITY REFRESH] Global run failed:', err.message);
+  }
+}
+
+// Run every 15 minutes
+setInterval(runGlobalActivityRefresh, 15 * 60 * 1000);
+
+// POST /api/activity/refresh — triggered on login and Activity pane open
+// Runs refresh for the requesting user only (immediate, not staggered)
+app.post('/api/activity/refresh', authenticateToken, async (req, res) => {
+  try {
+    const userRes = await pool.query(
+      'SELECT canvas_api_token, canvas_api_token_iv FROM users WHERE id=$1', [req.user.id]
+    );
+    const token = getDecryptedCanvasToken(req.user.id, userRes.rows[0]);
+    if (!token) return res.json({ skipped: true, reason: 'no canvas token' });
+    // Run async — don't wait for it to complete before responding
+    runActivityRefreshForUser(req.user.id, token).catch(e => console.warn('[ACTIVITY REFRESH]', e.message));
+    res.json({ started: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to start refresh' });
+  }
+});
+
+// POST /api/courses/custom — student creates a named course entry
+app.post('/api/courses/custom', authenticateToken, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'Course name required' });
+    // Prevent duplicates (case-insensitive)
+    const existing = await pool.query(
+      'SELECT id FROM courses WHERE user_id=$1 AND LOWER(name)=LOWER($2)',
+      [req.user.id, name.trim()]
+    );
+    if (existing.rows.length > 0) return res.status(409).json({ error: 'A course with that name already exists' });
+    const result = await pool.query(
+      `INSERT INTO courses (user_id, name, course_code, enabled, manually_created)
+       VALUES ($1, $2, $2, true, true) RETURNING *`,
+      [req.user.id, name.trim()]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Custom course create error:', err.message);
+    res.status(500).json({ error: 'Failed to create course' });
   }
 });
 
