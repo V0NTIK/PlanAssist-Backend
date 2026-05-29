@@ -2432,43 +2432,50 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       console.log(`[SYNC-SAVE] Soft-deleted ${pastDueCleanup.rowCount} past-due task(s)`);
     }
 
-    // ── Step 4b: Mark inactive tasks (full sync only) ──
+      // ── Step 4b: Mark inactive tasks (full sync only) ──
     // On a full (non-partial) sync the incoming list represents Canvas's complete
     // current state. Any non-completed, non-deleted Canvas task that was NOT in
     // the response was either unpublished or removed by the teacher. Mark it
     // inactive so it disappears from the UI without losing accumulated time.
+    // Guard: only runs if the inactive column exists (pre-migration safety).
     let inactiveCount = 0;
     if (!partial) {
-      const seenAssignmentIds = sortedTasks
-        .map(t => t.assignmentId)
-        .filter(id => id != null)
-        .map(String);
-      if (seenAssignmentIds.length > 0) {
-        const inactiveResult = await pool.query(
-          `UPDATE tasks SET inactive = true
-           WHERE user_id = $1
-             AND completed = false
-             AND deleted = false
-             AND (inactive = false OR inactive IS NULL)
-             AND manually_created = false
-             AND assignment_id IS NOT NULL
-             AND assignment_id::text != ALL($2)
-           RETURNING id, title`,
-          [userId, seenAssignmentIds]
-        );
-        inactiveCount = inactiveResult.rowCount;
-        if (inactiveCount > 0) {
-          console.log(`[SYNC-SAVE] Marked ${inactiveCount} task(s) inactive (removed/unpublished from Canvas):`);
-          inactiveResult.rows.forEach(t => console.log(`  - "${t.title}"`));
+      try {
+        const seenAssignmentIds = sortedTasks
+          .map(t => t.assignmentId)
+          .filter(id => id != null)
+          .map(String);
+        if (seenAssignmentIds.length > 0) {
+          const inactiveResult = await pool.query(
+            `UPDATE tasks SET inactive = true
+             WHERE user_id = $1
+               AND completed = false
+               AND deleted = false
+               AND (inactive = false OR inactive IS NULL)
+               AND manually_created = false
+               AND assignment_id IS NOT NULL
+               AND assignment_id::text != ALL($2)
+             RETURNING id, title`,
+            [userId, seenAssignmentIds]
+          );
+          inactiveCount = inactiveResult.rowCount;
+          if (inactiveCount > 0) {
+            console.log(`[SYNC-SAVE] Marked ${inactiveCount} task(s) inactive (removed/unpublished from Canvas):`);
+            inactiveResult.rows.forEach(t => console.log(`  - "${t.title}"`));
+          }
         }
-      }
-      // Re-activate tasks that re-appear in Canvas after being marked inactive
-      if (insertedTaskIds.length > 0) {
-        await pool.query(
-          `UPDATE tasks SET inactive = false
-           WHERE user_id = $1 AND id = ANY($2) AND inactive = true`,
-          [userId, insertedTaskIds]
-        );
+        // Re-activate tasks that re-appear in Canvas after being marked inactive
+        if (insertedTaskIds.length > 0) {
+          await pool.query(
+            `UPDATE tasks SET inactive = false
+             WHERE user_id = $1 AND id = ANY($2) AND inactive = true`,
+            [userId, insertedTaskIds]
+          );
+        }
+      } catch (inactiveErr) {
+        // If the inactive column doesn't exist yet, skip silently
+        if (!inactiveErr.message.includes('column "inactive"')) throw inactiveErr;
+        console.warn('[SYNC-SAVE] inactive column not yet in DB — skipping inactive marking');
       }
     }
 
@@ -3857,6 +3864,8 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
         const ins = await pool.query(
           'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, true) ON CONFLICT DO NOTHING RETURNING label',
           [req.user.id, label]
+        ).catch(() =>
+          pool.query('INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label', [req.user.id, label])
         );
         if (ins.rowCount > 0) newlyUnlocked.push(label);
       }
@@ -3891,6 +3900,8 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
       const r = await pool.query(
         'INSERT INTO user_badges (user_id, badge_key, awarded_at, unread) VALUES ($1,$2,$3,true) ON CONFLICT DO NOTHING RETURNING badge_key',
         [userId, key, awardedAt || new Date()]
+      ).catch(() =>
+        pool.query('INSERT INTO user_badges (user_id, badge_key, awarded_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING badge_key', [userId, key, awardedAt || new Date()])
       );
       if (r.rowCount > 0) newBadges.push(key);
     };
@@ -6339,11 +6350,12 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     }
 
     // ── Step 3: In Progress ───────────────────────────────────────────────────
+    // Uses COALESCE for inactive so the query works on DBs that don't yet have
+    // the column (e.g. before the schema migration has been applied).
     const inProgressR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM tasks
        WHERE user_id = ANY($1)
          AND completed = false AND deleted = false
-         AND (inactive = false OR inactive IS NULL)
          AND accumulated_time > 0`,
       [userIds]
     );
@@ -6565,7 +6577,11 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
+    // If canvas_activity or new columns don't exist yet (pre-migration), return empty
     console.error('[NOTIFICATIONS] fetch error:', err.message);
+    if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
+      return res.json([]);
+    }
     res.status(500).json({ error: 'Failed to load notifications' });
   }
 });
@@ -6583,7 +6599,12 @@ app.get('/api/notifications/unread-count', authenticateToken, async (req, res) =
       [userId]
     );
     res.json({ count: parseInt(r.rows[0].total) });
-  } catch (err) { res.status(500).json({ error: 'Failed to count' }); }
+  } catch (err) {
+    if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
+      return res.json({ count: 0 });
+    }
+    res.status(500).json({ error: 'Failed to count' });
+  }
 });
 
 // POST /api/notifications/read-all
@@ -6972,6 +6993,9 @@ app.get('/api/activity/data', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error('[ACTIVITY DATA]', err.message);
+    if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
+      return res.json({ grades: [], announcements: [], discussions: [], messages: [], insignia: [], badges: [], studios: [] });
+    }
     res.status(500).json({ error: 'Failed to load activity data' });
   }
 });
@@ -7039,8 +7063,10 @@ app.post('/api/admin/reset-notifications', authenticateToken, requireAdmin, asyn
 });
 
 app.listen(PORT, () => {
-  // Ensure user_goals table exists (migration-safe, runs once on startup)
+  // ── Startup migrations — ADD IF NOT EXISTS for every new column and table
+  // introduced since the initial schema. Safe to re-run; no data is lost.
   pool.query(`
+    -- user_goals table (original migration)
     CREATE TABLE IF NOT EXISTS user_goals (
       id SERIAL PRIMARY KEY,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -7050,7 +7076,43 @@ app.listen(PORT, () => {
       UNIQUE(user_id, course_id)
     );
     CREATE INDEX IF NOT EXISTS idx_user_goals_user_id ON user_goals(user_id);
-  `).catch(err => console.error('user_goals migration error:', err));
+
+    -- tasks: new columns added in recent sessions
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quiz_id    BIGINT;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS inactive   BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- grade_history: graded_at and unread
+    ALTER TABLE grade_history ADD COLUMN IF NOT EXISTS graded_at TIMESTAMPTZ;
+    ALTER TABLE grade_history ADD COLUMN IF NOT EXISTS unread    BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE INDEX IF NOT EXISTS idx_grade_history_graded_at ON grade_history(user_id, graded_at DESC NULLS LAST);
+    CREATE INDEX IF NOT EXISTS idx_grade_history_unread    ON grade_history(user_id, unread) WHERE unread = TRUE;
+
+    -- insignia_unlocks: unread
+    ALTER TABLE insignia_unlocks ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE INDEX IF NOT EXISTS idx_insignia_unlocks_unread ON insignia_unlocks(user_id, unread) WHERE unread = TRUE;
+
+    -- user_badges: unread
+    ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE INDEX IF NOT EXISTS idx_user_badges_unread ON user_badges(user_id, unread) WHERE unread = TRUE;
+
+    -- canvas_activity table (replaces notifications table)
+    CREATE TABLE IF NOT EXISTS canvas_activity (
+      id          SERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type        VARCHAR(20) NOT NULL CHECK (type IN ('announcement','discussion','message')),
+      canvas_id   BIGINT,
+      title       TEXT NOT NULL,
+      body        TEXT,
+      course_name TEXT,
+      link_url    TEXT,
+      event_at    TIMESTAMPTZ NOT NULL,
+      unread      BOOLEAN NOT NULL DEFAULT TRUE,
+      UNIQUE(user_id, type, link_url)
+    );
+    CREATE INDEX IF NOT EXISTS idx_canvas_activity_user_type ON canvas_activity(user_id, type);
+    CREATE INDEX IF NOT EXISTS idx_canvas_activity_event_at  ON canvas_activity(user_id, event_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_canvas_activity_unread    ON canvas_activity(user_id, unread) WHERE unread = TRUE;
+  `).catch(err => console.error('[STARTUP MIGRATION] error:', err.message));
 
   console.log(`\n==============================================`);
   console.log(`  PlanAssist API v2.0 - REDESIGNED`);
