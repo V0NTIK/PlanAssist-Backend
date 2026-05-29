@@ -49,7 +49,14 @@ CREATE TABLE IF NOT EXISTS users (
     calendar_show_weekends      BOOLEAN         DEFAULT TRUE,
     -- Timestamps
     created_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-    updated_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+    updated_at                  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    -- Notification preferences
+    notif_grades                BOOLEAN         NOT NULL DEFAULT TRUE,
+    notif_announcements         BOOLEAN         NOT NULL DEFAULT TRUE,
+    notif_discussions           BOOLEAN         NOT NULL DEFAULT TRUE,
+    notif_messages              BOOLEAN         NOT NULL DEFAULT TRUE,
+    notif_achievements          BOOLEAN         NOT NULL DEFAULT TRUE,
+    notif_studios               BOOLEAN         NOT NULL DEFAULT TRUE
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
@@ -75,6 +82,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_current_week BOOLEAN   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week1   BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_next_week2   BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_weekends     BOOLEAN      DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_grades               BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_announcements        BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_discussions          BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_messages             BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_achievements         BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_studios              BOOLEAN      NOT NULL DEFAULT TRUE;
 
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
 ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
@@ -94,7 +107,7 @@ CREATE INDEX IF NOT EXISTS idx_users_last_sync ON users(last_sync ASC NULLS FIRS
 CREATE TABLE IF NOT EXISTS courses (
     id                      SERIAL PRIMARY KEY,
     user_id                 INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    course_id               BIGINT  NOT NULL,
+    course_id               BIGINT,
     name                    VARCHAR(255) NOT NULL,
     course_code             VARCHAR(100),
     current_score           NUMERIC(6,2),
@@ -108,6 +121,7 @@ CREATE TABLE IF NOT EXISTS courses (
     enrollment_id           BIGINT,
     zoom_number             TEXT,
     enabled                 BOOLEAN DEFAULT TRUE,
+    manually_created        BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, course_id)
 );
@@ -120,8 +134,11 @@ ALTER TABLE courses ADD COLUMN IF NOT EXISTS grading_period_title TEXT;
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS enrollment_id        BIGINT;
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS zoom_number          TEXT;
 ALTER TABLE courses ADD COLUMN IF NOT EXISTS enabled              BOOLEAN DEFAULT TRUE;
+ALTER TABLE courses ADD COLUMN IF NOT EXISTS manually_created     BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE courses ALTER COLUMN current_grade TYPE VARCHAR(50);
 ALTER TABLE courses ALTER COLUMN final_grade    TYPE VARCHAR(50);
+-- Allow course_id to be NULL for manually-created courses
+ALTER TABLE courses ALTER COLUMN course_id DROP NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_courses_user_id   ON courses(user_id);
 CREATE INDEX IF NOT EXISTS idx_courses_course_id ON courses(course_id);
@@ -835,9 +852,6 @@ CREATE TABLE IF NOT EXISTS hpt_studios (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE hpt_studios ADD COLUMN IF NOT EXISTS course_id   BIGINT;
-ALTER TABLE hpt_studios ADD COLUMN IF NOT EXISTS zoom_number TEXT;
-
 CREATE INDEX IF NOT EXISTS idx_hpt_studios_course_id   ON hpt_studios(course_id);
 CREATE INDEX IF NOT EXISTS idx_hpt_studios_created_by  ON hpt_studios(created_by);
 CREATE INDEX IF NOT EXISTS idx_hpt_studios_studio_key  ON hpt_studios(studio_key);
@@ -933,3 +947,26 @@ CREATE TABLE IF NOT EXISTS grade_history (
 
 CREATE INDEX IF NOT EXISTS idx_grade_history_user_id    ON grade_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_grade_history_synced_at  ON grade_history(user_id, synced_at DESC);
+
+
+-- ============================================================================
+-- NOTIFICATIONS
+-- Per-user notification inbox. Fed by the background Activity Refresh job
+-- (grades, announcements, discussions, messages), insignia unlocks,
+-- badge awards, and studio membership changes.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type        VARCHAR(30) NOT NULL
+                    CHECK (type IN ('grade','announcement','discussion','message','insignia','badge','studio')),
+    title       TEXT NOT NULL,
+    body        TEXT,
+    link_url    TEXT,
+    read        BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, read) WHERE read = FALSE;
+CREATE INDEX IF NOT EXISTS idx_notifications_user_time   ON notifications(user_id, created_at DESC);
