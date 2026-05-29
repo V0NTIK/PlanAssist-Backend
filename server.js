@@ -1715,11 +1715,10 @@ app.post('/api/canvas/course-sync', authenticateToken, async (req, res) => {
 // ============================================================================
 // POST /api/canvas/grade-sync — GRADE SYNC
 // Triggered: opening Activity pane on Account & Analytics page.
-// POST /api/canvas/grade-sync — triggered when user opens the Activity/Grades pane.
-// Fetches ALL graded submissions for ALL of the user's enrolled courses from Canvas,
-// and upserts them into grade_history keyed by (user_id, assignment_id).
-// This captures full historical grades regardless of whether PlanAssist has ever
-// had a corresponding task row — fixes the "only future tasks" limitation.
+// Fetches graded submissions within the last 2 months for all enrolled courses.
+// Upserts into grade_history keyed by (user_id, assignment_id):
+//   - First-run users: unread=FALSE (prevent historical flood on signup)
+//   - Returning users: new rows get unread=TRUE; score changes flip existing rows to unread=TRUE
 app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -1735,9 +1734,14 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
 
     const headers = { Authorization: `Bearer ${canvasToken}` };
 
+    // First-run guard: if grade_history is empty for this user, mark all incoming
+    // grades as unread=FALSE to avoid flooding the notification sidebar on first load.
+    const existingGradeCount = await pool.query(
+      'SELECT 1 FROM grade_history WHERE user_id=$1 LIMIT 1', [userId]
+    );
+    const isFirstRun = existingGradeCount.rows.length === 0;
+
     // Step 2: Get all enrolled course IDs from the courses table.
-    // Using courses table (not tasks) means we get ALL courses, not just those
-    // with tasks due in the last 60 days — enabling full historical grade coverage.
     const coursesRes = await pool.query(
       'SELECT DISTINCT course_id FROM courses WHERE user_id = $1 AND enabled = true',
       [userId]
@@ -1749,9 +1753,11 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
     }
     console.log(`[GRADE SYNC] Fetching submissions for ${courseIds.length} course(s)`);
 
-    // Step 3: Fetch all submissions for each course in parallel.
-    // include[]=assignment pulls in assignment metadata (title, points_possible, html_url).
-    // per_page=100 is Canvas's max; most courses have well under 100 assignments.
+    // 2-month window: only process grades from the last 2 months
+    const twoMonthsAgo = new Date();
+    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+
+    // Step 3: Fetch graded submissions for each course in parallel.
     const submissionResults = await Promise.allSettled(
       courseIds.map(cid =>
         axios.get(
@@ -1767,8 +1773,7 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
     const allSubs = submissionResults.flatMap(r => r.status === 'fulfilled' ? r.value : []);
     console.log(`[GRADE SYNC] Total submissions fetched: ${allSubs.length}`);
 
-    // Step 4: Build a course_id → course_name lookup from the courses table
-    // so we can store a human-readable course name in grade_history.
+    // Step 4: Build course_id → course_name lookup
     const courseNameRes = await pool.query(
       'SELECT course_id, name FROM courses WHERE user_id = $1',
       [userId]
@@ -1777,44 +1782,59 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
     courseNameRes.rows.forEach(r => { courseNameMap[r.course_id] = r.name; });
 
     // Step 5: Upsert each graded submission into grade_history.
-    // Only process submissions that have a score OR a grade — unsubmitted work is skipped.
-    // Date restriction: only process submissions graded/submitted within the last 2 months.
-    const twoMonthsAgo = new Date();
-    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+    // Window: skip anything graded/submitted more than 2 months ago.
+    // unread logic: new rows → unread=TRUE (unless first run); score changes on
+    // existing rows → flip unread back to TRUE so the user sees the update.
     let upsertedCount = 0;
     for (const sub of allSubs) {
       if (sub.score == null && !sub.grade) continue;
-      // Skip submissions outside the 2-month window (by submitted_at)
-      if (sub.submitted_at && new Date(sub.submitted_at) < twoMonthsAgo) continue;
 
       const assignment = sub.assignment || {};
-      const title       = assignment.name || `Assignment ${sub.assignment_id}`;
-      const courseName  = courseNameMap[sub._courseId] || null;
-      const htmlUrl     = assignment.html_url || sub.preview_url || null;
-      const pointsPoss  = assignment.points_possible != null ? parseFloat(assignment.points_possible) : null;
-      const score       = sub.score != null ? parseFloat(sub.score) : null;
-      const grade       = sub.grade || null;
-      const gradingType = assignment.grading_type || 'points';
-      const submittedAt = sub.submitted_at || null;
+      // graded_at from Canvas; fall back to submitted_at
+      const gradedAt = sub.graded_at || sub.submitted_at || null;
+      if (gradedAt && new Date(gradedAt) < twoMonthsAgo) continue;
 
-      await pool.query(
-        `INSERT INTO grade_history
-           (user_id, course_id, assignment_id, title, course_name, html_url,
-            score, points_possible, grade, grading_type, submitted_at, synced_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-         ON CONFLICT (user_id, assignment_id) DO UPDATE SET
-           title          = EXCLUDED.title,
-           course_name    = EXCLUDED.course_name,
-           html_url       = EXCLUDED.html_url,
-           score          = EXCLUDED.score,
-           points_possible = EXCLUDED.points_possible,
-           grade          = EXCLUDED.grade,
-           grading_type   = EXCLUDED.grading_type,
-           submitted_at   = EXCLUDED.submitted_at,
-           synced_at      = NOW()`,
-        [userId, sub._courseId, sub.assignment_id, title, courseName, htmlUrl,
-         score, pointsPoss, grade, gradingType, submittedAt]
+      const title        = assignment.name || `Assignment ${sub.assignment_id}`;
+      const courseName   = courseNameMap[sub._courseId] || null;
+      const htmlUrl      = assignment.html_url || sub.preview_url || null;
+      const pointsPoss   = assignment.points_possible != null ? parseFloat(assignment.points_possible) : null;
+      const score        = sub.score != null ? parseFloat(sub.score) : null;
+      const grade        = sub.grade || null;
+      const gradingType  = assignment.grading_type || 'points';
+      const submittedAt  = sub.submitted_at || null;
+
+      // Check if the row already exists and if the score changed
+      const existing = await pool.query(
+        'SELECT id, score, grade FROM grade_history WHERE user_id=$1 AND assignment_id=$2',
+        [userId, sub.assignment_id]
       );
+
+      if (existing.rows.length > 0) {
+        const scoreChanged = String(existing.rows[0].score) !== String(score);
+        const gradeChanged = existing.rows[0].grade !== grade;
+        const changed = scoreChanged || gradeChanged;
+        await pool.query(
+          `UPDATE grade_history SET
+             title=$1, course_name=$2, html_url=$3, score=$4, points_possible=$5,
+             grade=$6, grading_type=$7, submitted_at=$8, graded_at=$9, synced_at=NOW(),
+             unread = CASE WHEN $10 THEN true ELSE unread END
+           WHERE user_id=$11 AND assignment_id=$12`,
+          [title, courseName, htmlUrl, score, pointsPoss,
+           grade, gradingType, submittedAt, gradedAt,
+           changed && !isFirstRun,
+           userId, sub.assignment_id]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO grade_history
+             (user_id, course_id, assignment_id, title, course_name, html_url,
+              score, points_possible, grade, grading_type, submitted_at, graded_at, synced_at, unread)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13)`,
+          [userId, sub._courseId, sub.assignment_id, title, courseName, htmlUrl,
+           score, pointsPoss, grade, gradingType, submittedAt, gradedAt,
+           !isFirstRun] // unread=FALSE for first-run users
+        );
+      }
       upsertedCount++;
     }
 
@@ -2132,7 +2152,7 @@ app.get('/api/tasks/calendar', authenticateToken, async (req, res) => {
               completed, submitted_at, is_missing, is_late,
               points_possible, course_id, assignment_id
        FROM tasks
-       WHERE user_id = $1 AND deleted = false
+       WHERE user_id = $1 AND deleted = false AND (inactive = false OR inactive IS NULL)
        ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST`,
       [req.user.id]
     );
@@ -2171,6 +2191,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       `SELECT * FROM tasks
        WHERE user_id = $1
          AND (split_origin = false OR split_origin IS NULL)
+         AND (inactive = false OR inactive IS NULL)
        ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST, segment ASC NULLS FIRST`,
       [req.user.id]
     );
@@ -2354,9 +2375,11 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
 
         if (completionFlip) {
           completionFlips++;
-          console.log(`  ★ Completion flip detected for "${existing.title}" → updating leaderboard`);
+          console.log(`  ★ Completion flip detected for "${existing.title}" → updating leaderboard + feed`);
           incrementLeaderboardForUser(userId).catch(err =>
             console.error('[LEADERBOARD] sync flip error:', err.message));
+          addToCompletionFeed(userId, existing.title, existing.class).catch(err =>
+            console.error('[FEED] sync flip error:', err.message));
         }
         if (gradeFlipped) {
           console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
@@ -2409,17 +2432,57 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       console.log(`[SYNC-SAVE] Soft-deleted ${pastDueCleanup.rowCount} past-due task(s)`);
     }
 
+    // ── Step 4b: Mark inactive tasks (full sync only) ──
+    // On a full (non-partial) sync the incoming list represents Canvas's complete
+    // current state. Any non-completed, non-deleted Canvas task that was NOT in
+    // the response was either unpublished or removed by the teacher. Mark it
+    // inactive so it disappears from the UI without losing accumulated time.
+    let inactiveCount = 0;
+    if (!partial) {
+      const seenAssignmentIds = sortedTasks
+        .map(t => t.assignmentId)
+        .filter(id => id != null)
+        .map(String);
+      if (seenAssignmentIds.length > 0) {
+        const inactiveResult = await pool.query(
+          `UPDATE tasks SET inactive = true
+           WHERE user_id = $1
+             AND completed = false
+             AND deleted = false
+             AND (inactive = false OR inactive IS NULL)
+             AND manually_created = false
+             AND assignment_id IS NOT NULL
+             AND assignment_id::text != ALL($2)
+           RETURNING id, title`,
+          [userId, seenAssignmentIds]
+        );
+        inactiveCount = inactiveResult.rowCount;
+        if (inactiveCount > 0) {
+          console.log(`[SYNC-SAVE] Marked ${inactiveCount} task(s) inactive (removed/unpublished from Canvas):`);
+          inactiveResult.rows.forEach(t => console.log(`  - "${t.title}"`));
+        }
+      }
+      // Re-activate tasks that re-appear in Canvas after being marked inactive
+      if (insertedTaskIds.length > 0) {
+        await pool.query(
+          `UPDATE tasks SET inactive = false
+           WHERE user_id = $1 AND id = ANY($2) AND inactive = true`,
+          [userId, insertedTaskIds]
+        );
+      }
+    }
+
     // ── Step 5: Update last_sync timestamp ──
     await pool.query(
       'UPDATE users SET last_sync = CURRENT_TIMESTAMP WHERE id = $1',
       [userId]
     );
 
-    console.log(`=== SYNC-SAVE COMPLETE: updated=${updatedCount} new=${newCount} leaderboard_flips=${completionFlips} past_due_cleaned=${pastDueCleanup.rowCount} ===`);
+    console.log(`=== SYNC-SAVE COMPLETE: updated=${updatedCount} new=${newCount} leaderboard_flips=${completionFlips} past_due_cleaned=${pastDueCleanup.rowCount} inactive=${inactiveCount} ===`);
 
     res.json({
       success: true,
-      stats: { updated: updatedCount, new: newCount, completionFlips, cleaned: pastDueCleanup.rowCount }
+      stats: { updated: updatedCount, new: newCount, completionFlips, cleaned: pastDueCleanup.rowCount, inactive: inactiveCount }
     });
   } catch (err) {
     console.error('[SYNC-SAVE] Error:', err.message);
@@ -3095,6 +3158,7 @@ app.get('/api/sessions/tasks', authenticateToken, async (req, res) => {
        WHERE user_id = $1
          AND completed = false
          AND deleted = false
+         AND (inactive = false OR inactive IS NULL)
          AND LOWER(class) NOT LIKE '%homeroom%'
        ORDER BY deadline_date ASC, deadline_time ASC NULLS LAST, segment ASC NULLS FIRST`,
       [req.user.id]
@@ -3791,7 +3855,7 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
     for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
       if (days >= threshold) {
         const ins = await pool.query(
-          'INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label',
+          'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, true) ON CONFLICT DO NOTHING RETURNING label',
           [req.user.id, label]
         );
         if (ins.rowCount > 0) newlyUnlocked.push(label);
@@ -3825,7 +3889,7 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
     // Helper: award badge if not already awarded
     const award = async (key, awardedAt) => {
       const r = await pool.query(
-        'INSERT INTO user_badges (user_id, badge_key, awarded_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING badge_key',
+        'INSERT INTO user_badges (user_id, badge_key, awarded_at, unread) VALUES ($1,$2,$3,true) ON CONFLICT DO NOTHING RETURNING badge_key',
         [userId, key, awardedAt || new Date()]
       );
       if (r.rowCount > 0) newBadges.push(key);
@@ -5291,19 +5355,17 @@ app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => 
   }
 });
 
-// GET /api/canvas/grades — returns all graded submissions from grade_history,
-// ordered by most-recently-synced first. grade_history is populated by Grade Sync
-// (POST /canvas/grade-sync) and covers full historical grades for all courses,
-// not just tasks that are currently in the tasks table.
+// GET /api/canvas/grades — returns graded submissions from grade_history (2-month window),
+// ordered by graded_at DESC. Populated by Grade Sync.
 app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, course_id, assignment_id, title, course_name, html_url,
-              score, points_possible, grade, grading_type, submitted_at, synced_at
+              score, points_possible, grade, grading_type, submitted_at, graded_at, synced_at, unread
        FROM grade_history
        WHERE user_id = $1
-         AND (submitted_at IS NULL OR submitted_at >= NOW() - INTERVAL '2 months')
-       ORDER BY submitted_at DESC NULLS LAST, id DESC`,
+         AND (graded_at IS NULL OR graded_at >= NOW() - INTERVAL '2 months')
+       ORDER BY COALESCE(graded_at, submitted_at) DESC NULLS LAST, id DESC`,
       [req.user.id]
     );
 
@@ -5316,8 +5378,9 @@ app.get('/api/canvas/grades', authenticateToken, async (req, res) => {
       pointsPossible:  t.points_possible != null ? parseFloat(t.points_possible) : null,
       grade:           t.grade,
       gradingType:     t.grading_type || 'points',
-      gradedAt:        t.submitted_at,
+      gradedAt:        t.graded_at || t.submitted_at,
       htmlUrl:         t.html_url,
+      unread:          t.unread,
     }));
 
     res.json(graded);
@@ -6202,12 +6265,11 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
 
       // Recent graded submissions (last 10) from grade_history
       const ghRes = await pool.query(
-        `SELECT gh.assignment_title, gh.course_name, gh.score, gh.points_possible,
-                gh.grade, gh.graded_at
+        `SELECT gh.title AS assignment_title, gh.course_name, gh.score, gh.points_possible,
+                gh.grade, COALESCE(gh.graded_at, gh.submitted_at) AS graded_at
          FROM grade_history gh
          WHERE gh.user_id=$1
-           AND gh.graded_at IS NOT NULL
-         ORDER BY gh.graded_at DESC LIMIT 10`,
+         ORDER BY COALESCE(gh.graded_at, gh.submitted_at) DESC NULLS LAST LIMIT 10`,
         [userId]
       );
 
@@ -6240,50 +6302,114 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
 });
 
 // ============================================================================
-// NOTIFICATIONS
+// NOTIFICATIONS — sourced from grade_history, insignia_unlocks, user_badges,
+// and canvas_activity (announcements, discussions, messages).
+// No separate notifications table; unread flags live on the source rows.
 // ============================================================================
 
-// GET /api/notifications — fetch user's notifications (last 100, newest first by event time)
+// GET /api/notifications — unified feed sorted by event_time DESC
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
+    const userId = req.user.id;
     const result = await pool.query(
-      `SELECT id, type, title, body, link_url, read, created_at
-       FROM notifications WHERE user_id=$1
-       ORDER BY created_at DESC, id DESC LIMIT 100`,
-      [req.user.id]
+      `SELECT * FROM (
+         -- Unread grade notifications
+         SELECT 'grade_' || id::text AS id, 'grade' AS type, title,
+                course_name AS body, html_url AS link_url, unread AS is_unread,
+                COALESCE(graded_at, submitted_at, synced_at) AS event_time,
+                id AS source_id,
+                score, points_possible, grade, grading_type,
+                NULL::text AS course_name_extra
+         FROM grade_history WHERE user_id = $1 AND unread = true
+
+         UNION ALL
+
+         -- Unread insignia unlocks
+         SELECT 'insignia_' || id::text, 'insignia',
+                '🎖️ ' || label || ' Insignia Unlocked',
+                'You unlocked a new Insignia tier!', NULL, unread,
+                COALESCE(unlocked_at, NOW()), id,
+                NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar, NULL::text
+         FROM insignia_unlocks WHERE user_id = $1 AND unread = true
+
+         UNION ALL
+
+         -- Unread badge awards
+         SELECT 'badge_' || id::text, 'badge',
+                '🏆 ' || REPLACE(INITCAP(REPLACE(badge_key,'_',' ')),' ',' ') || ' Badge Earned',
+                'You earned a new Gallery badge!', NULL, unread,
+                COALESCE(awarded_at, NOW()), id,
+                NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar, NULL::text
+         FROM user_badges WHERE user_id = $1 AND unread = true
+
+         UNION ALL
+
+         -- Canvas activity (announcements, discussions, messages) — all recent
+         SELECT 'canvas_' || id::text, type, title, body, link_url, unread,
+                event_at, id,
+                NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar,
+                course_name AS course_name_extra
+         FROM canvas_activity
+         WHERE user_id = $1 AND event_at >= NOW() - INTERVAL '2 months'
+       ) combined
+       ORDER BY event_time DESC NULLS LAST
+       LIMIT 100`,
+      [userId]
     );
     res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Failed to load notifications' }); }
-});
-
-// POST /api/notifications/read-all — mark all as read
-app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
-  try {
-    await pool.query('UPDATE notifications SET read=true WHERE user_id=$1 AND read=false', [req.user.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
-});
-
-// PATCH /api/notifications/:id/read — mark a single notification as read
-app.patch('/api/notifications/:id/read', authenticateToken, async (req, res) => {
-  try {
-    await pool.query(
-      'UPDATE notifications SET read=true WHERE id=$1 AND user_id=$2',
-      [req.params.id, req.user.id]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
+  } catch (err) {
+    console.error('[NOTIFICATIONS] fetch error:', err.message);
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
 });
 
 // GET /api/notifications/unread-count
 app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
   try {
-    const r = await pool.query('SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND read=false', [req.user.id]);
-    res.json({ count: parseInt(r.rows[0].count) });
+    const userId = req.user.id;
+    const r = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM grade_history    WHERE user_id=$1 AND unread=true) +
+         (SELECT COUNT(*) FROM insignia_unlocks WHERE user_id=$1 AND unread=true) +
+         (SELECT COUNT(*) FROM user_badges      WHERE user_id=$1 AND unread=true) +
+         (SELECT COUNT(*) FROM canvas_activity  WHERE user_id=$1 AND unread=true) AS total`,
+      [userId]
+    );
+    res.json({ count: parseInt(r.rows[0].total) });
   } catch (err) { res.status(500).json({ error: 'Failed to count' }); }
 });
 
-// GET /api/user/notification-prefs — get notification preferences
+// POST /api/notifications/read-all
+app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await Promise.all([
+      pool.query('UPDATE grade_history    SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
+      pool.query('UPDATE insignia_unlocks SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
+      pool.query('UPDATE user_badges      SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
+      pool.query('UPDATE canvas_activity  SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
+    ]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
+});
+
+// PATCH /api/notifications/:id/read — id format: "grade_123", "insignia_45", "badge_67", "canvas_89"
+app.patch('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const parts = req.params.id.split('_');
+    const numId = parseInt(parts[parts.length - 1]);
+    const type = parts[0];
+    if (!numId) return res.status(400).json({ error: 'Invalid id' });
+    const tableMap = { grade: 'grade_history', insignia: 'insignia_unlocks', badge: 'user_badges', canvas: 'canvas_activity' };
+    const table = tableMap[type];
+    if (!table) return res.status(400).json({ error: 'Unknown notification type' });
+    await pool.query(`UPDATE ${table} SET unread=false WHERE id=$1 AND user_id=$2`, [numId, userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
+});
+
+// GET /api/user/notification-prefs
 app.get('/api/user/notification-prefs', authenticateToken, async (req, res) => {
   try {
     const r = await pool.query(
@@ -6294,28 +6420,26 @@ app.get('/api/user/notification-prefs', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed to load prefs' }); }
 });
 
-// PUT /api/user/notification-prefs — update notification preferences
+// PUT /api/user/notification-prefs
 app.put('/api/user/notification-prefs', authenticateToken, async (req, res) => {
   try {
     const { notif_grades, notif_announcements, notif_discussions, notif_messages, notif_achievements, notif_studios } = req.body;
     await pool.query(
-      `UPDATE users SET
-         notif_grades=$1, notif_announcements=$2, notif_discussions=$3,
-         notif_messages=$4, notif_achievements=$5, notif_studios=$6
-       WHERE id=$7`,
-      [
-        notif_grades ?? true, notif_announcements ?? true, notif_discussions ?? true,
-        notif_messages ?? true, notif_achievements ?? true, notif_studios ?? true,
-        req.user.id
-      ]
+      `UPDATE users SET notif_grades=$1, notif_announcements=$2, notif_discussions=$3,
+         notif_messages=$4, notif_achievements=$5, notif_studios=$6 WHERE id=$7`,
+      [notif_grades ?? true, notif_announcements ?? true, notif_discussions ?? true,
+       notif_messages ?? true, notif_achievements ?? true, notif_studios ?? true,
+       req.user.id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed to update prefs' }); }
 });
 
 // ============================================================================
-// BACKGROUND ACTIVITY REFRESH — runs every 15 minutes, staggered across users
-// Writes new items to the notifications table respecting user preferences.
+// BACKGROUND ACTIVITY REFRESH — runs every 15 minutes, staggered across users.
+// Writes into canvas_activity (announcements/discussions/messages) and
+// grade_history (grades). Insignia/badge unread flags are set at insert time
+// by their respective endpoints; no extra work needed here.
 // ============================================================================
 
 async function runActivityRefreshForUser(userId, canvasToken) {
@@ -6324,118 +6448,89 @@ async function runActivityRefreshForUser(userId, canvasToken) {
     const twoMonthsAgo = new Date();
     twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
 
-    // Fetch user preferences — include notif_achievements
     const prefsRes = await pool.query(
-      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages, notif_achievements, name
-       FROM users WHERE id=$1`, [userId]
+      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages FROM users WHERE id=$1`, [userId]
     );
     if (!prefsRes.rows[0]) return;
     const prefs = prefsRes.rows[0];
 
-    // First-run guard: if the notifications table is empty for this user,
-    // treat all existing grades as already-seen by marking them with a
-    // pre-read notification dated to their submitted_at. This prevents a
-    // flood of historical notifications on first load.
-    const existingCount = await pool.query(
-      'SELECT 1 FROM notifications WHERE user_id=$1 LIMIT 1', [userId]
-    );
+    // First-run guard: if grade_history is empty, new rows get unread=FALSE to avoid flood
+    const existingCount = await pool.query('SELECT 1 FROM grade_history WHERE user_id=$1 LIMIT 1', [userId]);
     const isFirstRun = existingCount.rows.length === 0;
 
-    const insertNotif = async (type, title, body, link_url, createdAt = null, markRead = false) => {
-      // Dedup: if a link_url is present (grades, announcements, discussions, messages),
-      // deduplicate by (user_id, type, link_url) — each Canvas item has a unique URL,
-      // so this correctly allows regrades when the score changes without duplicate rows.
-      // If no link_url (insignia, badge, studio), fall back to exact title match.
-      let dedup;
-      if (link_url) {
-        dedup = await pool.query(
-          `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND link_url=$3`,
-          [userId, type, link_url]
-        );
-      } else {
-        dedup = await pool.query(
-          `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND title=$3`,
-          [userId, type, title]
-        );
-      }
-      if (dedup.rows.length > 0) return;
+    // Helper: upsert canvas_activity. On URL collision, only flip unread if event_at advanced.
+    const upsertActivity = async (type, title, body, courseName, linkUrl, eventAt) => {
+      if (!linkUrl) return;
       await pool.query(
-        `INSERT INTO notifications (user_id, type, title, body, link_url, read, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (user_id, type, link_url) WHERE link_url IS NOT NULL DO NOTHING`,
-        [userId, type, title, body || null, link_url || null, markRead, createdAt || new Date()]
+        `INSERT INTO canvas_activity (user_id, type, title, body, course_name, link_url, event_at, unread)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,true)
+         ON CONFLICT (user_id, type, link_url) DO UPDATE SET
+           title       = EXCLUDED.title,
+           body        = EXCLUDED.body,
+           course_name = EXCLUDED.course_name,
+           unread      = CASE WHEN EXCLUDED.event_at > canvas_activity.event_at THEN true ELSE canvas_activity.unread END,
+           event_at    = GREATEST(canvas_activity.event_at, EXCLUDED.event_at)`,
+        [userId, type, title, body || null, courseName || null, linkUrl, eventAt]
       );
     };
 
-    // --- Grade Sync (if enabled) ---
+    // --- Grades ---
     if (prefs.notif_grades) {
       try {
         const coursesRes = await pool.query(
           'SELECT DISTINCT course_id FROM courses WHERE user_id=$1 AND enabled=true AND course_id IS NOT NULL', [userId]
         );
-        const courseIds = coursesRes.rows.map(r => r.course_id);
-        for (const cid of courseIds) {
+        for (const { course_id } of coursesRes.rows) {
           const subsRes = await axios.get(
-            `${CANVAS_API_BASE}/courses/${cid}/students/submissions?student_ids[]=self&include[]=assignment&per_page=50`,
+            `${CANVAS_API_BASE}/courses/${course_id}/students/submissions?student_ids[]=self&include[]=assignment&per_page=50`,
             { headers, timeout: 12000 }
           ).catch(() => ({ data: [] }));
+          const courseNameRow = await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id]);
+          const courseName = courseNameRow.rows[0]?.name || '';
           for (const sub of subsRes.data) {
             if (!sub.score && !sub.grade) continue;
-            if (sub.submitted_at && new Date(sub.submitted_at) < twoMonthsAgo) continue;
+            const gradedAt = sub.graded_at || sub.submitted_at || null;
+            if (gradedAt && new Date(gradedAt) < twoMonthsAgo) continue;
             const assignment = sub.assignment || {};
             const title = assignment.name || `Assignment ${sub.assignment_id}`;
-            const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, cid])).rows[0]?.name || '';
-            const pct = assignment.points_possible > 0 ? Math.round((sub.score / assignment.points_possible) * 100) : null;
-            const body = [courseName, pct != null ? `${pct}%` : sub.grade].filter(Boolean).join(' · ');
-            // Use submitted_at as created_at so notifications sort chronologically.
-            // On first run, mark all as read so they don't flood as unread.
-            const notifDate = sub.submitted_at ? new Date(sub.submitted_at) : new Date();
-            const gradeUrl = assignment.html_url || null;
-            if (gradeUrl && !isFirstRun) {
-              // For regrades: if the notification already exists but body changed (score updated),
-              // update it in place and flip it back to unread so the student sees the change.
-              const existing = await pool.query(
-                `SELECT id, body FROM notifications WHERE user_id=$1 AND type='grade' AND link_url=$2`,
-                [userId, gradeUrl]
-              );
-              if (existing.rows.length > 0) {
-                if (existing.rows[0].body !== body) {
-                  await pool.query(
-                    `UPDATE notifications SET body=$1, read=false, created_at=$2 WHERE id=$3`,
-                    [body, notifDate, existing.rows[0].id]
-                  );
-                }
-              } else {
-                await insertNotif('grade', title, body, gradeUrl, notifDate, false);
-              }
-            } else {
-              await insertNotif('grade', title, body, gradeUrl, notifDate, isFirstRun);
-            }
-
-            // Also upsert into grade_history (date-restricted)
-            await pool.query(
-              `INSERT INTO grade_history
-                 (user_id, course_id, assignment_id, title, course_name, html_url, score, points_possible, grade, grading_type, submitted_at, synced_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-               ON CONFLICT (user_id, assignment_id) DO UPDATE SET
-                 title=EXCLUDED.title, course_name=EXCLUDED.course_name, score=EXCLUDED.score,
-                 points_possible=EXCLUDED.points_possible, grade=EXCLUDED.grade,
-                 submitted_at=EXCLUDED.submitted_at, synced_at=NOW()`,
-              [userId, cid, sub.assignment_id, title, courseName,
-               assignment.html_url || null,
-               sub.score != null ? parseFloat(sub.score) : null,
-               assignment.points_possible != null ? parseFloat(assignment.points_possible) : null,
-               sub.grade || null, assignment.grading_type || 'points', sub.submitted_at || null]
+            const score = sub.score != null ? parseFloat(sub.score) : null;
+            const grade = sub.grade || null;
+            const pointsPoss = assignment.points_possible != null ? parseFloat(assignment.points_possible) : null;
+            const htmlUrl = assignment.html_url || null;
+            const gradingType = (assignment.grading_type || 'points').slice(0, 50);
+            const existing = await pool.query(
+              'SELECT id, score, grade FROM grade_history WHERE user_id=$1 AND assignment_id=$2',
+              [userId, sub.assignment_id]
             );
+            if (existing.rows.length > 0) {
+              const changed = String(existing.rows[0].score) !== String(score) || existing.rows[0].grade !== grade;
+              await pool.query(
+                `UPDATE grade_history SET title=$1, course_name=$2, html_url=$3, score=$4, points_possible=$5,
+                   grade=$6, grading_type=$7, submitted_at=$8, graded_at=$9, synced_at=NOW(),
+                   unread = CASE WHEN $10 THEN true ELSE unread END
+                 WHERE user_id=$11 AND assignment_id=$12`,
+                [title, courseName, htmlUrl, score, pointsPoss, grade, gradingType,
+                 sub.submitted_at || null, gradedAt, changed && !isFirstRun, userId, sub.assignment_id]
+              );
+            } else {
+              await pool.query(
+                `INSERT INTO grade_history
+                   (user_id, course_id, assignment_id, title, course_name, html_url,
+                    score, points_possible, grade, grading_type, submitted_at, graded_at, synced_at, unread)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13)
+                 ON CONFLICT (user_id, assignment_id) DO NOTHING`,
+                [userId, course_id, sub.assignment_id, title, courseName, htmlUrl,
+                 score, pointsPoss, grade, gradingType, sub.submitted_at || null, gradedAt, !isFirstRun]
+              );
+            }
           }
         }
       } catch (e) { console.warn(`[ACTIVITY REFRESH] Grade sync failed for user ${userId}: ${e.message}`); }
     }
 
-    // --- Announcements (if enabled) ---
+    // --- Announcements ---
     if (prefs.notif_announcements) {
       try {
-        // Fetch course-specific announcements using context_codes so we get real course announcements
         const annCoursesRes = await pool.query(
           'SELECT DISTINCT course_id FROM courses WHERE user_id=$1 AND enabled=true AND course_id IS NOT NULL', [userId]
         );
@@ -6447,14 +6542,17 @@ async function runActivityRefreshForUser(userId, canvasToken) {
             { headers, timeout: 10000 }
           ).catch(() => ({ data: [] }));
           for (const ann of (annRes.data || [])) {
-            if (!ann.posted_at || new Date(ann.posted_at) < twoMonthsAgo) continue;
-            await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null, ann.posted_at ? new Date(ann.posted_at) : null, isFirstRun);
+            const eventAt = ann.posted_at || ann.created_at;
+            if (!eventAt || new Date(eventAt) < twoMonthsAgo) continue;
+            await upsertActivity('announcement', ann.title || 'Announcement',
+              ann.message ? ann.message.replace(/<[^>]+>/g, '').slice(0, 300) : null,
+              ann.context_name || null, ann.html_url || null, new Date(eventAt));
           }
         }
       } catch (e) { /* silently ignore */ }
     }
 
-    // --- Discussions (if enabled) ---
+    // --- Discussions ---
     if (prefs.notif_discussions) {
       try {
         const coursesRes = await pool.query(
@@ -6465,38 +6563,19 @@ async function runActivityRefreshForUser(userId, canvasToken) {
             `${CANVAS_API_BASE}/courses/${course_id}/discussion_topics?per_page=5&order_by=recent_activity`,
             { headers, timeout: 8000 }
           ).catch(() => ({ data: [] }));
+          const cName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id])).rows[0]?.name || '';
           for (const disc of (discRes.data || [])) {
-            const discEventTime = disc.last_reply_at || disc.posted_at || disc.created_at;
-            if (!discEventTime || new Date(discEventTime) < twoMonthsAgo) continue;
-            const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id])).rows[0]?.name || '';
-            const discUrl = disc.html_url || null;
-            const discTime = new Date(discEventTime);
-            if (discUrl && !isFirstRun) {
-              // If existing notification is older than the latest reply, update it and flip unread
-              const existingDisc = await pool.query(
-                `SELECT id, created_at FROM notifications WHERE user_id=$1 AND type='discussion' AND link_url=$2`,
-                [userId, discUrl]
-              );
-              if (existingDisc.rows.length > 0) {
-                const storedTime = new Date(existingDisc.rows[0].created_at);
-                if (disc.last_reply_at && discTime > storedTime) {
-                  await pool.query(
-                    `UPDATE notifications SET created_at=$1, read=false WHERE id=$2`,
-                    [discTime, existingDisc.rows[0].id]
-                  );
-                }
-              } else {
-                await insertNotif('discussion', disc.title || 'Discussion', courseName || null, discUrl, discTime, false);
-              }
-            } else {
-              await insertNotif('discussion', disc.title || 'Discussion', courseName || null, discUrl, discTime, isFirstRun);
-            }
+            const eventAt = disc.last_reply_at || disc.posted_at || disc.created_at;
+            if (!eventAt || new Date(eventAt) < twoMonthsAgo) continue;
+            await upsertActivity('discussion', disc.title || 'Discussion',
+              disc.message ? disc.message.replace(/<[^>]+>/g, '').slice(0, 300) : null,
+              cName, disc.html_url || null, new Date(eventAt));
           }
         }
       } catch (e) { /* silently ignore */ }
     }
 
-    // --- Canvas Activity Stream for messages (if enabled) ---
+    // --- Messages ---
     if (prefs.notif_messages) {
       try {
         const actRes = await axios.get(
@@ -6505,57 +6584,13 @@ async function runActivityRefreshForUser(userId, canvasToken) {
         ).catch(() => ({ data: [] }));
         for (const item of (actRes.data || [])) {
           if (item.type !== 'Message' && item.type !== 'Conversation') continue;
-          if (!item.updated_at || new Date(item.updated_at) < twoMonthsAgo) continue;
-          await insertNotif('message', item.title || 'New message', item.message || null, item.html_url || null, item.updated_at ? new Date(item.updated_at) : null, isFirstRun);
+          const eventAt = item.updated_at || item.created_at;
+          if (!eventAt || new Date(eventAt) < twoMonthsAgo) continue;
+          await upsertActivity('message', item.title || 'New message',
+            item.message ? item.message.replace(/<[^>]+>/g, '').slice(0, 300) : null,
+            null, item.html_url || null, new Date(eventAt));
         }
       } catch (e) { /* silently ignore */ }
-    }
-
-    // --- Insignia unlocks — only if notif_achievements is enabled ---
-    if (prefs.notif_achievements) {
-      try {
-        const insigniaRes = await pool.query(
-          `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
-           WHERE iu.user_id=$1
-             AND NOT EXISTS (
-               SELECT 1 FROM notifications n
-               WHERE n.user_id=$1 AND n.type='insignia' AND n.title = '🎖️ ' || iu.label || ' Insignia Unlocked'
-             )`,
-          [userId]
-        );
-        for (const row of insigniaRes.rows) {
-          // Achievements are never pre-read — a user always wants to see a new tier as "New"
-          await pool.query(
-            `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-             VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',false,$3)`,
-            [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
-          );
-        }
-      } catch (e) { console.warn(`[ACTIVITY REFRESH] Insignia check failed for user ${userId}: ${e.message}`); }
-    }
-
-    // --- Badges — only if notif_achievements is enabled ---
-    if (prefs.notif_achievements) {
-      try {
-        const badgeRes = await pool.query(
-          `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
-           WHERE ub.user_id=$1
-             AND NOT EXISTS (
-               SELECT 1 FROM notifications n
-               WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '🏆 ' || REPLACE(ub.badge_key, '_', ' ') || '%'
-             )`,
-          [userId]
-        );
-        for (const row of badgeRes.rows) {
-          const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-          // Achievements are never pre-read
-          await pool.query(
-            `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-             VALUES ($1,'badge',$2,'You earned a new Gallery badge!',false,$3)`,
-            [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
-          );
-        }
-      } catch (e) { console.warn(`[ACTIVITY REFRESH] Badge check failed for user ${userId}: ${e.message}`); }
     }
 
   } catch (err) {
@@ -6563,54 +6598,11 @@ async function runActivityRefreshForUser(userId, canvasToken) {
   }
 }
 
-// Achievement-only refresh for users without Canvas tokens
-// Checks insignia_unlocks and user_badges and inserts missing notification rows
+// Achievement-only refresh — insignia/badge rows carry their own unread flag set
+// at insert time; no separate notifications table write needed any more.
 async function runAchievementNotificationsForUser(userId) {
-  try {
-    const prefsRes = await pool.query(
-      `SELECT notif_achievements FROM users WHERE id=$1`, [userId]
-    );
-    if (!prefsRes.rows[0]?.notif_achievements) return;
-
-    // Insignia
-    const insigniaRes = await pool.query(
-      `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
-       WHERE iu.user_id=$1
-         AND NOT EXISTS (
-           SELECT 1 FROM notifications n
-           WHERE n.user_id=$1 AND n.type='insignia' AND n.title = '🎖️ ' || iu.label || ' Insignia Unlocked'
-         )`,
-      [userId]
-    );
-    for (const row of insigniaRes.rows) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-         VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',false,$3)`,
-        [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
-      );
-    }
-
-    // Badges
-    const badgeRes = await pool.query(
-      `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
-       WHERE ub.user_id=$1
-         AND NOT EXISTS (
-           SELECT 1 FROM notifications n
-           WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '🏆 ' || REPLACE(ub.badge_key, '_', ' ') || '%'
-         )`,
-      [userId]
-    );
-    for (const row of badgeRes.rows) {
-      const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\w/g, c => c.toUpperCase());
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, body, read, created_at)
-         VALUES ($1,'badge',$2,'You earned a new Gallery badge!',false,$3)`,
-        [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
-      );
-    }
-  } catch (err) {
-    console.warn(`[ACHIEVEMENT NOTIF] User ${userId} failed: ${err.message}`);
-  }
+  // No-op: unread flags on insignia_unlocks and user_badges are set by
+  // /api/insignia/check-unlock and /api/badges/check at award time.
 }
 
 // Background job: stagger users at 2-second intervals to avoid hammering Canvas
@@ -6694,13 +6686,16 @@ app.post('/api/courses/custom', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/admin/reset-notifications — wipe all notifications so next refresh re-seeds cleanly
-// One-time use after the first-run bug. Marks all existing as read rather than deleting,
-// preserving the rows but clearing the unread badge.
+// POST /api/admin/reset-notifications — mark all unread items as read across all sources
 app.post('/api/admin/reset-notifications', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const r = await pool.query('UPDATE notifications SET read=true WHERE read=false');
-    res.json({ updated: r.rowCount });
+    const [g, i, b, c] = await Promise.all([
+      pool.query('UPDATE grade_history    SET unread=false WHERE unread=true'),
+      pool.query('UPDATE insignia_unlocks SET unread=false WHERE unread=true'),
+      pool.query('UPDATE user_badges      SET unread=false WHERE unread=true'),
+      pool.query('UPDATE canvas_activity  SET unread=false WHERE unread=true'),
+    ]);
+    res.json({ updated: g.rowCount + i.rowCount + b.rowCount + c.rowCount });
   } catch (err) {
     res.status(500).json({ error: 'Failed to reset notifications' });
   }
