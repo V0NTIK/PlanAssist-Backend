@@ -798,6 +798,118 @@ SET shield_date = (
 )::date;
 
 -- ============================================================================
+-- HPT USERS
+-- High Performing Team (teacher/staff) accounts. Separate from student users.
+-- Passcode is stored as bcrypt hash. Name is the teacher's display name.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_users (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    passcode_hash   VARCHAR(255) NOT NULL,          -- bcrypt hash of the teacher passcode
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_hpt_users_name ON hpt_users(name);
+
+
+-- ============================================================================
+-- HPT STUDIOS
+-- A Studio is a group of students that an HPT user monitors.
+-- setup_type: 'course' = derived live from courses.course_id
+--             'key'    = students join manually with a studio_key
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_studios (
+    id              SERIAL PRIMARY KEY,
+    studio_key      VARCHAR(20)  NOT NULL UNIQUE,   -- Short unique code (always set; auto-gen for both types)
+    setup_type      VARCHAR(10)  NOT NULL DEFAULT 'course'
+                        CHECK (setup_type IN ('course', 'key')),
+    course_id       BIGINT,                         -- Set for 'course' type; NULL for 'key' type
+    name            VARCHAR(255) NOT NULL,           -- Studio display name
+    color           VARCHAR(30)  NOT NULL DEFAULT '#7C3AED', -- Hex color for the studio card
+    zoom_number     TEXT,                            -- Optional zoom number
+    created_by      INTEGER NOT NULL REFERENCES hpt_users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE hpt_studios ADD COLUMN IF NOT EXISTS course_id   BIGINT;
+ALTER TABLE hpt_studios ADD COLUMN IF NOT EXISTS zoom_number TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_hpt_studios_course_id   ON hpt_studios(course_id);
+CREATE INDEX IF NOT EXISTS idx_hpt_studios_created_by  ON hpt_studios(created_by);
+CREATE INDEX IF NOT EXISTS idx_hpt_studios_studio_key  ON hpt_studios(studio_key);
+
+
+-- ============================================================================
+-- HPT STUDIO MEMBERS
+-- Explicit members for 'key'-type studios.
+-- 'course'-type studios derive members live from the courses table.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_studio_members (
+    id          SERIAL PRIMARY KEY,
+    studio_id   INTEGER NOT NULL REFERENCES hpt_studios(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(studio_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_studio ON hpt_studio_members(studio_id);
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_user   ON hpt_studio_members(user_id);
+
+
+-- ============================================================================
+-- HPT STUDIO SHARES
+-- HPT users that have been given shared access to a studio.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_studio_shares (
+    id          SERIAL PRIMARY KEY,
+    studio_id   INTEGER NOT NULL REFERENCES hpt_studios(id) ON DELETE CASCADE,
+    hpt_user_id INTEGER NOT NULL REFERENCES hpt_users(id) ON DELETE CASCADE,
+    shared_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(studio_id, hpt_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_shares_studio   ON hpt_studio_shares(studio_id);
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_shares_hpt_user ON hpt_studio_shares(hpt_user_id);
+
+
+-- ============================================================================
+-- HPT STUDIO BANNERS
+-- Dismissible banners posted by HPT users, shown to members on the Hub.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_studio_banners (
+    id          SERIAL PRIMARY KEY,
+    studio_id   INTEGER NOT NULL REFERENCES hpt_studios(id) ON DELETE CASCADE,
+    message     TEXT NOT NULL,
+    author_name VARCHAR(255) NOT NULL,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_banners_studio ON hpt_studio_banners(studio_id);
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_banners_active ON hpt_studio_banners(is_active);
+
+
+-- ============================================================================
+-- HPT STUDIO BANNER DISMISSALS
+-- Tracks which users have dismissed which studio banners.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS hpt_studio_banner_dismissals (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    banner_id   INTEGER NOT NULL REFERENCES hpt_studio_banners(id) ON DELETE CASCADE,
+    dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, banner_id)
+);
+
+
+-- ============================================================================
 -- GRADE HISTORY TABLE
 -- Stores all graded Canvas submissions for a user, keyed by (user_id, assignment_id).
 -- Populated by Grade Sync; persists historical grades regardless of task lifecycle.
