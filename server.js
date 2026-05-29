@@ -5858,11 +5858,19 @@ app.post('/api/studios/join', authenticateToken, async (req, res) => {
     try {
       const pref = await pool.query('SELECT notif_studios FROM users WHERE id=$1', [userId]);
       if (pref.rows[0]?.notif_studios !== false) {
-        await pool.query(
-          `INSERT INTO notifications (user_id, type, title, body)
-           VALUES ($1,'studio',$2,$3) ON CONFLICT DO NOTHING`,
-          [userId, `📚 Joined Studio: ${studio.name}`, 'You have been added to a new Studio in PlanAssist.']
+        // Dedup: one studio notification per studio (match by title)
+        const studioTitle = `📚 Joined Studio: ${studio.name}`;
+        const studioDedup = await pool.query(
+          `SELECT 1 FROM notifications WHERE user_id=$1 AND type='studio' AND title=$2`,
+          [userId, studioTitle]
         );
+        if (studioDedup.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO notifications (user_id, type, title, body)
+             VALUES ($1,'studio',$2,$3)`,
+            [userId, studioTitle, 'You have been added to a new Studio in PlanAssist.']
+          );
+        }
       }
     } catch (e) { /* non-fatal */ }
     res.json({ success: true, studioName: studio.name });
@@ -6235,13 +6243,13 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
 // NOTIFICATIONS
 // ============================================================================
 
-// GET /api/notifications — fetch user's notifications (last 100, newest first)
+// GET /api/notifications — fetch user's notifications (last 100, newest first by event time)
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, type, title, body, link_url, read, created_at
        FROM notifications WHERE user_id=$1
-       ORDER BY created_at DESC LIMIT 100`,
+       ORDER BY created_at DESC, id DESC LIMIT 100`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -6334,11 +6342,22 @@ async function runActivityRefreshForUser(userId, canvasToken) {
     const isFirstRun = existingCount.rows.length === 0;
 
     const insertNotif = async (type, title, body, link_url, createdAt = null, markRead = false) => {
-      // Dedup: skip if identical notification in last hour
-      const dedup = await pool.query(
-        `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND title=$3 AND created_at > NOW()-INTERVAL '1 hour'`,
-        [userId, type, title]
-      );
+      // Dedup: if a link_url is present (grades, announcements, discussions, messages),
+      // deduplicate by (user_id, type, link_url) — each Canvas item has a unique URL,
+      // so this correctly allows regrades when the score changes without duplicate rows.
+      // If no link_url (insignia, badge, studio), fall back to exact title match.
+      let dedup;
+      if (link_url) {
+        dedup = await pool.query(
+          `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND link_url=$3`,
+          [userId, type, link_url]
+        );
+      } else {
+        dedup = await pool.query(
+          `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND title=$3`,
+          [userId, type, title]
+        );
+      }
       if (dedup.rows.length > 0) return;
       await pool.query(
         `INSERT INTO notifications (user_id, type, title, body, link_url, read, created_at)
@@ -6370,7 +6389,27 @@ async function runActivityRefreshForUser(userId, canvasToken) {
             // Use submitted_at as created_at so notifications sort chronologically.
             // On first run, mark all as read so they don't flood as unread.
             const notifDate = sub.submitted_at ? new Date(sub.submitted_at) : new Date();
-            await insertNotif('grade', title, body, assignment.html_url || null, notifDate, isFirstRun);
+            const gradeUrl = assignment.html_url || null;
+            if (gradeUrl && !isFirstRun) {
+              // For regrades: if the notification already exists but body changed (score updated),
+              // update it in place and flip it back to unread so the student sees the change.
+              const existing = await pool.query(
+                `SELECT id, body FROM notifications WHERE user_id=$1 AND type='grade' AND link_url=$2`,
+                [userId, gradeUrl]
+              );
+              if (existing.rows.length > 0) {
+                if (existing.rows[0].body !== body) {
+                  await pool.query(
+                    `UPDATE notifications SET body=$1, read=false, created_at=$2 WHERE id=$3`,
+                    [body, notifDate, existing.rows[0].id]
+                  );
+                }
+              } else {
+                await insertNotif('grade', title, body, gradeUrl, notifDate, false);
+              }
+            } else {
+              await insertNotif('grade', title, body, gradeUrl, notifDate, isFirstRun);
+            }
 
             // Also upsert into grade_history (date-restricted)
             await pool.query(
@@ -6395,13 +6434,21 @@ async function runActivityRefreshForUser(userId, canvasToken) {
     // --- Announcements (if enabled) ---
     if (prefs.notif_announcements) {
       try {
-        const annRes = await axios.get(
-          `${CANVAS_API_BASE}/announcements?per_page=10`,
-          { headers, timeout: 8000 }
-        ).catch(() => ({ data: [] }));
-        for (const ann of (annRes.data || [])) {
-          if (!ann.posted_at || new Date(ann.posted_at) < twoMonthsAgo) continue;
-          await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null, ann.posted_at ? new Date(ann.posted_at) : null, isFirstRun);
+        // Fetch course-specific announcements using context_codes so we get real course announcements
+        const annCoursesRes = await pool.query(
+          'SELECT DISTINCT course_id FROM courses WHERE user_id=$1 AND enabled=true AND course_id IS NOT NULL', [userId]
+        );
+        const annCourseIds = annCoursesRes.rows.map(r => r.course_id);
+        if (annCourseIds.length > 0) {
+          const contextCodes = annCourseIds.map(cid => `context_codes[]=course_${cid}`).join('&');
+          const annRes = await axios.get(
+            `${CANVAS_API_BASE}/announcements?${contextCodes}&per_page=20`,
+            { headers, timeout: 10000 }
+          ).catch(() => ({ data: [] }));
+          for (const ann of (annRes.data || [])) {
+            if (!ann.posted_at || new Date(ann.posted_at) < twoMonthsAgo) continue;
+            await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null, ann.posted_at ? new Date(ann.posted_at) : null, isFirstRun);
+          }
         }
       } catch (e) { /* silently ignore */ }
     }
@@ -6418,9 +6465,31 @@ async function runActivityRefreshForUser(userId, canvasToken) {
             { headers, timeout: 8000 }
           ).catch(() => ({ data: [] }));
           for (const disc of (discRes.data || [])) {
-            if (!disc.last_reply_at || new Date(disc.last_reply_at) < twoMonthsAgo) continue;
+            const discEventTime = disc.last_reply_at || disc.posted_at || disc.created_at;
+            if (!discEventTime || new Date(discEventTime) < twoMonthsAgo) continue;
             const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id])).rows[0]?.name || '';
-            await insertNotif('discussion', disc.title || 'Discussion', courseName || null, disc.html_url || null, disc.last_reply_at ? new Date(disc.last_reply_at) : null, isFirstRun);
+            const discUrl = disc.html_url || null;
+            const discTime = new Date(discEventTime);
+            if (discUrl && !isFirstRun) {
+              // If existing notification is older than the latest reply, update it and flip unread
+              const existingDisc = await pool.query(
+                `SELECT id, created_at FROM notifications WHERE user_id=$1 AND type='discussion' AND link_url=$2`,
+                [userId, discUrl]
+              );
+              if (existingDisc.rows.length > 0) {
+                const storedTime = new Date(existingDisc.rows[0].created_at);
+                if (disc.last_reply_at && discTime > storedTime) {
+                  await pool.query(
+                    `UPDATE notifications SET created_at=$1, read=false WHERE id=$2`,
+                    [discTime, existingDisc.rows[0].id]
+                  );
+                }
+              } else {
+                await insertNotif('discussion', disc.title || 'Discussion', courseName || null, discUrl, discTime, false);
+              }
+            } else {
+              await insertNotif('discussion', disc.title || 'Discussion', courseName || null, discUrl, discTime, isFirstRun);
+            }
           }
         }
       } catch (e) { /* silently ignore */ }
