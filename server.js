@@ -6361,7 +6361,8 @@ async function runActivityRefreshForUser(userId, canvasToken) {
       if (dedup.rows.length > 0) return;
       await pool.query(
         `INSERT INTO notifications (user_id, type, title, body, link_url, read, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (user_id, type, link_url) WHERE link_url IS NOT NULL DO NOTHING`,
         [userId, type, title, body || null, link_url || null, markRead, createdAt || new Date()]
       );
     };
