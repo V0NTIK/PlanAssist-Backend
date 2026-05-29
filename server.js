@@ -6849,8 +6849,136 @@ async function runGlobalActivityRefresh() {
 // Run every 15 minutes
 setInterval(runGlobalActivityRefresh, 15 * 60 * 1000);
 
-// POST /api/activity/refresh — triggered on login and Activity pane open
-// Runs refresh for the requesting user only (immediate, not staggered)
+// GET /api/activity/data — returns all Activity pane data from the DB in one call.
+// The Activity Refresh (POST /activity/refresh) is run first to populate these tables;
+// this endpoint just reads them back for rendering. No live Canvas calls here.
+// Tabs: grades, announcements, discussions, messages, achievements (insignia+badges), studios
+app.get('/api/activity/data', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const twoMonthsAgo = new Date();
+    twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+
+    const [gradesR, announcementsR, discussionsR, messagesR, insigniaR, badgesR, studiosR] = await Promise.all([
+      // Grades — from grade_history, sorted by graded_at DESC
+      pool.query(
+        `SELECT id, course_id, assignment_id, title, course_name, html_url,
+                score, points_possible, grade, grading_type,
+                submitted_at, graded_at, synced_at, unread
+         FROM grade_history
+         WHERE user_id = $1
+           AND (graded_at IS NULL OR graded_at >= $2)
+         ORDER BY COALESCE(graded_at, submitted_at) DESC NULLS LAST, id DESC
+         LIMIT 100`,
+        [userId, twoMonthsAgo.toISOString()]
+      ),
+      // Announcements — from canvas_activity
+      pool.query(
+        `SELECT id, title, body, course_name, link_url, event_at, unread
+         FROM canvas_activity
+         WHERE user_id = $1 AND type = 'announcement'
+           AND event_at >= $2
+         ORDER BY event_at DESC
+         LIMIT 50`,
+        [userId, twoMonthsAgo.toISOString()]
+      ),
+      // Discussions — from canvas_activity
+      pool.query(
+        `SELECT id, title, body, course_name, link_url, event_at, unread
+         FROM canvas_activity
+         WHERE user_id = $1 AND type = 'discussion'
+           AND event_at >= $2
+         ORDER BY event_at DESC
+         LIMIT 50`,
+        [userId, twoMonthsAgo.toISOString()]
+      ),
+      // Messages — from canvas_activity
+      pool.query(
+        `SELECT id, title, body, course_name, link_url, event_at, unread
+         FROM canvas_activity
+         WHERE user_id = $1 AND type = 'message'
+           AND event_at >= $2
+         ORDER BY event_at DESC
+         LIMIT 50`,
+        [userId, twoMonthsAgo.toISOString()]
+      ),
+      // Insignia unlocks
+      pool.query(
+        `SELECT id, label, unlocked_at, unread
+         FROM insignia_unlocks
+         WHERE user_id = $1
+         ORDER BY unlocked_at ASC`,
+        [userId]
+      ),
+      // Badges
+      pool.query(
+        `SELECT id, badge_key, awarded_at, unread
+         FROM user_badges
+         WHERE user_id = $1
+         ORDER BY awarded_at ASC`,
+        [userId]
+      ),
+      // Studios this user is a member of
+      pool.query(
+        `SELECT s.id, s.name, s.color, s.setup_type,
+                (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name,
+                sm.joined_at
+         FROM hpt_studio_members sm
+         JOIN hpt_studios s ON s.id = sm.studio_id
+         WHERE sm.user_id = $1
+         UNION
+         SELECT DISTINCT s.id, s.name, s.color, s.setup_type,
+                (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name,
+                c.updated_at AS joined_at
+         FROM hpt_studios s
+         JOIN courses c ON c.course_id = s.course_id AND c.user_id = $1
+         WHERE s.setup_type = 'course'
+         ORDER BY joined_at DESC NULLS LAST`,
+        [userId]
+      ),
+    ]);
+
+    res.json({
+      grades:        gradesR.rows.map(g => ({
+        id: g.id,
+        assignmentId:   g.assignment_id,
+        assignmentName: g.title,
+        courseName:     g.course_name,
+        score:          g.score != null ? parseFloat(g.score) : null,
+        pointsPossible: g.points_possible != null ? parseFloat(g.points_possible) : null,
+        grade:          g.grade,
+        gradingType:    g.grading_type || 'points',
+        gradedAt:       g.graded_at || g.submitted_at,
+        htmlUrl:        g.html_url,
+        unread:         g.unread,
+      })),
+      announcements: announcementsR.rows.map(a => ({
+        id: a.id, title: a.title, body: a.body,
+        courseName: a.course_name, htmlUrl: a.link_url,
+        postedAt: a.event_at, unread: a.unread,
+      })),
+      discussions:   discussionsR.rows.map(d => ({
+        id: d.id, title: d.title, body: d.body,
+        courseName: d.course_name, htmlUrl: d.link_url,
+        lastReplyAt: d.event_at, unread: d.unread,
+      })),
+      messages:      messagesR.rows.map(m => ({
+        id: m.id, title: m.title, body: m.body,
+        htmlUrl: m.link_url, updatedAt: m.event_at, unread: m.unread,
+      })),
+      insignia:      insigniaR.rows,
+      badges:        badgesR.rows,
+      studios:       studiosR.rows,
+    });
+  } catch (err) {
+    console.error('[ACTIVITY DATA]', err.message);
+    res.status(500).json({ error: 'Failed to load activity data' });
+  }
+});
+
+// POST /api/activity/refresh — triggered on login and Activity pane open.
+// Runs a full refresh for the requesting user and WAITS until done before responding,
+// so the frontend can await it and only show the Hub once data is ready.
 app.post('/api/activity/refresh', authenticateToken, async (req, res) => {
   try {
     const userRes = await pool.query(
@@ -6858,15 +6986,17 @@ app.post('/api/activity/refresh', authenticateToken, async (req, res) => {
     );
     const token = getDecryptedCanvasToken(req.user.id, userRes.rows[0]);
     if (token) {
-      // Full Canvas refresh (grades, announcements, discussions, messages, achievements)
-      runActivityRefreshForUser(req.user.id, token).catch(e => console.warn('[ACTIVITY REFRESH]', e.message));
+      // Await the full Canvas refresh — grades, announcements, discussions, messages
+      await runActivityRefreshForUser(req.user.id, token);
     } else {
-      // No Canvas token — still check for new achievement notifications
-      runAchievementNotificationsForUser(req.user.id).catch(e => console.warn('[ACHIEVEMENT NOTIF]', e.message));
+      // No Canvas token — achievements only (no-op in new architecture)
+      await runAchievementNotificationsForUser(req.user.id);
     }
-    res.json({ started: true });
+    res.json({ done: true });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to start refresh' });
+    // Never 500 — a failed refresh should not block login
+    console.warn('[ACTIVITY REFRESH]', err.message);
+    res.json({ done: true, warning: err.message });
   }
 });
 
