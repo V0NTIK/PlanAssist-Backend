@@ -6256,6 +6256,17 @@ app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
 });
 
+// PATCH /api/notifications/:id/read — mark a single notification as read
+app.patch('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE notifications SET read=true WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
+});
+
 // GET /api/notifications/unread-count
 app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
   try {
@@ -6305,15 +6316,24 @@ async function runActivityRefreshForUser(userId, canvasToken) {
     const twoMonthsAgo = new Date();
     twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
 
-    // Fetch user preferences
+    // Fetch user preferences — include notif_achievements
     const prefsRes = await pool.query(
-      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages, name
+      `SELECT notif_grades, notif_announcements, notif_discussions, notif_messages, notif_achievements, name
        FROM users WHERE id=$1`, [userId]
     );
     if (!prefsRes.rows[0]) return;
     const prefs = prefsRes.rows[0];
 
-    const insertNotif = async (type, title, body, link_url) => {
+    // First-run guard: if the notifications table is empty for this user,
+    // treat all existing grades as already-seen by marking them with a
+    // pre-read notification dated to their submitted_at. This prevents a
+    // flood of historical notifications on first load.
+    const existingCount = await pool.query(
+      'SELECT 1 FROM notifications WHERE user_id=$1 LIMIT 1', [userId]
+    );
+    const isFirstRun = existingCount.rows.length === 0;
+
+    const insertNotif = async (type, title, body, link_url, createdAt = null, markRead = false) => {
       // Dedup: skip if identical notification in last hour
       const dedup = await pool.query(
         `SELECT 1 FROM notifications WHERE user_id=$1 AND type=$2 AND title=$3 AND created_at > NOW()-INTERVAL '1 hour'`,
@@ -6321,8 +6341,9 @@ async function runActivityRefreshForUser(userId, canvasToken) {
       );
       if (dedup.rows.length > 0) return;
       await pool.query(
-        `INSERT INTO notifications (user_id, type, title, body, link_url) VALUES ($1,$2,$3,$4,$5)`,
-        [userId, type, title, body || null, link_url || null]
+        `INSERT INTO notifications (user_id, type, title, body, link_url, read, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [userId, type, title, body || null, link_url || null, markRead, createdAt || new Date()]
       );
     };
 
@@ -6346,7 +6367,10 @@ async function runActivityRefreshForUser(userId, canvasToken) {
             const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, cid])).rows[0]?.name || '';
             const pct = assignment.points_possible > 0 ? Math.round((sub.score / assignment.points_possible) * 100) : null;
             const body = [courseName, pct != null ? `${pct}%` : sub.grade].filter(Boolean).join(' · ');
-            await insertNotif('grade', title, body, assignment.html_url || null);
+            // Use submitted_at as created_at so notifications sort chronologically.
+            // On first run, mark all as read so they don't flood as unread.
+            const notifDate = sub.submitted_at ? new Date(sub.submitted_at) : new Date();
+            await insertNotif('grade', title, body, assignment.html_url || null, notifDate, isFirstRun);
 
             // Also upsert into grade_history (date-restricted)
             await pool.query(
@@ -6377,7 +6401,7 @@ async function runActivityRefreshForUser(userId, canvasToken) {
         ).catch(() => ({ data: [] }));
         for (const ann of (annRes.data || [])) {
           if (!ann.posted_at || new Date(ann.posted_at) < twoMonthsAgo) continue;
-          await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null);
+          await insertNotif('announcement', ann.title || 'Announcement', ann.context_name || null, ann.html_url || null, ann.posted_at ? new Date(ann.posted_at) : null, isFirstRun);
         }
       } catch (e) { /* silently ignore */ }
     }
@@ -6396,7 +6420,7 @@ async function runActivityRefreshForUser(userId, canvasToken) {
           for (const disc of (discRes.data || [])) {
             if (!disc.last_reply_at || new Date(disc.last_reply_at) < twoMonthsAgo) continue;
             const courseName = (await pool.query('SELECT name FROM courses WHERE user_id=$1 AND course_id=$2 LIMIT 1', [userId, course_id])).rows[0]?.name || '';
-            await insertNotif('discussion', disc.title || 'Discussion', courseName || null, disc.html_url || null);
+            await insertNotif('discussion', disc.title || 'Discussion', courseName || null, disc.html_url || null, disc.last_reply_at ? new Date(disc.last_reply_at) : null, isFirstRun);
           }
         }
       } catch (e) { /* silently ignore */ }
@@ -6412,51 +6436,55 @@ async function runActivityRefreshForUser(userId, canvasToken) {
         for (const item of (actRes.data || [])) {
           if (item.type !== 'Message' && item.type !== 'Conversation') continue;
           if (!item.updated_at || new Date(item.updated_at) < twoMonthsAgo) continue;
-          await insertNotif('message', item.title || 'New message', item.message || null, item.html_url || null);
+          await insertNotif('message', item.title || 'New message', item.message || null, item.html_url || null, item.updated_at ? new Date(item.updated_at) : null, isFirstRun);
         }
       } catch (e) { /* silently ignore */ }
     }
 
-    // --- Insignia unlocks (check insignia_unlocks for records without a notification) ---
-    try {
-      const insigniaRes = await pool.query(
-        `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
-         WHERE iu.user_id=$1
-           AND NOT EXISTS (
-             SELECT 1 FROM notifications n WHERE n.user_id=$1 AND n.type='insignia' AND n.title ILIKE '%' || iu.label || '%'
-           )`,
-        [userId]
-      );
-      for (const row of insigniaRes.rows) {
-        await pool.query(
-          `INSERT INTO notifications (user_id, type, title, body, created_at)
-           VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',$3)
-           ON CONFLICT DO NOTHING`,
-          [userId, `🎖️ ${row.label} Insignia Unlocked`, row.unlocked_at || new Date()]
+    // --- Insignia unlocks — only if notif_achievements is enabled ---
+    if (prefs.notif_achievements) {
+      try {
+        const insigniaRes = await pool.query(
+          `SELECT iu.label, iu.unlocked_at FROM insignia_unlocks iu
+           WHERE iu.user_id=$1
+             AND NOT EXISTS (
+               SELECT 1 FROM notifications n
+               WHERE n.user_id=$1 AND n.type='insignia' AND n.title ILIKE '%' || iu.label || '%'
+             )`,
+          [userId]
         );
-      }
-    } catch (e) { /* silently ignore */ }
+        for (const row of insigniaRes.rows) {
+          await pool.query(
+            `INSERT INTO notifications (user_id, type, title, body, read, created_at)
+             VALUES ($1,'insignia',$2,'You unlocked a new Insignia tier!',$3,$4)`,
+            [userId, `🎖️ ${row.label} Insignia Unlocked`, isFirstRun, row.unlocked_at || new Date()]
+          );
+        }
+      } catch (e) { /* silently ignore */ }
+    }
 
-    // --- Badges (check user_badges for records without a notification) ---
-    try {
-      const badgeRes = await pool.query(
-        `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
-         WHERE ub.user_id=$1
-           AND NOT EXISTS (
-             SELECT 1 FROM notifications n WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '%' || ub.badge_key || '%'
-           )`,
-        [userId]
-      );
-      for (const row of badgeRes.rows) {
-        const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        await pool.query(
-          `INSERT INTO notifications (user_id, type, title, body, created_at)
-           VALUES ($1,'badge',$2,'You earned a new Gallery badge!',$3)
-           ON CONFLICT DO NOTHING`,
-          [userId, `🏆 ${friendlyKey} Badge Earned`, row.awarded_at || new Date()]
+    // --- Badges — only if notif_achievements is enabled ---
+    if (prefs.notif_achievements) {
+      try {
+        const badgeRes = await pool.query(
+          `SELECT ub.badge_key, ub.awarded_at FROM user_badges ub
+           WHERE ub.user_id=$1
+             AND NOT EXISTS (
+               SELECT 1 FROM notifications n
+               WHERE n.user_id=$1 AND n.type='badge' AND n.title ILIKE '%' || ub.badge_key || '%'
+             )`,
+          [userId]
         );
-      }
-    } catch (e) { /* silently ignore */ }
+        for (const row of badgeRes.rows) {
+          const friendlyKey = row.badge_key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+          await pool.query(
+            `INSERT INTO notifications (user_id, type, title, body, read, created_at)
+             VALUES ($1,'badge',$2,'You earned a new Gallery badge!',$3,$4)`,
+            [userId, `🏆 ${friendlyKey} Badge Earned`, isFirstRun, row.awarded_at || new Date()]
+          );
+        }
+      } catch (e) { /* silently ignore */ }
+    }
 
   } catch (err) {
     console.warn(`[ACTIVITY REFRESH] User ${userId} failed: ${err.message}`);
@@ -6526,6 +6554,18 @@ app.post('/api/courses/custom', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Custom course create error:', err.message);
     res.status(500).json({ error: 'Failed to create course' });
+  }
+});
+
+// POST /api/admin/reset-notifications — wipe all notifications so next refresh re-seeds cleanly
+// One-time use after the first-run bug. Marks all existing as read rather than deleting,
+// preserving the rows but clearing the unread badge.
+app.post('/api/admin/reset-notifications', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('UPDATE notifications SET read=true WHERE read=false');
+    res.json({ updated: r.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reset notifications' });
   }
 });
 
