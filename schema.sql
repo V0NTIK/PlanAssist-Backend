@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS users (
     streak_shields_available    INTEGER         DEFAULT 0,
     streak_shield_mode          VARCHAR(10)     DEFAULT 'manual'
                                     CHECK (streak_shield_mode IN ('manual', 'automatic')),
+    -- Credits currency
+    credits                     INTEGER         NOT NULL DEFAULT 0,
+    last_daily_chest            DATE,           -- Date (user local) of last chest claim — YYYY-MM-DD
     -- Campus & period offsets (replaces present_periods)
     campus                      VARCHAR(50)     DEFAULT 'Ashland',
     tz_periods                  VARCHAR(10)     DEFAULT '2-6',      -- Present periods
@@ -73,6 +76,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_days              INTEGER   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_selected          VARCHAR(30)  DEFAULT 'Default';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER      DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS credits                    INTEGER      NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_chest           DATE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
@@ -494,11 +499,12 @@ CREATE INDEX IF NOT EXISTS idx_completion_feed_user_id      ON completion_feed(u
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS feed_reactions (
-    id              SERIAL PRIMARY KEY,
-    feed_entry_id   INTEGER NOT NULL REFERENCES completion_feed(id) ON DELETE CASCADE,
-    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    emoji           VARCHAR(10) NOT NULL,
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id                       SERIAL PRIMARY KEY,
+    feed_entry_id            INTEGER NOT NULL REFERENCES completion_feed(id) ON DELETE CASCADE,
+    user_id                  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji                    VARCHAR(10) NOT NULL,
+    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    credits_claimed          BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE once the entry owner claimed credits
     UNIQUE(feed_entry_id, user_id)
 );
 
@@ -517,6 +523,7 @@ CREATE TABLE IF NOT EXISTS weekly_leaderboard (
     user_name       VARCHAR(255) NOT NULL,
     grade           VARCHAR(50) NOT NULL,
     tasks_completed INTEGER DEFAULT 0,
+    spins_taken     INTEGER NOT NULL DEFAULT 0, -- spins used from this week's entry
     week_start      DATE NOT NULL,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, week_start)
@@ -722,12 +729,13 @@ SET insignia_days = (
 )
 WHERE u.insignia_days = 0;
 
--- Backfill insignia_unlocks for all users from their current insignia_days
+-- Backfill insignia_unlocks for all users from their current insignia_days (new tier set)
 DO $$
 DECLARE
-    tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 75, 100];
-    tier_labels     TEXT[] := ARRAY['Default','Copper','Silver','Gold','Emerald',
-                                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter'];
+    tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    tier_labels     TEXT[] := ARRAY['Default','Bronze','Silver','Gold','Platinum',
+                                    'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+                                    'Obsidian','Diamond','Antimatter'];
     rec RECORD;
     i   INT;
 BEGIN
@@ -742,20 +750,30 @@ BEGIN
     END LOOP;
 END $$;
 
--- Remove any stale insignia_unlocks rows with old or invalid tier names
+-- Remove stale rows for old tier names (replaced by new tier set)
 DELETE FROM insignia_unlocks
-WHERE label NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                    'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
+WHERE label NOT IN ('Default','Bronze','Silver','Gold','Platinum',
+                    'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+                    'Obsidian','Diamond','Antimatter',
+                    -- purchased insignias
+                    'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
+                    'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core');
 
--- Rename Aether → Antimatter in both tables (label was renamed in a prior release)
+-- Rename old earned Aether → Antimatter (Aether is now a purchased insignia name)
+-- Any existing Aether rows are from the old earned tier and should become Antimatter.
 UPDATE insignia_unlocks SET label = 'Antimatter' WHERE label = 'Aether';
 UPDATE users SET insignia_selected = 'Antimatter' WHERE insignia_selected = 'Aether';
 
--- Reset any invalid insignia_selected values to Default (catches 'completed' and other garbage)
+-- Reset any remaining invalid insignia_selected values to Default
 UPDATE users
 SET insignia_selected = 'Default'
-WHERE insignia_selected NOT IN ('Default','Copper','Silver','Gold','Emerald',
-                                'Amethyst','Ruby','Diamond','Obsidian','Antimatter');
+WHERE insignia_selected NOT IN (
+  'Default','Bronze','Silver','Gold','Platinum',
+  'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+  'Obsidian','Diamond','Antimatter',
+  'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
+  'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'
+);
 
 -- Backfill first_completion gallery badge
 INSERT INTO user_badges (user_id, badge_key, awarded_at)
@@ -1019,3 +1037,43 @@ CREATE INDEX IF NOT EXISTS idx_canvas_activity_unread    ON canvas_activity(user
 -- DROP is safe to re-run (IF EXISTS).  CASCADE removes dependent indexes.
 -- ============================================================================
 DROP TABLE IF EXISTS notifications CASCADE;
+
+-- ============================================================================
+-- CREDITS SYSTEM
+-- ============================================================================
+
+-- ALTER TABLE migrations for live DB (no-ops if columns already exist)
+ALTER TABLE users             ADD COLUMN IF NOT EXISTS credits          INTEGER  NOT NULL DEFAULT 0;
+ALTER TABLE users             ADD COLUMN IF NOT EXISTS last_daily_chest DATE;
+ALTER TABLE weekly_leaderboard ADD COLUMN IF NOT EXISTS spins_taken     INTEGER  NOT NULL DEFAULT 0;
+ALTER TABLE feed_reactions    ADD COLUMN IF NOT EXISTS credits_claimed  BOOLEAN  NOT NULL DEFAULT FALSE;
+
+-- ============================================================================
+-- INSIGNIA SHOP
+-- Purchased insignias. One row per available insignia for sale.
+-- Users unlock a purchased insignia when a row exists in insignia_unlocks
+-- for them with the matching label (inserted by the purchase endpoint).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS insignia_shop (
+    id          SERIAL PRIMARY KEY,
+    label       VARCHAR(50) NOT NULL UNIQUE,
+    cost        INTEGER NOT NULL,            -- credit cost
+    description TEXT,
+    sort_order  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Seed the shop (INSERT … ON CONFLICT DO NOTHING is safe to re-run)
+INSERT INTO insignia_shop (label, cost, description, sort_order) VALUES
+  ('Meteorite',       1000, 'Dark brown with pulsing orange ember spots.',                      1),
+  ('Dragonbone',      1000, 'Fades from white to pitch black and back, with a subtle jitter.',  2),
+  ('Celestium',       1500, 'Shifts between red, purple, and blue with a pulsing ripple.',      3),
+  ('Aether',          1500, 'Violent lightning-like purple lines flash across a purple base.',  4),
+  ('Soulstone',       1500, 'Tan and brown letters that each teeters uniquely.',                5),
+  ('Starlight',       1500, 'Letters blink and shake against pure black.',                      6),
+  ('Astral Crystal',  2000, 'Opaque white letters that randomly glitch and vanish.',            7),
+  ('Dark Matter',     2000, 'All-black letters that jitter violently and drift from side to side.', 8),
+  ('Neutronium',      2500, 'Glowing neon green with a violent shutter effect.',                9),
+  ('Singularity Core',2500, 'White and cyan letters with purple flames rising from each one.', 10)
+ON CONFLICT (label) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_insignia_shop_sort ON insignia_shop(sort_order);
