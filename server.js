@@ -6267,7 +6267,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
       }
     }
 
-    const userIds = [...allUserIds];
+    const userIds = [...allUserIds].map(Number); // ensure integer array for pg ANY($1) queries
     if (userIds.length === 0) {
       return res.json({
         stats: { tasksToday: 0, tasksWeek: 0, totalStudyMins: 0, accuracy: 0, streak: 0 },
@@ -6287,7 +6287,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     // Today completions
     const todayR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM tasks_completed
-       WHERE user_id = ANY($1) AND completed_at::date = $2`,
+       WHERE user_id = ANY($1::int[]) AND completed_at::date = $2`,
       [userIds, todayStr]
     );
     const tasksToday = parseInt(todayR.rows[0].cnt);
@@ -6295,7 +6295,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     // This week completions
     const weekR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM tasks_completed
-       WHERE user_id = ANY($1) AND completed_at >= $2`,
+       WHERE user_id = ANY($1::int[]) AND completed_at >= $2`,
       [userIds, weekStart.toISOString()]
     );
     const tasksWeek = parseInt(weekR.rows[0].cnt);
@@ -6303,7 +6303,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     // Total study time (all time, minutes)
     const timeR = await pool.query(
       `SELECT COALESCE(SUM(actual_time), 0) AS total_mins FROM tasks_completed
-       WHERE user_id = ANY($1) AND actual_time IS NOT NULL`,
+       WHERE user_id = ANY($1::int[]) AND actual_time IS NOT NULL`,
       [userIds]
     );
     const totalStudyMins = parseInt(timeR.rows[0].total_mins);
@@ -6311,7 +6311,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     // Accuracy: avg(min(est/actual, actual/est)) across tasks with both values
     const accR = await pool.query(
       `SELECT estimated_time, actual_time FROM tasks_completed
-       WHERE user_id = ANY($1)
+       WHERE user_id = ANY($1::int[])
          AND estimated_time > 0 AND actual_time > 0`,
       [userIds]
     );
@@ -6329,7 +6329,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     const compDatesR = await pool.query(
       `SELECT DISTINCT completed_at::date AS day
        FROM tasks_completed
-       WHERE user_id = ANY($1)
+       WHERE user_id = ANY($1::int[])
        ORDER BY day ASC`,
       [userIds]
     );
@@ -6343,7 +6343,6 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     };
 
     let streak = 0;
-    // Anchor: if today (weekday) has a completion use it; else use prev weekday
     let anchor = isWeekend(todayStr) ? prevWD(todayStr) : (compDateSet.has(todayStr) ? todayStr : prevWD(todayStr));
     if (compDateSet.has(anchor)) {
       let cur = anchor;
@@ -6354,11 +6353,9 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     }
 
     // ── Step 3: In Progress ───────────────────────────────────────────────────
-    // Uses COALESCE for inactive so the query works on DBs that don't yet have
-    // the column (e.g. before the schema migration has been applied).
     const inProgressR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM tasks
-       WHERE user_id = ANY($1)
+       WHERE user_id = ANY($1::int[])
          AND completed = false AND deleted = false
          AND accumulated_time > 0`,
       [userIds]
@@ -6371,7 +6368,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
               cf.completed_at, cf.insignia
        FROM completion_feed cf
        JOIN users u ON cf.user_id = u.id
-       WHERE cf.user_id = ANY($1)
+       WHERE cf.user_id = ANY($1::int[])
          AND u.show_in_feed = true
          AND cf.completed_at > NOW() - INTERVAL '7 days'
        ORDER BY cf.completed_at DESC
@@ -6385,15 +6382,14 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
               u.insignia_selected AS insignia
        FROM weekly_leaderboard wl
        JOIN users u ON u.id = wl.user_id
-       WHERE wl.user_id = ANY($1)
+       WHERE wl.user_id = ANY($1::int[])
          AND wl.week_start = DATE_TRUNC('week', CURRENT_DATE)::date
        ORDER BY wl.tasks_completed DESC, wl.user_name ASC
        LIMIT 20`,
       [userIds]
     );
 
-    // ── Step 6: Goal Snapshot — pick a random student with at least one goal ──
-    // Fetch goals + courses for all connected users, then pick one randomly
+    // ── Step 6: Goal Snapshot ──────────────────────────────────────────────────
     let goalSnapshot = null;
     const goalsR = await pool.query(
       `SELECT ug.user_id, ug.course_id, ug.target_score,
@@ -6403,7 +6399,7 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
        FROM user_goals ug
        JOIN courses c ON c.user_id = ug.user_id AND c.course_id = ug.course_id
        JOIN users u ON u.id = ug.user_id
-       WHERE ug.user_id = ANY($1)
+       WHERE ug.user_id = ANY($1::int[])
          AND c.current_period_score IS NOT NULL
          AND c.enabled = true
        ORDER BY RANDOM()
@@ -6411,7 +6407,6 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
       [userIds]
     );
     if (goalsR.rows.length > 0) {
-      // Pick a deterministic-random entry (rotates every 5 minutes)
       const idx = Math.floor(Date.now() / 1000 / 60 / 5) % goalsR.rows.length;
       goalSnapshot = goalsR.rows[idx];
     }
@@ -6425,8 +6420,8 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
       studentCount: userIds.length,
     });
   } catch (err) {
-    console.error('[HPT HUB]', err.message);
-    res.status(500).json({ error: 'Failed to load hub data' });
+    console.error('[HPT HUB] error:', err.message, err.stack?.split('\n')[1]);
+    res.status(500).json({ error: 'Failed to load hub data', details: err.message });
   }
 });
 
