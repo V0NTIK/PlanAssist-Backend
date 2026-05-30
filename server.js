@@ -2332,8 +2332,11 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         const nowCompleted = t.completed === true;
         const completionFlip = !wasCompleted && nowCompleted;
 
-        // Detect grade change
-        const scoreChanged = t.currentScore != null && String(t.currentScore) !== String(existing.current_score);
+        // Detect grade change — compare as floats to avoid false positives from
+        // DB returning "50.00" (NUMERIC string) while Canvas sends 50 (JS number).
+        const existingScore = existing.current_score != null ? parseFloat(existing.current_score) : null;
+        const incomingScore = t.currentScore != null ? parseFloat(t.currentScore) : null;
+        const scoreChanged = incomingScore != null && incomingScore !== existingScore;
         const gradeChanged = t.currentGrade != null && t.currentGrade !== existing.current_grade;
         const gradeFlipped = (scoreChanged || gradeChanged) && !existing.segment;
         let gradeIdToUse = existing.grade_id;
@@ -2602,7 +2605,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 existingTask.title !== incomingTask.title ||
                 existingTask.class !== incomingTask.class ||
                 (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
-                String(existingTask.current_score ?? '') !== String(incomingTask.currentScore ?? '') ||
+                (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null) !== (incomingTask.currentScore != null ? parseFloat(incomingTask.currentScore) : null) ||
                 (existingTask.current_grade ?? null) !== (incomingTask.currentGrade ?? null) ||
                 (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
                 (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
@@ -2648,7 +2651,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                 existingTask.class !== incomingTask.class ||
                 (existingTask.deadline_date || '').toString().slice(0,10) !== (incomingTask.deadlineDate || '') ||
                 existingTask.completed !== (incomingTask.completed ?? false) ||
-                String(existingTask.current_score ?? '') !== String(incomingTask.currentScore ?? '') ||
+                (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null) !== (incomingTask.currentScore != null ? parseFloat(incomingTask.currentScore) : null) ||
                 (existingTask.current_grade ?? null) !== (incomingTask.currentGrade ?? null) ||
                 (existingTask.submitted_at ?? null) !== (incomingTask.submittedAt ?? null) ||
                 (existingTask.is_missing ?? false) !== (incomingTask.isMissing ?? false) ||
@@ -2735,7 +2738,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
           
           // ── Grade change detection ──────────────────────────────────────────
           const scoreChanged = incomingTask.currentScore != null &&
-            String(incomingTask.currentScore) !== String(existingTask.current_score);
+            (incomingTask.currentScore != null ? parseFloat(incomingTask.currentScore) : null) !==
+            (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null);
           const gradeChanged = incomingTask.currentGrade != null &&
             incomingTask.currentGrade !== existingTask.current_grade;
           if (hasCanvasData && (scoreChanged || gradeChanged)) {
@@ -6868,8 +6872,19 @@ async function runAchievementNotificationsForUser(userId) {
   // /api/insignia/check-unlock and /api/badges/check at award time.
 }
 
+// Guard: prevent concurrent global refresh runs.
+// With 135 users × 2-second stagger, a single run spans ~4.5 minutes.
+// Without this guard, the 15-minute setInterval could overlap with a previous run
+// that hasn't finished scheduling yet, causing 270 simultaneous Canvas fetches.
+let _globalRefreshRunning = false;
+
 // Background job: stagger users at 2-second intervals to avoid hammering Canvas
 async function runGlobalActivityRefresh() {
+  if (_globalRefreshRunning) {
+    console.log('[ACTIVITY REFRESH] Previous run still in progress — skipping this interval');
+    return;
+  }
+  _globalRefreshRunning = true;
   try {
     // Canvas-dependent refresh (grades, announcements, discussions, messages)
     const canvasUsersRes = await pool.query(
@@ -6897,8 +6912,14 @@ async function runGlobalActivityRefresh() {
       setTimeout(() => runAchievementNotificationsForUser(row.id), achDelay);
       achDelay += 200; // lighter stagger — no external API calls
     }
+    // Release the guard once all setTimeout callbacks are scheduled.
+    // The individual per-user refreshes run asynchronously after this point.
+    const totalScheduledMs = delay;
+    setTimeout(() => { _globalRefreshRunning = false; }, totalScheduledMs + 5000);
+
   } catch (err) {
     console.error('[ACTIVITY REFRESH] Global run failed:', err.message);
+    _globalRefreshRunning = false;
   }
 }
 
@@ -7131,6 +7152,13 @@ app.listen(PORT, () => {
     -- user_badges: unread
     ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_user_badges_unread ON user_badges(user_id, unread) WHERE unread = TRUE;
+
+    -- Widen NUMERIC columns to prevent overflow from large Canvas point values
+    ALTER TABLE courses       ALTER COLUMN current_score        TYPE NUMERIC(10,2);
+    ALTER TABLE courses       ALTER COLUMN final_score          TYPE NUMERIC(10,2);
+    ALTER TABLE courses       ALTER COLUMN current_period_score TYPE NUMERIC(10,2);
+    ALTER TABLE grade_history ALTER COLUMN score                TYPE NUMERIC(10,2);
+    ALTER TABLE grade_history ALTER COLUMN points_possible      TYPE NUMERIC(10,2);
 
     -- hpt_studio_members: unread flag for studio join alerts
     ALTER TABLE hpt_studio_members ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
