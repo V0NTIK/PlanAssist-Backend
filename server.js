@@ -5924,29 +5924,13 @@ app.post('/api/studios/join', authenticateToken, async (req, res) => {
     if (studioRes.rows.length === 0) return res.status(404).json({ error: 'Studio not found or this key is for a course-type studio' });
     const studio = studioRes.rows[0];
 
+    // Insert or re-mark as unread on joining (ON CONFLICT sets unread=true so re-joins alert again)
     await pool.query(
-      'INSERT INTO hpt_studio_members (studio_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      `INSERT INTO hpt_studio_members (studio_id, user_id, joined_at, unread)
+       VALUES ($1, $2, NOW(), true)
+       ON CONFLICT (studio_id, user_id) DO UPDATE SET joined_at = NOW(), unread = true`,
       [studio.id, userId]
     );
-    // Notify student they were added to a studio (respect notif_studios pref)
-    try {
-      const pref = await pool.query('SELECT notif_studios FROM users WHERE id=$1', [userId]);
-      if (pref.rows[0]?.notif_studios !== false) {
-        // Dedup: one studio notification per studio (match by title)
-        const studioTitle = `📚 Joined Studio: ${studio.name}`;
-        const studioDedup = await pool.query(
-          `SELECT 1 FROM notifications WHERE user_id=$1 AND type='studio' AND title=$2`,
-          [userId, studioTitle]
-        );
-        if (studioDedup.rows.length === 0) {
-          await pool.query(
-            `INSERT INTO notifications (user_id, type, title, body)
-             VALUES ($1,'studio',$2,$3)`,
-            [userId, studioTitle, 'You have been added to a new Studio in PlanAssist.']
-          );
-        }
-      }
-    } catch (e) { /* non-fatal */ }
     res.json({ success: true, studioName: studio.name });
   } catch (err) {
     res.status(500).json({ error: 'Failed to join studio' });
@@ -6532,46 +6516,66 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const result = await pool.query(
       `SELECT * FROM (
-         -- Unread grade notifications
+         -- Unread grade notifications (must have graded_at or submitted_at — synced_at alone is not a user-facing date)
          SELECT 'grade_' || id::text AS id, 'grade' AS type, title,
                 course_name AS body, html_url AS link_url, unread AS is_unread,
-                COALESCE(graded_at, submitted_at, synced_at) AS event_time,
+                COALESCE(graded_at, submitted_at) AS event_time,
                 id AS source_id,
                 score, points_possible, grade, grading_type,
                 NULL::text AS course_name_extra
-         FROM grade_history WHERE user_id = $1 AND unread = true
+         FROM grade_history
+         WHERE user_id = $1 AND unread = true
+           AND COALESCE(graded_at, submitted_at) IS NOT NULL
 
          UNION ALL
 
-         -- Unread insignia unlocks
+         -- Unread insignia unlocks (must have unlocked_at)
          SELECT 'insignia_' || id::text, 'insignia',
                 '🎖️ ' || label || ' Insignia Unlocked',
                 'You unlocked a new Insignia tier!', NULL, unread,
-                COALESCE(unlocked_at, NOW()), id,
+                unlocked_at, id,
                 NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar, NULL::text
-         FROM insignia_unlocks WHERE user_id = $1 AND unread = true
+         FROM insignia_unlocks
+         WHERE user_id = $1 AND unread = true
+           AND unlocked_at IS NOT NULL
 
          UNION ALL
 
-         -- Unread badge awards
+         -- Unread badge awards (must have awarded_at)
          SELECT 'badge_' || id::text, 'badge',
                 '🏆 ' || REPLACE(INITCAP(REPLACE(badge_key,'_',' ')),' ',' ') || ' Badge Earned',
                 'You earned a new Gallery badge!', NULL, unread,
-                COALESCE(awarded_at, NOW()), id,
+                awarded_at, id,
                 NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar, NULL::text
-         FROM user_badges WHERE user_id = $1 AND unread = true
+         FROM user_badges
+         WHERE user_id = $1 AND unread = true
+           AND awarded_at IS NOT NULL
 
          UNION ALL
 
-         -- Canvas activity (announcements, discussions, messages) — all recent
+         -- Canvas activity (announcements, discussions, messages) — event_at is NOT NULL by schema
          SELECT 'canvas_' || id::text, type, title, body, link_url, unread,
                 event_at, id,
                 NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar,
                 course_name AS course_name_extra
          FROM canvas_activity
          WHERE user_id = $1 AND event_at >= NOW() - INTERVAL '2 months'
+
+         UNION ALL
+
+         -- Unread studio joins (hpt_studio_members)
+         SELECT 'studio_' || sm.id::text, 'studio',
+                '📚 Joined Studio: ' || s.name,
+                (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by), NULL, sm.unread,
+                sm.joined_at, sm.id,
+                NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar, NULL::text
+         FROM hpt_studio_members sm
+         JOIN hpt_studios s ON s.id = sm.studio_id
+         WHERE sm.user_id = $1 AND sm.unread = true
+           AND sm.joined_at IS NOT NULL
        ) combined
-       ORDER BY event_time DESC NULLS LAST
+       WHERE event_time IS NOT NULL
+       ORDER BY event_time DESC
        LIMIT 100`,
       [userId]
     );
@@ -6595,13 +6599,25 @@ app.get('/api/notifications/unread-count', authenticateToken, async (req, res) =
          (SELECT COUNT(*) FROM grade_history    WHERE user_id=$1 AND unread=true) +
          (SELECT COUNT(*) FROM insignia_unlocks WHERE user_id=$1 AND unread=true) +
          (SELECT COUNT(*) FROM user_badges      WHERE user_id=$1 AND unread=true) +
-         (SELECT COUNT(*) FROM canvas_activity  WHERE user_id=$1 AND unread=true) AS total`,
+         (SELECT COUNT(*) FROM canvas_activity  WHERE user_id=$1 AND unread=true) +
+         (SELECT COUNT(*) FROM hpt_studio_members WHERE user_id=$1 AND unread=true) AS total`,
       [userId]
     );
     res.json({ count: parseInt(r.rows[0].total) });
   } catch (err) {
     if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
-      return res.json({ count: 0 });
+      // Retry without the studio count if the column doesn't exist yet
+      try {
+        const r2 = await pool.query(
+          `SELECT
+             (SELECT COUNT(*) FROM grade_history    WHERE user_id=$1 AND unread=true) +
+             (SELECT COUNT(*) FROM insignia_unlocks WHERE user_id=$1 AND unread=true) +
+             (SELECT COUNT(*) FROM user_badges      WHERE user_id=$1 AND unread=true) +
+             (SELECT COUNT(*) FROM canvas_activity  WHERE user_id=$1 AND unread=true) AS total`,
+          [req.user.id]
+        );
+        return res.json({ count: parseInt(r2.rows[0].total) });
+      } catch (_) { return res.json({ count: 0 }); }
     }
     res.status(500).json({ error: 'Failed to count' });
   }
@@ -6616,6 +6632,7 @@ app.post('/api/notifications/read-all', authenticateToken, async (req, res) => {
       pool.query('UPDATE insignia_unlocks SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
       pool.query('UPDATE user_badges      SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
       pool.query('UPDATE canvas_activity  SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
+      pool.query('UPDATE hpt_studio_members SET unread=false WHERE user_id=$1 AND unread=true', [userId]),
     ]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed to mark read' }); }
@@ -6629,7 +6646,7 @@ app.patch('/api/notifications/:id/read', authenticateToken, async (req, res) => 
     const numId = parseInt(parts[parts.length - 1]);
     const type = parts[0];
     if (!numId) return res.status(400).json({ error: 'Invalid id' });
-    const tableMap = { grade: 'grade_history', insignia: 'insignia_unlocks', badge: 'user_badges', canvas: 'canvas_activity' };
+    const tableMap = { grade: 'grade_history', insignia: 'insignia_unlocks', badge: 'user_badges', canvas: 'canvas_activity', studio: 'hpt_studio_members' };
     const table = tableMap[type];
     if (!table) return res.status(400).json({ error: 'Unknown notification type' });
     await pool.query(`UPDATE ${table} SET unread=false WHERE id=$1 AND user_id=$2`, [numId, userId]);
@@ -6943,14 +6960,16 @@ app.get('/api/activity/data', authenticateToken, async (req, res) => {
       pool.query(
         `SELECT s.id, s.name, s.color, s.setup_type,
                 (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name,
-                sm.joined_at
+                sm.joined_at,
+                COALESCE(sm.unread, false) AS unread
          FROM hpt_studio_members sm
          JOIN hpt_studios s ON s.id = sm.studio_id
          WHERE sm.user_id = $1
          UNION
          SELECT DISTINCT s.id, s.name, s.color, s.setup_type,
                 (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by) AS teacher_name,
-                c.updated_at AS joined_at
+                c.updated_at AS joined_at,
+                false AS unread
          FROM hpt_studios s
          JOIN courses c ON c.course_id = s.course_id AND c.user_id = $1
          WHERE s.setup_type = 'course'
@@ -7094,6 +7113,10 @@ app.listen(PORT, () => {
     -- user_badges: unread
     ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE INDEX IF NOT EXISTS idx_user_badges_unread ON user_badges(user_id, unread) WHERE unread = TRUE;
+
+    -- hpt_studio_members: unread flag for studio join alerts
+    ALTER TABLE hpt_studio_members ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_unread ON hpt_studio_members(user_id, unread) WHERE unread = TRUE;
 
     -- canvas_activity table (replaces notifications table)
     CREATE TABLE IF NOT EXISTS canvas_activity (
