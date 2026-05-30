@@ -5686,7 +5686,7 @@ app.get('/api/hpt/studios', authenticateHPT, async (req, res) => {
         // Derive live from courses table
         const mRes = await pool.query(
           `SELECT DISTINCT u.id, u.name, u.grade,
-             c.current_period_score, c.current_period_grade,
+             c.current_score, c.current_period_score, c.current_period_grade,
              c.final_score, c.final_grade, c.course_code, c.name AS course_name,
              c.zoom_number
            FROM courses c
@@ -5697,17 +5697,14 @@ app.get('/api/hpt/studios', authenticateHPT, async (req, res) => {
         );
         members = mRes.rows;
       } else {
-        // Key-type: explicit members
+        // Key-type: explicit members — no course scores shown
         const mRes = await pool.query(
-          `SELECT u.id, u.name, u.grade,
-             c.current_period_score, c.current_period_grade,
-             c.final_score, c.final_grade, c.course_code, c.name AS course_name
+          `SELECT u.id, u.name, u.grade
            FROM hpt_studio_members sm
            JOIN users u ON u.id = sm.user_id
-           LEFT JOIN courses c ON c.user_id = u.id AND c.course_id = $2
            WHERE sm.studio_id = $1 AND u.is_banned = false
            ORDER BY u.name`,
-          [studio.id, studio.course_id]
+          [studio.id]
         );
         members = mRes.rows;
       }
@@ -5750,7 +5747,7 @@ app.post('/api/hpt/studios/preview-course', authenticateHPT, async (req, res) =>
 
     const mRes = await pool.query(
       `SELECT DISTINCT u.id, u.name, u.grade,
-         c.current_period_score, c.current_period_grade,
+         c.current_score, c.current_period_score, c.current_period_grade,
          c.final_score, c.final_grade, c.course_code, c.name AS course_name,
          c.zoom_number
        FROM courses c
@@ -6394,7 +6391,6 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     const goalsR = await pool.query(
       `SELECT ug.user_id, ug.course_id, ug.target_score,
               c.name AS course_name, c.current_period_score, c.grading_period_title,
-              c.color,
               u.name AS user_name, u.grade AS user_grade
        FROM user_goals ug
        JOIN courses c ON c.user_id = ug.user_id AND c.course_id = ug.course_id
@@ -6466,17 +6462,22 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
       const user = uRes.rows[0];
       if (!user) return null;
 
-      // All courses for this user (exclude homeroom)
+      // Courses for this user — only those with current_period_score (active period data).
+      // Excludes homeroom. current_score is returned as 'year_score' for the Year column.
       const cRes = await pool.query(
         `SELECT id, name, course_code, course_id,
-                current_score, current_grade,
-                current_period_score, current_period_grade,
-                final_score, final_grade,
+                current_score          AS year_score,
+                current_grade,
+                current_period_score,
+                current_period_grade,
+                final_score,
+                final_grade,
                 zoom_number
          FROM courses
          WHERE user_id=$1
            AND LOWER(COALESCE(name,'')) NOT LIKE '%homeroom%'
            AND LOWER(COALESCE(course_code,'')) NOT LIKE '%homeroom%'
+           AND current_period_score IS NOT NULL
          ORDER BY name`,
         [userId]
       );
