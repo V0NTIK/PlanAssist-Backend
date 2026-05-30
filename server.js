@@ -3847,10 +3847,12 @@ app.get('/api/insignia', authenticateToken, async (req, res) => {
 app.put('/api/insignia', authenticateToken, async (req, res) => {
   try {
     const { label } = req.body;
-    // Whitelist guard — only known tier names are accepted
-    const VALID_INSIGNIA = ['Default','Copper','Silver','Gold','Emerald',
-                            'Amethyst','Ruby','Diamond','Obsidian','Antimatter'];
-    if (!VALID_INSIGNIA.includes(label)) {
+    const VALID_EARNED = ['Default','Bronze','Silver','Gold','Platinum',
+                          'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+                          'Obsidian','Diamond','Antimatter'];
+    const VALID_PURCHASED = ['Meteorite','Dragonbone','Celestium','Aether','Soulstone',
+                             'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'];
+    if (![...VALID_EARNED, ...VALID_PURCHASED].includes(label)) {
       return res.status(400).json({ error: 'Invalid insignia label' });
     }
     // Verify user has unlocked this label
@@ -3868,9 +3870,34 @@ app.put('/api/insignia', authenticateToken, async (req, res) => {
 app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
     const INSIGNIA_THRESHOLDS = [
-      [0,'Default'],[2,'Copper'],[5,'Silver'],[10,'Gold'],[20,'Emerald'],
-      [30,'Amethyst'],[40,'Ruby'],[50,'Diamond'],[75,'Obsidian'],[100,'Antimatter']
+      [0,'Default'],[2,'Bronze'],[5,'Silver'],[10,'Gold'],[20,'Platinum'],
+      [30,'Onyx'],[40,'Emerald'],[50,'Sapphire'],[60,'Ruby'],[70,'Amethyst'],
+      [80,'Obsidian'],[90,'Diamond'],[100,'Antimatter']
     ];
+    const daysR = await pool.query(
+      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
+      [req.user.id]
+    );
+    const days = parseInt(daysR.rows[0]?.days ?? 0);
+    await pool.query(
+      'UPDATE users SET insignia_days = $1 WHERE id = $2 AND insignia_days != $1',
+      [days, req.user.id]
+    );
+    const newlyUnlocked = [];
+    for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
+      if (days >= threshold) {
+        const ins = await pool.query(
+          'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, true) ON CONFLICT DO NOTHING RETURNING label',
+          [req.user.id, label]
+        ).catch(() =>
+          pool.query('INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label', [req.user.id, label])
+        );
+        if (ins.rowCount > 0) newlyUnlocked.push(label);
+      }
+    }
+    res.json({ newlyUnlocked, days });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
     // Compute dynamically from tasks_completed (same approach as GET /api/insignia)
     const daysR = await pool.query(
       'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
@@ -6525,7 +6552,217 @@ app.get('/api/hpt/studios/:id/marks', authenticateHPT, async (req, res) => {
 });
 
 // ============================================================================
-// NOTIFICATIONS — sourced from grade_history, insignia_unlocks, user_badges,
+// CREDITS & REWARDS
+// ============================================================================
+
+// GET /api/credits — get user's current credit balance and shop items
+app.get('/api/credits', authenticateToken, async (req, res) => {
+  try {
+    const [balR, shopR] = await Promise.all([
+      pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]),
+      pool.query('SELECT label, cost, description FROM insignia_shop ORDER BY sort_order'),
+    ]);
+    res.json({ credits: balR.rows[0]?.credits ?? 0, shop: shopR.rows });
+  } catch (err) { res.status(500).json({ error: 'Failed to load credits' }); }
+});
+
+// POST /api/credits/buy-shield — spend 100 credits to buy one Streak Shield
+app.post('/api/credits/buy-shield', authenticateToken, async (req, res) => {
+  const SHIELD_COST = 100;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query('SELECT credits FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+    const credits = r.rows[0]?.credits ?? 0;
+    if (credits < SHIELD_COST) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Insufficient credits', credits, cost: SHIELD_COST });
+    }
+    await client.query(
+      'UPDATE users SET credits = credits - $1, streak_shields_available = streak_shields_available + 1 WHERE id = $2',
+      [SHIELD_COST, req.user.id]
+    );
+    await client.query('COMMIT');
+    const updated = await pool.query('SELECT credits, streak_shields_available FROM users WHERE id=$1', [req.user.id]);
+    res.json({ success: true, credits: updated.rows[0].credits, shieldsAvailable: updated.rows[0].streak_shields_available });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Purchase failed' });
+  } finally { client.release(); }
+});
+
+// POST /api/credits/buy-insignia — spend credits to unlock a purchased insignia
+app.post('/api/credits/buy-insignia', authenticateToken, async (req, res) => {
+  const { label } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Verify it's a valid shop item and get cost
+    const shopR = await client.query('SELECT cost FROM insignia_shop WHERE label=$1', [label]);
+    if (shopR.rows.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Not a shop item' }); }
+    const cost = shopR.rows[0].cost;
+    // Check they don't already own it
+    const ownR = await client.query('SELECT 1 FROM insignia_unlocks WHERE user_id=$1 AND label=$2', [req.user.id, label]);
+    if (ownR.rows.length > 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Already owned' }); }
+    // Check balance
+    const balR = await client.query('SELECT credits FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+    if ((balR.rows[0]?.credits ?? 0) < cost) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Insufficient credits', credits: balR.rows[0]?.credits ?? 0, cost }); }
+    // Deduct and unlock
+    await client.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [cost, req.user.id]);
+    await client.query('INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1,$2,true) ON CONFLICT DO NOTHING', [req.user.id, label]);
+    await client.query('COMMIT');
+    const updated = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
+    res.json({ success: true, credits: updated.rows[0].credits });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Purchase failed' });
+  } finally { client.release(); }
+});
+
+// GET /api/rewards/status — all reward availability for the Rewards pane
+app.get('/api/rewards/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    // Last week's leaderboard entry (previous Monday → last Sunday)
+    const lastMonday = new Date();
+    lastMonday.setHours(0,0,0,0);
+    const dow = lastMonday.getDay();
+    lastMonday.setDate(lastMonday.getDate() - (dow === 0 ? 6 : dow - 1) - 7);
+    const lastMondayStr = lastMonday.toISOString().slice(0,10);
+
+    const [lbR, balR] = await Promise.all([
+      pool.query(
+        `SELECT tasks_completed, spins_taken FROM weekly_leaderboard
+         WHERE user_id=$1 AND week_start=$2`,
+        [userId, lastMondayStr]
+      ),
+      pool.query('SELECT credits, last_daily_chest FROM users WHERE id=$1', [userId]),
+    ]);
+
+    const lb = lbR.rows[0] || null;
+    const spinsAvailable = lb ? Math.max(0, lb.tasks_completed - lb.spins_taken) : 0;
+    const weeklyEntry = lb ? { tasks: lb.tasks_completed, spinsTaken: lb.spins_taken, spinsAvailable } : null;
+
+    // Claimable reactions (reacted within last 7 days, not yet claimed, on this user's entries)
+    const reactionR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM feed_reactions fr
+       JOIN completion_feed cf ON cf.id = fr.feed_entry_id
+       WHERE cf.user_id = $1
+         AND fr.credits_claimed = false
+         AND fr.created_at >= NOW() - INTERVAL '7 days'`,
+      [userId]
+    );
+    const unclaimedReactions = parseInt(reactionR.rows[0].cnt);
+
+    const credits = balR.rows[0]?.credits ?? 0;
+    const lastChest = balR.rows[0]?.last_daily_chest || null;
+
+    res.json({ credits, weeklyEntry, spinsAvailable, unclaimedReactions, lastDailyChest: lastChest });
+  } catch (err) {
+    console.error('[REWARDS STATUS]', err.message);
+    res.status(500).json({ error: 'Failed to load rewards' });
+  }
+});
+
+// POST /api/rewards/spin — use one spin, returns credits earned
+app.post('/api/rewards/spin', authenticateToken, async (req, res) => {
+  const SPIN_PRIZES = [0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 50, 50, 75, 100, 150, 200];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lastMonday = new Date();
+    lastMonday.setHours(0,0,0,0);
+    const dow = lastMonday.getDay();
+    lastMonday.setDate(lastMonday.getDate() - (dow === 0 ? 6 : dow - 1) - 7);
+    const lastMondayStr = lastMonday.toISOString().slice(0,10);
+
+    const lbR = await client.query(
+      'SELECT tasks_completed, spins_taken FROM weekly_leaderboard WHERE user_id=$1 AND week_start=$2 FOR UPDATE',
+      [req.user.id, lastMondayStr]
+    );
+    if (lbR.rows.length === 0 || lbR.rows[0].tasks_completed <= lbR.rows[0].spins_taken) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No spins available' });
+    }
+    // Award random prize
+    const prize = SPIN_PRIZES[Math.floor(Math.random() * SPIN_PRIZES.length)];
+    await client.query(
+      'UPDATE weekly_leaderboard SET spins_taken = spins_taken + 1 WHERE user_id=$1 AND week_start=$2',
+      [req.user.id, lastMondayStr]
+    );
+    if (prize > 0) {
+      await client.query('UPDATE users SET credits = credits + $1 WHERE id = $2', [prize, req.user.id]);
+    }
+    await client.query('COMMIT');
+    const balR = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
+    res.json({ prize, credits: balR.rows[0].credits });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Spin failed' });
+  } finally { client.release(); }
+});
+
+// POST /api/rewards/claim-reactions — claim credits for unclaimed reactions on own feed entries
+app.post('/api/rewards/claim-reactions', authenticateToken, async (req, res) => {
+  const CREDITS_PER_REACTION = 10;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Mark claimable reactions as claimed and count them
+    const claimR = await client.query(
+      `UPDATE feed_reactions fr SET credits_claimed = true
+       FROM completion_feed cf
+       WHERE fr.feed_entry_id = cf.id
+         AND cf.user_id = $1
+         AND fr.credits_claimed = false
+         AND fr.created_at >= NOW() - INTERVAL '7 days'
+       RETURNING fr.id`,
+      [req.user.id]
+    );
+    const count = claimR.rowCount;
+    const earned = count * CREDITS_PER_REACTION;
+    if (earned > 0) {
+      await client.query('UPDATE users SET credits = credits + $1 WHERE id = $2', [earned, req.user.id]);
+    }
+    await client.query('COMMIT');
+    const balR = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
+    res.json({ claimed: count, earned, credits: balR.rows[0].credits });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Claim failed' });
+  } finally { client.release(); }
+});
+
+// POST /api/rewards/daily-chest — claim daily chest (once per calendar day in user's timezone)
+app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
+  const { localDate } = req.body; // 'YYYY-MM-DD' in user's local timezone, sent from frontend
+  if (!localDate || !/^\d{4}-\d{2}-\d{2}$/.test(localDate)) {
+    return res.status(400).json({ error: 'localDate required (YYYY-MM-DD)' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query('SELECT credits, last_daily_chest FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+    const lastChest = r.rows[0]?.last_daily_chest;
+    // Compare as date strings — timezone already handled by the client sending local date
+    const lastChestStr = lastChest ? (lastChest instanceof Date ? lastChest.toISOString().slice(0,10) : String(lastChest).slice(0,10)) : null;
+    if (lastChestStr === localDate) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Already claimed today', nextAvailable: localDate });
+    }
+    const prize = Math.floor(Math.random() * 51); // 0–50 credits
+    await client.query(
+      'UPDATE users SET credits = credits + $1, last_daily_chest = $2 WHERE id = $3',
+      [prize, localDate, req.user.id]
+    );
+    await client.query('COMMIT');
+    const balR = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
+    res.json({ prize, credits: balR.rows[0].credits });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Chest claim failed' });
+  } finally { client.release(); }
+});
 // and canvas_activity (announcements, discussions, messages).
 // No separate notifications table; unread flags live on the source rows.
 // ============================================================================
@@ -7138,6 +7375,12 @@ app.listen(PORT, () => {
     -- tasks: new columns added in recent sessions
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quiz_id    BIGINT;
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS inactive   BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- Credits & rewards
+    ALTER TABLE users              ADD COLUMN IF NOT EXISTS credits           INTEGER  NOT NULL DEFAULT 0;
+    ALTER TABLE users              ADD COLUMN IF NOT EXISTS last_daily_chest  DATE;
+    ALTER TABLE weekly_leaderboard ADD COLUMN IF NOT EXISTS spins_taken       INTEGER  NOT NULL DEFAULT 0;
+    ALTER TABLE feed_reactions     ADD COLUMN IF NOT EXISTS credits_claimed   BOOLEAN  NOT NULL DEFAULT FALSE;
 
     -- grade_history: graded_at and unread
     ALTER TABLE grade_history ADD COLUMN IF NOT EXISTS graded_at TIMESTAMPTZ;
