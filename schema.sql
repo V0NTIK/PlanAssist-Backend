@@ -110,11 +110,11 @@ CREATE TABLE IF NOT EXISTS courses (
     course_id               BIGINT,
     name                    VARCHAR(255) NOT NULL,
     course_code             VARCHAR(100),
-    current_score           NUMERIC(6,2),
+    current_score           NUMERIC(10,2),
     current_grade           VARCHAR(50),
-    final_score             NUMERIC(6,2),
+    final_score             NUMERIC(10,2),
     final_grade             VARCHAR(50),
-    current_period_score    NUMERIC(6,2),
+    current_period_score    NUMERIC(10,2),
     current_period_grade    VARCHAR(50),
     grading_period_id       INTEGER,
     grading_period_title    TEXT,
@@ -243,6 +243,16 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing          BOOLEAN DEFAULT F
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late             BOOLEAN DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quiz_id             BIGINT;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS inactive            BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Widen NUMERIC columns to NUMERIC(10,2) to prevent overflow from large Canvas point values.
+-- NUMERIC(6,2) caps at 9999.99 and NUMERIC(8,2) caps at 999999.99 — both reachable in
+-- Canvas configs that store raw point totals rather than percentages.
+-- TYPE change is safe on PostgreSQL (widening never truncates existing data).
+ALTER TABLE courses       ALTER COLUMN current_score        TYPE NUMERIC(10,2);
+ALTER TABLE courses       ALTER COLUMN final_score          TYPE NUMERIC(10,2);
+ALTER TABLE courses       ALTER COLUMN current_period_score TYPE NUMERIC(10,2);
+ALTER TABLE grade_history ALTER COLUMN score                TYPE NUMERIC(10,2);
+ALTER TABLE grade_history ALTER COLUMN points_possible      TYPE NUMERIC(10,2);
 ALTER TABLE tasks ALTER COLUMN current_grade TYPE VARCHAR(50);
 ALTER TABLE tasks ALTER COLUMN grading_type   TYPE VARCHAR(50);
 ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
@@ -949,8 +959,8 @@ CREATE TABLE IF NOT EXISTS grade_history (
     title            TEXT    NOT NULL,
     course_name      TEXT,
     html_url         TEXT,
-    score            NUMERIC(8,2),
-    points_possible  NUMERIC(8,2),
+    score            NUMERIC(10,2),
+    points_possible  NUMERIC(10,2),
     grade            VARCHAR(50),
     grading_type     VARCHAR(50) DEFAULT 'points',
     submitted_at     TIMESTAMPTZ,
