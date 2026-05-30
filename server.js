@@ -3898,32 +3898,6 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
     res.json({ newlyUnlocked, days });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-    // Compute dynamically from tasks_completed (same approach as GET /api/insignia)
-    const daysR = await pool.query(
-      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
-      [req.user.id]
-    );
-    const days = parseInt(daysR.rows[0]?.days ?? 0);
-    // Keep stored value in sync
-    await pool.query(
-      'UPDATE users SET insignia_days = $1 WHERE id = $2 AND insignia_days != $1',
-      [days, req.user.id]
-    );
-    const newlyUnlocked = [];
-    for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
-      if (days >= threshold) {
-        const ins = await pool.query(
-          'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, true) ON CONFLICT DO NOTHING RETURNING label',
-          [req.user.id, label]
-        ).catch(() =>
-          pool.query('INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label', [req.user.id, label])
-        );
-        if (ins.rowCount > 0) newlyUnlocked.push(label);
-      }
-    }
-    res.json({ newlyUnlocked, days });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
 // ============================================================================
 // GALLERY BADGES
