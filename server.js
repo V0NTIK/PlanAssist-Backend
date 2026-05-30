@@ -1810,7 +1810,9 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
       );
 
       if (existing.rows.length > 0) {
-        const scoreChanged = String(existing.rows[0].score) !== String(score);
+        // Compare as floats to avoid false positives from DB returning "91.00" vs JS 91
+        const existingScore = existing.rows[0].score != null ? parseFloat(existing.rows[0].score) : null;
+        const scoreChanged = existingScore !== score; // both are null or parseFloat
         const gradeChanged = existing.rows[0].grade !== grade;
         const changed = scoreChanged || gradeChanged;
         await pool.query(
@@ -2413,10 +2415,28 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         insertedTaskIds.push(newId);
         newCount++;
         console.log(`  ✓ Inserted task ID ${newId}: "${t.title}"`);
-        // Do NOT fire leaderboard for tasks that arrive already completed on first insert —
-        // these are historical completions from before PlanAssist started tracking the user.
-        // The leaderboard only increments on a FALSE→TRUE flip on a task that PlanAssist
-        // already knew about (i.e. it existed in the DB as incomplete first).
+
+        // Fire leaderboard + feed for tasks that arrive already completed this week.
+        // These are tasks the student submitted before PlanAssist first synced them
+        // (e.g. submitted immediately when published, or between two syncs).
+        // Gate: completed=true AND either (a) submitted_at is within this calendar week,
+        // or (b) no submitted_at but deadline is within this week.
+        // We intentionally exclude old/historical completions (submitted months ago).
+        if (t.completed === true) {
+          const weekStart = new Date();
+          weekStart.setHours(0, 0, 0, 0);
+          weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+          const completionDate = t.submittedAt ? new Date(t.submittedAt)
+            : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
+          const isThisWeek = completionDate && completionDate >= weekStart;
+          if (isThisWeek) {
+            console.log(`  ★ New task already completed this week: "${t.title}" → leaderboard + feed`);
+            incrementLeaderboardForUser(userId).catch(err =>
+              console.error('[LEADERBOARD] new-complete error:', err.message));
+            addToCompletionFeed(userId, t.title, t.class).catch(err =>
+              console.error('[FEED] new-complete error:', err.message));
+          }
+        }
       }
     }
 
@@ -6748,7 +6768,9 @@ async function runActivityRefreshForUser(userId, canvasToken) {
               [userId, sub.assignment_id]
             );
             if (existing.rows.length > 0) {
-              const changed = String(existing.rows[0].score) !== String(score) || existing.rows[0].grade !== grade;
+              // Compare as floats to avoid false positives (DB stores "91.00", Canvas sends 91)
+              const existingScore = existing.rows[0].score != null ? parseFloat(existing.rows[0].score) : null;
+              const changed = existingScore !== score || existing.rows[0].grade !== grade;
               await pool.query(
                 `UPDATE grade_history SET title=$1, course_name=$2, html_url=$3, score=$4, points_possible=$5,
                    grade=$6, grading_type=$7, submitted_at=$8, graded_at=$9, synced_at=NOW(),
