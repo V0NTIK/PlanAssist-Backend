@@ -209,6 +209,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     submitted_at            TIMESTAMP,
     is_missing              BOOLEAN DEFAULT FALSE,
     is_late                 BOOLEAN DEFAULT FALSE,
+    quiz_id                 BIGINT,                             -- Canvas classic quiz ID (NULL for standard assignments)
+    inactive                BOOLEAN NOT NULL DEFAULT FALSE,     -- TRUE = removed/unpublished from Canvas; hidden in UI
     -- Timestamps
     created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, assignment_id)
@@ -239,6 +241,8 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lock_at             TIMESTAMP;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submitted_at        TIMESTAMP;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing          BOOLEAN DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late             BOOLEAN DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quiz_id             BIGINT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS inactive            BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tasks ALTER COLUMN current_grade TYPE VARCHAR(50);
 ALTER TABLE tasks ALTER COLUMN grading_type   TYPE VARCHAR(50);
 ALTER TABLE tasks DROP COLUMN IF EXISTS priority_order;
@@ -254,6 +258,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_deleted          ON tasks(deleted);
 CREATE INDEX IF NOT EXISTS idx_tasks_is_new           ON tasks(is_new);
 CREATE INDEX IF NOT EXISTS idx_tasks_segment          ON tasks(segment);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignment_id    ON tasks(assignment_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_quiz_id          ON tasks(quiz_id) WHERE quiz_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_inactive         ON tasks(user_id, inactive) WHERE inactive = TRUE;
 CREATE INDEX IF NOT EXISTS idx_tasks_course_id        ON tasks(course_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignment_group ON tasks(assignment_group_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_session_active   ON tasks(user_id, session_active) WHERE session_active = TRUE;
@@ -868,11 +874,14 @@ CREATE TABLE IF NOT EXISTS hpt_studio_members (
     studio_id   INTEGER NOT NULL REFERENCES hpt_studios(id) ON DELETE CASCADE,
     user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     joined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    unread      BOOLEAN NOT NULL DEFAULT FALSE,   -- TRUE = new studio join, show in Alerts tab
     UNIQUE(studio_id, user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_studio ON hpt_studio_members(studio_id);
 CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_user   ON hpt_studio_members(user_id);
+ALTER TABLE hpt_studio_members ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_hpt_studio_members_unread ON hpt_studio_members(user_id, unread) WHERE unread = TRUE;
 
 
 -- ============================================================================
@@ -926,7 +935,11 @@ CREATE TABLE IF NOT EXISTS hpt_studio_banner_dismissals (
 -- ============================================================================
 -- GRADE HISTORY TABLE
 -- Stores all graded Canvas submissions for a user, keyed by (user_id, assignment_id).
--- Populated by Grade Sync; persists historical grades regardless of task lifecycle.
+-- Populated by Grade Sync (2-month window); upserts on conflict — no duplicates.
+-- graded_at: Canvas graded_at timestamp; falls back to submitted_at when absent.
+-- unread:    TRUE = entry is new/changed and should appear in the notification sidebar.
+--            First-run guard in server.js sets unread=FALSE for brand-new users so their
+--            entire grade history doesn't flood in as notifications on first load.
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS grade_history (
     id               SERIAL PRIMARY KEY,
@@ -941,32 +954,58 @@ CREATE TABLE IF NOT EXISTS grade_history (
     grade            VARCHAR(50),
     grading_type     VARCHAR(50) DEFAULT 'points',
     submitted_at     TIMESTAMPTZ,
+    graded_at        TIMESTAMPTZ,
     synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    unread           BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE (user_id, assignment_id)
 );
 
+-- Safe migrations for existing tables (no-ops if columns already exist)
+ALTER TABLE grade_history ADD COLUMN IF NOT EXISTS graded_at TIMESTAMPTZ;
+ALTER TABLE grade_history ADD COLUMN IF NOT EXISTS unread    BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_grade_history_user_id    ON grade_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_grade_history_synced_at  ON grade_history(user_id, synced_at DESC);
+CREATE INDEX IF NOT EXISTS idx_grade_history_graded_at  ON grade_history(user_id, graded_at DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_grade_history_unread     ON grade_history(user_id, unread) WHERE unread = TRUE;
 
+-- unread flag on insignia_unlocks — TRUE = show in notification sidebar
+-- New entries inserted by server.js default to FALSE for first-run users.
+ALTER TABLE insignia_unlocks ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_insignia_unlocks_unread ON insignia_unlocks(user_id, unread) WHERE unread = TRUE;
+
+-- unread flag on user_badges
+ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS unread BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_user_badges_unread ON user_badges(user_id, unread) WHERE unread = TRUE;
 
 -- ============================================================================
--- NOTIFICATIONS
--- Per-user notification inbox. Fed by the background Activity Refresh job
--- (grades, announcements, discussions, messages), insignia unlocks,
--- badge awards, and studio membership changes.
+-- CANVAS ACTIVITY CACHE
+-- Stores Canvas announcements, discussions, and messages per user.
+-- Fed by Activity Refresh; deduped by (user_id, type, link_url).
+-- unread = TRUE means the item is new/updated since last seen.
+-- event_at is the canonical sort timestamp: posted_at / last_reply_at / updated_at.
 -- ============================================================================
-
-CREATE TABLE IF NOT EXISTS notifications (
+CREATE TABLE IF NOT EXISTS canvas_activity (
     id          SERIAL PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    type        VARCHAR(30) NOT NULL
-                    CHECK (type IN ('grade','announcement','discussion','message','insignia','badge','studio')),
+    type        VARCHAR(20) NOT NULL CHECK (type IN ('announcement','discussion','message')),
+    canvas_id   BIGINT,
     title       TEXT NOT NULL,
     body        TEXT,
+    course_name TEXT,
     link_url    TEXT,
-    read        BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    event_at    TIMESTAMPTZ NOT NULL,
+    unread      BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE(user_id, type, link_url)
 );
 
-CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, read) WHERE read = FALSE;
-CREATE INDEX IF NOT EXISTS idx_notifications_user_time   ON notifications(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_canvas_activity_user_type ON canvas_activity(user_id, type);
+CREATE INDEX IF NOT EXISTS idx_canvas_activity_event_at  ON canvas_activity(user_id, event_at DESC);
+CREATE INDEX IF NOT EXISTS idx_canvas_activity_unread    ON canvas_activity(user_id, unread) WHERE unread = TRUE;
+
+-- ============================================================================
+-- NOTIFICATIONS (legacy) — dropped; notification logic now uses unread flags
+-- on grade_history, insignia_unlocks, user_badges, and canvas_activity.
+-- DROP is safe to re-run (IF EXISTS).  CASCADE removes dependent indexes.
+-- ============================================================================
+DROP TABLE IF EXISTS notifications CASCADE;
