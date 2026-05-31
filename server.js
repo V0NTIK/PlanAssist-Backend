@@ -3847,8 +3847,8 @@ app.get('/api/insignia', authenticateToken, async (req, res) => {
 app.put('/api/insignia', authenticateToken, async (req, res) => {
   try {
     const { label } = req.body;
-    const VALID_EARNED = ['Default','Bronze','Silver','Gold','Platinum',
-                          'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+    const VALID_EARNED = ['Default','Bronze','Silver','Gold',
+                          'Emerald','Sapphire','Ruby','Amethyst',
                           'Obsidian','Diamond','Antimatter'];
     const VALID_PURCHASED = ['Meteorite','Dragonbone','Celestium','Aether','Soulstone',
                              'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'];
@@ -3870,9 +3870,9 @@ app.put('/api/insignia', authenticateToken, async (req, res) => {
 app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
   try {
     const INSIGNIA_THRESHOLDS = [
-      [0,'Default'],[2,'Bronze'],[5,'Silver'],[10,'Gold'],[20,'Platinum'],
-      [30,'Onyx'],[40,'Emerald'],[50,'Sapphire'],[60,'Ruby'],[70,'Amethyst'],
-      [80,'Obsidian'],[90,'Diamond'],[100,'Antimatter']
+      [0,'Default'],[2,'Bronze'],[5,'Silver'],[10,'Gold'],
+      [20,'Emerald'],[30,'Sapphire'],[40,'Ruby'],[50,'Amethyst'],
+      [60,'Obsidian'],[80,'Diamond'],[100,'Antimatter']
     ];
     const daysR = await pool.query(
       'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
