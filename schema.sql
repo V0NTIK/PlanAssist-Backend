@@ -729,12 +729,12 @@ SET insignia_days = (
 )
 WHERE u.insignia_days = 0;
 
--- Backfill insignia_unlocks for all users from their current insignia_days (new tier set)
+-- Backfill insignia_unlocks for all users from their current insignia_days (11-tier set)
 DO $$
 DECLARE
-    tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
-    tier_labels     TEXT[] := ARRAY['Default','Bronze','Silver','Gold','Platinum',
-                                    'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+    tier_thresholds INT[]  := ARRAY[0, 2, 5, 10, 20, 30, 40, 50, 60, 80, 100];
+    tier_labels     TEXT[] := ARRAY['Default','Bronze','Silver','Gold',
+                                    'Emerald','Sapphire','Ruby','Amethyst',
                                     'Obsidian','Diamond','Antimatter'];
     rec RECORD;
     i   INT;
@@ -750,10 +750,10 @@ BEGIN
     END LOOP;
 END $$;
 
--- Remove stale rows for old tier names (replaced by new tier set)
+-- Remove stale rows for removed tiers (Platinum, Onyx) and any other invalid names
 DELETE FROM insignia_unlocks
-WHERE label NOT IN ('Default','Bronze','Silver','Gold','Platinum',
-                    'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+WHERE label NOT IN ('Default','Bronze','Silver','Gold',
+                    'Emerald','Sapphire','Ruby','Amethyst',
                     'Obsidian','Diamond','Antimatter',
                     -- purchased insignias
                     'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
@@ -768,8 +768,8 @@ UPDATE users SET insignia_selected = 'Antimatter' WHERE insignia_selected = 'Aet
 UPDATE users
 SET insignia_selected = 'Default'
 WHERE insignia_selected NOT IN (
-  'Default','Bronze','Silver','Gold','Platinum',
-  'Onyx','Emerald','Sapphire','Ruby','Amethyst',
+  'Default','Bronze','Silver','Gold',
+  'Emerald','Sapphire','Ruby','Amethyst',
   'Obsidian','Diamond','Antimatter',
   'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
   'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'
