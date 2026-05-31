@@ -6640,7 +6640,7 @@ app.get('/api/rewards/status', authenticateToken, async (req, res) => {
 
 // POST /api/rewards/spin — use one spin, returns credits earned
 app.post('/api/rewards/spin', authenticateToken, async (req, res) => {
-  const SPIN_PRIZES = [0, 0, 10, 10, 10, 20, 20, 20, 30, 30, 50, 50, 75, 100, 150, 200];
+  const SPIN_PRIZES = [0, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 35, 40];
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -6678,7 +6678,7 @@ app.post('/api/rewards/spin', authenticateToken, async (req, res) => {
 
 // POST /api/rewards/claim-reactions — claim credits for unclaimed reactions on own feed entries
 app.post('/api/rewards/claim-reactions', authenticateToken, async (req, res) => {
-  const CREDITS_PER_REACTION = 10;
+  const CREDITS_PER_REACTION = 5;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
