@@ -4979,7 +4979,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
               u.is_new_user, u.campus, u.tz_periods, u.schedule_enhanced, u.created_at, u.last_sync,
-              u.streak_shields_available,
+              u.streak_shields_available, u.credits,
               u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
               MAX(tc.completed_at) AS last_completion,
@@ -5010,7 +5010,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     const userRes = await pool.query(
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
               campus, tz_periods, schedule_enhanced, created_at,
-              streak_shields_available, insignia_days, insignia_selected
+              streak_shields_available, insignia_days, insignia_selected, credits
        FROM users WHERE id = $1`,
       [req.params.id]
     );
@@ -5037,10 +5037,10 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   }
 });
 
-// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin)
+// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin, email, password)
 app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, grade, campus, is_admin } = req.body;
+    const { name, grade, campus, is_admin, email, password } = req.body;
     const targetId = parseInt(req.params.id);
 
     // Prevent self-demotion
@@ -5059,6 +5059,13 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
       fields.push(`tz_periods = $${idx++}`); vals.push(getEffectivePeriods(resolvedCampus));
     }
     if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
+    if (email !== undefined && email.trim()) {
+      fields.push(`email = $${idx++}`); vals.push(email.trim().toLowerCase());
+    }
+    if (password !== undefined && password.trim().length >= 6) {
+      const hashed = await bcrypt.hash(password.trim(), 10);
+      fields.push(`password = $${idx++}`); vals.push(hashed);
+    }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
     vals.push(targetId);
@@ -5066,9 +5073,12 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
 
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, req.body);
+    const auditFields = { ...req.body };
+    if (auditFields.password) auditFields.password = '[REDACTED]';
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, auditFields);
     res.json({ success: true });
   } catch (err) {
+    console.error('Admin edit user error:', err);
     res.status(500).json({ error: 'Failed to update user' });
   }
 });
@@ -5126,6 +5136,89 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
   }
 });
 
+// GET /api/admin/users/:id/canvas-token — decrypt and return the user's Canvas API token
+app.get('/api/admin/users/:id/canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    const userRow = await pool.query('SELECT canvas_api_token, canvas_api_token_iv, name FROM users WHERE id = $1', [targetId]);
+    if (userRow.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const u = userRow.rows[0];
+    const decrypted = getDecryptedCanvasToken(targetId, u);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'VIEW_CANVAS_TOKEN', targetId, u.name, {});
+    res.json({ token: decrypted || null });
+  } catch (err) {
+    console.error('Admin view canvas token error:', err);
+    res.status(500).json({ error: 'Failed to retrieve token' });
+  }
+});
+
+// POST /api/admin/users/:id/set-canvas-token — replace a user's Canvas API token
+app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { token: newToken } = req.body;
+    if (!newToken || !newToken.trim()) return res.status(400).json({ error: 'token is required' });
+    const targetId = parseInt(req.params.id);
+    // Encrypt using same AES-256-GCM path as the user-facing save
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(process.env.ENCRYPTION_KEY, 'hex'), iv);
+    let encrypted = cipher.update(newToken.trim(), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    const encryptedToken = `${encrypted}:${authTag}`;
+    await pool.query(
+      'UPDATE users SET canvas_api_token = $1, canvas_api_token_iv = $2 WHERE id = $3',
+      [encryptedToken, iv.toString('hex'), targetId]
+    );
+    invalidateCachedToken(targetId);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CANVAS_TOKEN', targetId, targetRes.rows[0]?.name, {});
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin set canvas token error:', err);
+    res.status(500).json({ error: 'Failed to set token' });
+  }
+});
+
+// POST /api/admin/users/:id/set-credits — set a user's credit balance to an exact value
+app.post('/api/admin/users/:id/set-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { credits } = req.body;
+    if (credits === undefined || isNaN(parseInt(credits))) return res.status(400).json({ error: 'credits (integer) required' });
+    const targetId = parseInt(req.params.id);
+    const newBalance = Math.max(0, parseInt(credits));
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
+    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CREDITS', targetId, prev.rows[0].name, { prev: prev.rows[0].credits, new: newBalance });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) {
+    console.error('Admin set credits error:', err);
+    res.status(500).json({ error: 'Failed to set credits' });
+  }
+});
+
+// POST /api/admin/users/:id/adjust-credits — add or subtract credits from a user's balance
+app.post('/api/admin/users/:id/adjust-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { delta, reason } = req.body;
+    if (delta === undefined || isNaN(parseInt(delta))) return res.status(400).json({ error: 'delta (integer) required' });
+    const targetId = parseInt(req.params.id);
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
+    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const newBalance = Math.max(0, (prev.rows[0].credits || 0) + parseInt(delta));
+    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'ADJUST_CREDITS', targetId, prev.rows[0].name, { delta: parseInt(delta), prev: prev.rows[0].credits, new: newBalance, reason });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) {
+    console.error('Admin adjust credits error:', err);
+    res.status(500).json({ error: 'Failed to adjust credits' });
+  }
+});
+
 
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
 app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
@@ -5180,10 +5273,12 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
     );
 
     // d) Duplicate tasks (same url + user, multiple active)
+    // Excludes https://planassist.onrender.com/ — that's the manually-created task URL and is not a real duplicate
     const dupRes = await pool.query(
       `SELECT u.name as user_name, t.url, COUNT(*) as count
        FROM tasks t JOIN users u ON u.id = t.user_id
        WHERE t.deleted = false AND t.completed = false AND t.url IS NOT NULL
+         AND t.url != 'https://planassist.onrender.com/'
          AND t.segment IS NULL
        GROUP BY u.name, t.url HAVING COUNT(*) > 1
        ORDER BY count DESC LIMIT 20`
