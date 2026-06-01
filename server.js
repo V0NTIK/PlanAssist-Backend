@@ -6624,11 +6624,12 @@ app.get('/api/rewards/status', authenticateToken, async (req, res) => {
     const spinsAvailable = lb ? Math.max(0, lb.tasks_completed - lb.spins_taken) : 0;
     const weeklyEntry = lb ? { tasks: lb.tasks_completed, spinsTaken: lb.spins_taken, spinsAvailable } : null;
 
-    // Claimable reactions (reacted within last 7 days, not yet claimed, on this user's entries)
+    // Claimable reactions (reacted within last 7 days, not yet claimed, on this user's entries, excluding self-reactions)
     const reactionR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM feed_reactions fr
        JOIN completion_feed cf ON cf.id = fr.feed_entry_id
        WHERE cf.user_id = $1
+         AND fr.user_id != $1
          AND fr.credits_claimed = false
          AND fr.created_at >= NOW() - INTERVAL '7 days'`,
       [userId]
