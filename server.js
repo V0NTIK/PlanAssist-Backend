@@ -6724,7 +6724,28 @@ app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Already claimed today', nextAvailable: localDate });
     }
-    const prize = Math.floor(Math.random() * 51); // 0–50 credits
+    // Weighted chest prizes — lower values are more common, higher values are rare.
+    // Weights: 0(12), 2(10), 4(9), 6(8), 8(7), 10(7), 12(6), 15(6), 18(5), 20(5),
+    //          25(4), 30(4), 35(3), 40(2), 45(1), 50(1) — total weight 90
+    const CHEST_PRIZES = [
+      ...Array(12).fill(0),
+      ...Array(10).fill(2),
+      ...Array(9).fill(4),
+      ...Array(8).fill(6),
+      ...Array(7).fill(8),
+      ...Array(7).fill(10),
+      ...Array(6).fill(12),
+      ...Array(6).fill(15),
+      ...Array(5).fill(18),
+      ...Array(5).fill(20),
+      ...Array(4).fill(25),
+      ...Array(4).fill(30),
+      ...Array(3).fill(35),
+      ...Array(2).fill(40),
+      ...Array(1).fill(45),
+      ...Array(1).fill(50),
+    ];
+    const prize = CHEST_PRIZES[Math.floor(Math.random() * CHEST_PRIZES.length)];
     await client.query(
       'UPDATE users SET credits = credits + $1, last_daily_chest = $2 WHERE id = $3',
       [prize, localDate, req.user.id]
