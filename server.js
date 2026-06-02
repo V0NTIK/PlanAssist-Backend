@@ -1368,8 +1368,10 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: err.message });
     }
 
-    // Step 2: Fetch assignments for ALL courses IN PARALLEL (90-day window)
+    // Step 2: Fetch assignments for ALL courses IN PARALLEL
+    // Window: 7 days back → 90 days forward so recently-expired tasks are never missed
     const ninetyDaysOut = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+    const sevenDaysBack = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const now = new Date();
     console.log('[MAIN SYNC] Fetching assignments in parallel...');
     const courseResults = await Promise.all(
@@ -1388,7 +1390,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
               const effectiveDue = a.due_at || a.lock_at;
               if (!effectiveDue) return false;
               const d = new Date(effectiveDue);
-              return d >= now && d <= ninetyDaysOut;
+              return d >= sevenDaysBack && d <= ninetyDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (err) {
@@ -2298,13 +2300,6 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       byUrlMap.get(r.url).push(r);
     });
 
-    // ── Step 2: Pre-fetch max grade_id ──
-    const gradeIdRes = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [userId]
-    );
-    let nextGradeId = parseInt(gradeIdRes.rows[0].max_id) + 1;
-
     const sortedTasks = [...tasks].sort((a, b) => {
       const dA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
       const dB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
@@ -2344,11 +2339,6 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         const scoreChanged = incomingScore != null && incomingScore !== existingScore;
         const gradeChanged = t.currentGrade != null && t.currentGrade !== existing.current_grade;
         const gradeFlipped = (scoreChanged || gradeChanged) && !existing.segment;
-        let gradeIdToUse = existing.grade_id;
-        if (gradeFlipped) {
-          gradeIdToUse = nextGradeId++;
-        }
-
         if (existing.segment) {
           // Segment task: only update display fields
           await pool.query(
@@ -2370,15 +2360,15 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                quiz_id=$9, points_possible=$10, assignment_group_id=$11,
                current_score=$12, current_grade=$13, grading_type=$14,
                unlock_at=$15, lock_at=$16, submitted_at=$17,
-               is_missing=$18, is_late=$19, grade_id=$20,
-               completed=$21, deleted=CASE WHEN $21 THEN true ELSE deleted END
-             WHERE id=$22 AND user_id=$23`,
+               is_missing=$18, is_late=$19,
+               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
+             WHERE id=$21 AND user_id=$22`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
              t.quizId ?? null, t.pointsPossible ?? null, t.assignmentGroupId ?? null,
              t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
              t.unlockAt ?? null, t.lockAt ?? null, t.submittedAt ?? null,
-             t.isMissing ?? false, t.isLate ?? false, gradeIdToUse,
+             t.isMissing ?? false, t.isLate ?? false,
              nowCompleted, existing.id, userId]
           );
         }
@@ -2415,7 +2405,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
           }
         }
         if (gradeFlipped) {
-          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
+          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore}`);
         }
         updatedCount++;
         insertedTaskIds.push(existing.id);
@@ -2429,8 +2419,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               course_id, assignment_id, quiz_id, points_possible, assignment_group_id,
               current_score, current_grade, grading_type,
               unlock_at, lock_at, submitted_at, is_missing, is_late,
-              completed, deleted, manually_created, is_new)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+              completed, deleted, manually_created)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
            RETURNING id`,
           [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
@@ -2440,7 +2430,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
            t.gradingType || 'points', t.unlockAt ?? null, t.lockAt ?? null,
            t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
            t.completed ?? false, t.completed ?? false, // deleted if already completed
-           false, true] // manually_created=false, is_new=true
+           false] // manually_created=false
         );
         const newId = result.rows[0].id;
         insertedTaskIds.push(newId);
@@ -2519,8 +2509,9 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                AND manually_created = false
                AND assignment_id IS NOT NULL
                AND assignment_id::text != ALL($2)
+               AND deadline_date >= $3
              RETURNING id, title`,
-            [userId, seenAssignmentIds]
+            [userId, seenAssignmentIds, sevenDaysAgoStr]
           );
           inactiveCount = inactiveResult.rowCount;
           if (inactiveCount > 0) {
@@ -2586,14 +2577,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     let updatedCount = 0;
     let newCount = 0;
     const insertedTasks = [];
-
-    // Pre-fetch max grade_id once to avoid race conditions when multiple
-    // grade changes are detected in the same sync — increment locally
-    const gradeIdBaseResult = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextGradeId = parseInt(gradeIdBaseResult.rows[0].max_id) + 1;
 
     for (const incomingTask of sortedTasks) {
       // Check if this task already exists (match by assignment_id first, then URL)
@@ -2783,15 +2766,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null);
           const gradeChanged = incomingTask.currentGrade != null &&
             incomingTask.currentGrade !== existingTask.current_grade;
-          if (hasCanvasData && (scoreChanged || gradeChanged)) {
-            await pool.query(
-              'UPDATE tasks SET grade_id = $1 WHERE id = $2 AND user_id = $3',
-              [nextGradeId, existingTask.id, req.user.id]
-            );
-            console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
-            nextGradeId++;
-          }
-
           // If Canvas now marks the task completed and it wasn't before:
           if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
             // Only write tasks_completed if user hasn't manually resolved it already
@@ -3005,24 +2979,24 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 
     // === CLEANUP PAST DUE TASKS ===
-    // After sync, mark any incomplete tasks that are past their deadline as deleted
-    // This prevents old unfinished tasks from cluttering the task list
+    // 7-day grace period — tasks that just went past due remain visible.
+    // Never deletes manually-created tasks.
     console.log(`\n=== CLEANING UP PAST DUE TASKS ===`);
     
-    // Define today's date at midnight for comparison
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayDateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+    const sevenDaysAgoClean = new Date();
+    sevenDaysAgoClean.setDate(sevenDaysAgoClean.getDate() - 7);
+    const cleanupCutoff = sevenDaysAgoClean.toISOString().split('T')[0];
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
        SET deleted = true, session_active = false
        WHERE user_id = $1 
          AND completed = false 
-         AND deleted = false 
+         AND deleted = false
+         AND manually_created IS NOT TRUE
          AND deadline_date < $2
        RETURNING id, title, deadline_date`,
-      [req.user.id, todayDateStr]
+      [req.user.id, cleanupCutoff]
     );
     
     const cleanedUpCount = cleanupResult.rows.length;
@@ -3855,11 +3829,11 @@ app.post('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// DELETE /api/feed-reactions/:entryId — remove own reaction
+// DELETE /api/feed-reactions/:entryId — remove own reaction (only if credits not yet claimed)
 app.delete('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
   try {
     await pool.query(
-      'DELETE FROM feed_reactions WHERE feed_entry_id = $1 AND user_id = $2',
+      'DELETE FROM feed_reactions WHERE feed_entry_id = $1 AND user_id = $2 AND credits_claimed = false',
       [req.params.entryId, req.user.id]
     );
     res.json({ success: true });
@@ -6935,6 +6909,7 @@ app.post('/api/rewards/claim-reactions', authenticateToken, async (req, res) => 
        FROM completion_feed cf
        WHERE fr.feed_entry_id = cf.id
          AND cf.user_id = $1
+         AND fr.user_id != $1
          AND fr.credits_claimed = false
          AND fr.created_at >= NOW() - INTERVAL '7 days'
        RETURNING fr.id`,
