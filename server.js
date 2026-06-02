@@ -3849,7 +3849,7 @@ app.put('/api/insignia', authenticateToken, async (req, res) => {
     const { label } = req.body;
     const VALID_EARNED = ['Default','Bronze','Silver','Gold',
                           'Emerald','Sapphire','Ruby','Amethyst',
-                          'Obsidian','Diamond','Antimatter'];
+                          'Obsidian','Diamond','Antimatter','Hacked PlanAssist'];
     const VALID_PURCHASED = ['Meteorite','Dragonbone','Celestium','Aether','Soulstone',
                              'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'];
     if (![...VALID_EARNED, ...VALID_PURCHASED].includes(label)) {
@@ -4094,6 +4094,110 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
   } catch (error) {
     console.error('Get leaderboard position error:', error);
     res.status(500).json({ error: 'Failed to get position' });
+  }
+});
+
+// GET /api/hub/insights — global aggregates for rich Insight cards on the Hub
+app.get('/api/hub/insights', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date();
+    const todayUTC = now.toISOString().slice(0, 10);
+
+    // Global completions today
+    const globalTodayR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]
+    );
+    // User completions today
+    const userTodayR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at::date=$2::date`, [userId, todayUTC]
+    );
+    // Week start (Monday)
+    const dow = now.getDay();
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
+    weekStart.setHours(0,0,0,0);
+    const weekStartISO = weekStart.toISOString().slice(0,10);
+    // Global avg tasks this week per active user
+    const globalWeekR = await pool.query(
+      `SELECT AVG(cnt)::numeric(6,1) AS avg_tasks FROM (
+         SELECT user_id, COUNT(*) AS cnt FROM tasks_completed
+         WHERE completed_at >= $1 GROUP BY user_id HAVING COUNT(*) > 0) sub`, [weekStartISO]
+    );
+    // User streak percentile
+    const userStreakR = await pool.query(`SELECT insignia_days FROM users WHERE id=$1`, [userId]);
+    const userStreakDays = userStreakR.rows[0]?.insignia_days || 0;
+    const streakPercentileR = await pool.query(
+      `SELECT COUNT(*)::float / NULLIF(COUNT(*),0) * 100 AS percentile
+       FROM users WHERE is_banned=false AND insignia_days > 0 AND insignia_days < $1`, [userStreakDays]
+    );
+    // Global avg session length
+    const globalSessionR = await pool.query(
+      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE actual_time>0 AND actual_time<300`
+    );
+    // User avg session length
+    const userSessionR = await pool.query(
+      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE user_id=$1 AND actual_time>0 AND actual_time<300`, [userId]
+    );
+    // Last week completions
+    const lastWeekStart = new Date(weekStart); lastWeekStart.setDate(lastWeekStart.getDate()-7);
+    const userLastWeekR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2 AND completed_at<$3`,
+      [userId, lastWeekStart.toISOString().slice(0,10), weekStartISO]
+    );
+    // This week completions
+    const userWeekR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2`, [userId, weekStartISO]
+    );
+    // Best day
+    const bestDayR = await pool.query(
+      `SELECT TO_CHAR(completed_at,'Day') AS dow, COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id=$1 GROUP BY dow ORDER BY cnt DESC LIMIT 1`, [userId]
+    );
+    // Peak hour
+    const peakHourR = await pool.query(
+      `SELECT EXTRACT(HOUR FROM completed_at)::int AS hr, COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id=$1 GROUP BY hr ORDER BY cnt DESC LIMIT 1`, [userId]
+    );
+    // Accuracy trend (last 4 weeks vs prior 4 weeks)
+    const fourWeeksAgo = new Date(weekStart); fourWeeksAgo.setDate(fourWeeksAgo.getDate()-28);
+    const eightWeeksAgo = new Date(weekStart); eightWeeksAgo.setDate(eightWeeksAgo.getDate()-56);
+    const accuracyR = await pool.query(
+      `SELECT AVG(CASE WHEN completed_at>=$2 THEN ratio END) AS recent,
+              AVG(CASE WHEN completed_at<$2 AND completed_at>=$3 THEN ratio END) AS prior
+       FROM (SELECT completed_at,
+               LEAST(estimated_time::float/NULLIF(actual_time,0), actual_time::float/NULLIF(estimated_time,0))*100 AS ratio
+             FROM tasks_completed WHERE user_id=$1 AND estimated_time>0 AND actual_time>0 AND completed_at>=$3) sub`,
+      [userId, fourWeeksAgo.toISOString(), eightWeeksAgo.toISOString()]
+    );
+    const recentAcc = Math.round(parseFloat(accuracyR.rows[0]?.recent)||0);
+    const priorAcc  = Math.round(parseFloat(accuracyR.rows[0]?.prior)||0);
+    // Grade percentile
+    const gradeRankR = await pool.query(
+      `WITH ranked AS (SELECT user_id, PERCENT_RANK() OVER (ORDER BY tasks_completed ASC)*100 AS pct
+         FROM weekly_leaderboard WHERE grade=(SELECT grade FROM users WHERE id=$1) AND week_start=$2)
+       SELECT ROUND(pct) AS pct FROM ranked WHERE user_id=$1`, [userId, weekStartISO]
+    );
+
+    res.json({
+      globalCompletionsToday: parseInt(globalTodayR.rows[0].cnt),
+      userCompletionsToday:   parseInt(userTodayR.rows[0].cnt),
+      globalAvgWeek:          parseFloat(globalWeekR.rows[0].avg_tasks)||0,
+      userCompletionsThisWeek: parseInt(userWeekR.rows[0].cnt),
+      userCompletionsLastWeek: parseInt(userLastWeekR.rows[0].cnt),
+      streakPercentile:        Math.round(parseFloat(streakPercentileR.rows[0]?.percentile)||0),
+      userStreakDays,
+      globalAvgSessionMins:    parseFloat(globalSessionR.rows[0].avg_mins)||0,
+      userAvgSessionMins:      parseFloat(userSessionR.rows[0].avg_mins)||0,
+      bestDay:                 bestDayR.rows[0]?.dow?.trim()||null,
+      peakHour:                peakHourR.rows[0]?.hr??null,
+      accuracyDelta:           (recentAcc && priorAcc) ? (recentAcc-priorAcc) : null,
+      recentAcc,
+      gradePercentile:         gradeRankR.rows[0]?.pct!=null ? Math.round(parseFloat(gradeRankR.rows[0].pct)) : null,
+    });
+  } catch (err) {
+    console.error('Hub insights error:', err);
+    res.status(500).json({ error: 'Failed to load insights' });
   }
 });
 
@@ -4993,6 +5097,44 @@ app.post('/api/admin/users/:id/revoke-hacked-insignia', authenticateToken, requi
   }
 });
 
+// POST /api/admin/users/:id/set-credits — set a user's credit balance to an exact value
+app.post('/api/admin/users/:id/set-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { credits } = req.body;
+    if (credits === undefined || isNaN(parseInt(credits))) return res.status(400).json({ error: 'credits (integer) required' });
+    const targetId = parseInt(req.params.id);
+    const newBalance = Math.max(0, parseInt(credits));
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
+    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CREDITS', targetId, prev.rows[0].name, { prev: prev.rows[0].credits, new: newBalance });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) {
+    console.error('Admin set credits error:', err);
+    res.status(500).json({ error: 'Failed to set credits' });
+  }
+});
+
+// POST /api/admin/users/:id/adjust-credits — add or subtract credits from a user's balance
+app.post('/api/admin/users/:id/adjust-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { delta, reason } = req.body;
+    if (delta === undefined || isNaN(parseInt(delta))) return res.status(400).json({ error: 'delta (integer) required' });
+    const targetId = parseInt(req.params.id);
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
+    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const newBalance = Math.max(0, (prev.rows[0].credits || 0) + parseInt(delta));
+    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'ADJUST_CREDITS', targetId, prev.rows[0].name, { delta: parseInt(delta), prev: prev.rows[0].credits, new: newBalance, reason });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) {
+    console.error('Admin adjust credits error:', err);
+    res.status(500).json({ error: 'Failed to adjust credits' });
+  }
+});
+
 // POST /api/admin/grant-shields-all — grant one shield to ALL users
 app.post('/api/admin/grant-shields-all', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -5165,6 +5307,49 @@ app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, as
   }
 });
 
+// GET /api/admin/users/:id/canvas-token — decrypt and return the user's Canvas API token
+app.get('/api/admin/users/:id/canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    const userRow = await pool.query('SELECT canvas_api_token, canvas_api_token_iv, name FROM users WHERE id = $1', [targetId]);
+    if (userRow.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const u = userRow.rows[0];
+    const decrypted = getDecryptedCanvasToken(targetId, u);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'VIEW_CANVAS_TOKEN', targetId, u.name, {});
+    res.json({ token: decrypted || null });
+  } catch (err) {
+    console.error('Admin view canvas token error:', err);
+    res.status(500).json({ error: 'Failed to retrieve token' });
+  }
+});
+
+// POST /api/admin/users/:id/set-canvas-token — replace a user's Canvas API token
+app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { token: newToken } = req.body;
+    if (!newToken || !newToken.trim()) return res.status(400).json({ error: 'token is required' });
+    const targetId = parseInt(req.params.id);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(process.env.ENCRYPTION_KEY, 'hex'), iv);
+    let encrypted = cipher.update(newToken.trim(), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    const encryptedToken = `${encrypted}:${authTag}`;
+    await pool.query(
+      'UPDATE users SET canvas_api_token = $1, canvas_api_token_iv = $2 WHERE id = $3',
+      [encryptedToken, iv.toString('hex'), targetId]
+    );
+    invalidateCachedToken(targetId);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CANVAS_TOKEN', targetId, targetRes.rows[0]?.name, {});
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin set canvas token error:', err);
+    res.status(500).json({ error: 'Failed to set token' });
+  }
+});
 
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
 app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
