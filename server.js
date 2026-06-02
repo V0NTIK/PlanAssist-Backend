@@ -1368,10 +1368,9 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: err.message });
     }
 
-    // Step 2: Fetch assignments for ALL courses IN PARALLEL
-    // Window: 7 days ago → 90 days out, so recently-expired tasks aren't missed on sync
+    // Step 2: Fetch assignments for ALL courses IN PARALLEL (90-day window)
     const ninetyDaysOut = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
-    const sevenDaysBack = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const now = new Date();
     console.log('[MAIN SYNC] Fetching assignments in parallel...');
     const courseResults = await Promise.all(
       courses.map(async (course) => {
@@ -1389,7 +1388,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
               const effectiveDue = a.due_at || a.lock_at;
               if (!effectiveDue) return false;
               const d = new Date(effectiveDue);
-              return d >= sevenDaysBack && d <= ninetyDaysOut;
+              return d >= now && d <= ninetyDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (err) {
@@ -1499,8 +1498,8 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
     }
 
-    // 14-day forward + 7-day lookback — matches main sync so recently-expired tasks
-    // are not marked inactive just because they fell outside the window
+    // 14-day forward + 7-day lookback — matches main sync window so recently-expired
+    // tasks are not incorrectly marked inactive by the full-sync inactive logic.
     const now = new Date();
     const fourteenDaysOut = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
     const sevenDaysBack = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -1515,8 +1514,8 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
     const courseResults = await Promise.all(
       courses.map(async (course) => {
         try {
-          // bucket=upcoming removed — Canvas filters that to future-only, causing
-          // recently-expired assignments to be missed and incorrectly marked inactive
+          // Note: bucket=upcoming removed — Canvas filters that to future-only, which causes
+          // recently-expired assignments to be missed and incorrectly marked inactive.
           const resp = await axios.get(
             `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&updated_since=${encodeURIComponent(updatedSince)}`,
             { headers, timeout: 15000 }
@@ -2299,6 +2298,13 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       byUrlMap.get(r.url).push(r);
     });
 
+    // ── Step 2: Pre-fetch max grade_id ──
+    const gradeIdRes = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [userId]
+    );
+    let nextGradeId = parseInt(gradeIdRes.rows[0].max_id) + 1;
+
     const sortedTasks = [...tasks].sort((a, b) => {
       const dA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
       const dB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
@@ -2338,6 +2344,11 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         const scoreChanged = incomingScore != null && incomingScore !== existingScore;
         const gradeChanged = t.currentGrade != null && t.currentGrade !== existing.current_grade;
         const gradeFlipped = (scoreChanged || gradeChanged) && !existing.segment;
+        let gradeIdToUse = existing.grade_id;
+        if (gradeFlipped) {
+          gradeIdToUse = nextGradeId++;
+        }
+
         if (existing.segment) {
           // Segment task: only update display fields
           await pool.query(
@@ -2359,15 +2370,15 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                quiz_id=$9, points_possible=$10, assignment_group_id=$11,
                current_score=$12, current_grade=$13, grading_type=$14,
                unlock_at=$15, lock_at=$16, submitted_at=$17,
-               is_missing=$18, is_late=$19,
-               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
-             WHERE id=$21 AND user_id=$22`,
+               is_missing=$18, is_late=$19, grade_id=$20,
+               completed=$21, deleted=CASE WHEN $21 THEN true ELSE deleted END
+             WHERE id=$22 AND user_id=$23`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
              t.quizId ?? null, t.pointsPossible ?? null, t.assignmentGroupId ?? null,
              t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
              t.unlockAt ?? null, t.lockAt ?? null, t.submittedAt ?? null,
-             t.isMissing ?? false, t.isLate ?? false,
+             t.isMissing ?? false, t.isLate ?? false, gradeIdToUse,
              nowCompleted, existing.id, userId]
           );
         }
@@ -2381,7 +2392,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             console.error('[FEED] sync flip error:', err.message));
         }
         if (gradeFlipped) {
-          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore}`);
+          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
         }
         updatedCount++;
         insertedTaskIds.push(existing.id);
@@ -2395,8 +2406,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               course_id, assignment_id, quiz_id, points_possible, assignment_group_id,
               current_score, current_grade, grading_type,
               unlock_at, lock_at, submitted_at, is_missing, is_late,
-              completed, deleted, manually_created)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+              completed, deleted, manually_created, is_new)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
            RETURNING id`,
           [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
@@ -2406,7 +2417,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
            t.gradingType || 'points', t.unlockAt ?? null, t.lockAt ?? null,
            t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
            t.completed ?? false, t.completed ?? false, // deleted if already completed
-           false] // manually_created=false
+           false, true] // manually_created=false, is_new=true
         );
         const newId = result.rows[0].id;
         insertedTaskIds.push(newId);
@@ -2427,23 +2438,36 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
           const isThisWeek = completionDate && completionDate >= weekStart;
           if (isThisWeek) {
-            console.log(`  ★ New task already completed this week: "${t.title}" → leaderboard + feed`);
-            incrementLeaderboardForUser(userId).catch(err =>
-              console.error('[LEADERBOARD] new-complete error:', err.message));
-            addToCompletionFeed(userId, t.title, t.class).catch(err =>
-              console.error('[FEED] new-complete error:', err.message));
+            // Guard: only fire if not already recorded in tasks_completed — prevents
+            // re-inserted tasks (e.g. restored after inactive/deleted) from duplicating
+            const alreadyRecorded = await pool.query(
+              'SELECT 1 FROM tasks_completed WHERE id = $1', [newId]
+            );
+            if (alreadyRecorded.rowCount === 0) {
+              console.log(`  ★ New task already completed this week: "${t.title}" → leaderboard + feed`);
+              incrementLeaderboardForUser(userId).catch(err =>
+                console.error('[LEADERBOARD] new-complete error:', err.message));
+              addToCompletionFeed(userId, t.title, t.class).catch(err =>
+                console.error('[FEED] new-complete error:', err.message));
+            }
           }
         }
       }
     }
 
-    // ── Step 4: Soft-delete past-due incomplete tasks (always, even for partial) ──
-    const nowUtc = new Date().toISOString().split('T')[0];
+    // ── Step 4: Soft-delete past-due incomplete tasks (7+ days overdue only) ──
+    // Using a 7-day grace window so tasks that just went past due remain visible.
+    // Never deletes manually-created tasks.
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const sevenDaysAgoStr = sevenDaysAgo.toISOString().split('T')[0];
     const pastDueCleanup = await pool.query(
       `UPDATE tasks SET deleted=true, session_active=false
-       WHERE user_id=$1 AND completed=false AND deleted=false AND deadline_date < $2
+       WHERE user_id=$1 AND completed=false AND deleted=false
+         AND manually_created IS NOT TRUE
+         AND deadline_date < $2
        RETURNING id, title`,
-      [userId, nowUtc]
+      [userId, sevenDaysAgoStr]
     );
     if (pastDueCleanup.rowCount > 0) {
       console.log(`[SYNC-SAVE] Soft-deleted ${pastDueCleanup.rowCount} past-due task(s)`);
@@ -2539,6 +2563,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     let updatedCount = 0;
     let newCount = 0;
     const insertedTasks = [];
+
+    // Pre-fetch max grade_id once to avoid race conditions when multiple
+    // grade changes are detected in the same sync — increment locally
+    const gradeIdBaseResult = await pool.query(
+      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
+      [req.user.id]
+    );
+    let nextGradeId = parseInt(gradeIdBaseResult.rows[0].max_id) + 1;
 
     for (const incomingTask of sortedTasks) {
       // Check if this task already exists (match by assignment_id first, then URL)
@@ -2728,6 +2760,15 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null);
           const gradeChanged = incomingTask.currentGrade != null &&
             incomingTask.currentGrade !== existingTask.current_grade;
+          if (hasCanvasData && (scoreChanged || gradeChanged)) {
+            await pool.query(
+              'UPDATE tasks SET grade_id = $1 WHERE id = $2 AND user_id = $3',
+              [nextGradeId, existingTask.id, req.user.id]
+            );
+            console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
+            nextGradeId++;
+          }
+
           // If Canvas now marks the task completed and it wasn't before:
           if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
             // Only write tasks_completed if user hasn't manually resolved it already
@@ -2924,14 +2965,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 
     // === CLEANUP PAST DUE TASKS ===
-    // After sync, mark any incomplete tasks that are significantly past their deadline as deleted.
-    // Using 7-day grace period — tasks that expired yesterday still need to be visible.
-    // This is especially important end-of-term when many tasks go past due in quick succession.
+    // After sync, mark any incomplete tasks that are past their deadline as deleted
+    // This prevents old unfinished tasks from cluttering the task list
     console.log(`\n=== CLEANING UP PAST DUE TASKS ===`);
     
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    const sevenDaysAgoStr = sevenDaysAgo.toISOString().split('T')[0];
+    // Define today's date at midnight for comparison
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayDateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
@@ -2939,10 +2980,9 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
        WHERE user_id = $1 
          AND completed = false 
          AND deleted = false 
-         AND manually_created = false
          AND deadline_date < $2
        RETURNING id, title, deadline_date`,
-      [req.user.id, sevenDaysAgoStr]
+      [req.user.id, todayDateStr]
     );
     
     const cleanedUpCount = cleanupResult.rows.length;
@@ -4081,82 +4121,28 @@ app.get('/api/hub/insights', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const now = new Date();
     const todayUTC = now.toISOString().slice(0, 10);
-
-    // Global completions today
-    const globalTodayR = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]
-    );
-    // User completions today
-    const userTodayR = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at::date=$2::date`, [userId, todayUTC]
-    );
-    // Week start (Monday)
+    const globalTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]);
+    const userTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at::date=$2::date`, [userId, todayUTC]);
     const dow = now.getDay();
-    const weekStart = new Date(now);
-    weekStart.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
-    weekStart.setHours(0,0,0,0);
+    const weekStart = new Date(now); weekStart.setDate(now.getDate() - (dow===0?6:dow-1)); weekStart.setHours(0,0,0,0);
     const weekStartISO = weekStart.toISOString().slice(0,10);
-    // Global avg tasks this week per active user
-    const globalWeekR = await pool.query(
-      `SELECT AVG(cnt)::numeric(6,1) AS avg_tasks FROM (
-         SELECT user_id, COUNT(*) AS cnt FROM tasks_completed
-         WHERE completed_at >= $1 GROUP BY user_id HAVING COUNT(*) > 0) sub`, [weekStartISO]
-    );
-    // User streak percentile
+    const globalWeekR = await pool.query(`SELECT AVG(cnt)::numeric(6,1) AS avg_tasks FROM (SELECT user_id, COUNT(*) AS cnt FROM tasks_completed WHERE completed_at>=$1 GROUP BY user_id HAVING COUNT(*)>0) sub`, [weekStartISO]);
     const userStreakR = await pool.query(`SELECT insignia_days FROM users WHERE id=$1`, [userId]);
     const userStreakDays = userStreakR.rows[0]?.insignia_days || 0;
-    const streakPercentileR = await pool.query(
-      `SELECT COUNT(*)::float / NULLIF(COUNT(*),0) * 100 AS percentile
-       FROM users WHERE is_banned=false AND insignia_days > 0 AND insignia_days < $1`, [userStreakDays]
-    );
-    // Global avg session length
-    const globalSessionR = await pool.query(
-      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE actual_time>0 AND actual_time<300`
-    );
-    // User avg session length
-    const userSessionR = await pool.query(
-      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE user_id=$1 AND actual_time>0 AND actual_time<300`, [userId]
-    );
-    // Last week completions
+    const streakPercentileR = await pool.query(`SELECT COUNT(*)::float/NULLIF(COUNT(*),0)*100 AS percentile FROM users WHERE is_banned=false AND insignia_days>0 AND insignia_days<$1`, [userStreakDays]);
+    const globalSessionR = await pool.query(`SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE actual_time>0 AND actual_time<300`);
+    const userSessionR = await pool.query(`SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE user_id=$1 AND actual_time>0 AND actual_time<300`, [userId]);
     const lastWeekStart = new Date(weekStart); lastWeekStart.setDate(lastWeekStart.getDate()-7);
-    const userLastWeekR = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2 AND completed_at<$3`,
-      [userId, lastWeekStart.toISOString().slice(0,10), weekStartISO]
-    );
-    // This week completions
-    const userWeekR = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2`, [userId, weekStartISO]
-    );
-    // Best day
-    const bestDayR = await pool.query(
-      `SELECT TO_CHAR(completed_at,'Day') AS dow, COUNT(*) AS cnt FROM tasks_completed
-       WHERE user_id=$1 GROUP BY dow ORDER BY cnt DESC LIMIT 1`, [userId]
-    );
-    // Peak hour
-    const peakHourR = await pool.query(
-      `SELECT EXTRACT(HOUR FROM completed_at)::int AS hr, COUNT(*) AS cnt FROM tasks_completed
-       WHERE user_id=$1 GROUP BY hr ORDER BY cnt DESC LIMIT 1`, [userId]
-    );
-    // Accuracy trend (last 4 weeks vs prior 4 weeks)
+    const userLastWeekR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2 AND completed_at<$3`, [userId, lastWeekStart.toISOString().slice(0,10), weekStartISO]);
+    const userWeekR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2`, [userId, weekStartISO]);
+    const bestDayR = await pool.query(`SELECT TO_CHAR(completed_at,'Day') AS dow, COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 GROUP BY dow ORDER BY cnt DESC LIMIT 1`, [userId]);
+    const peakHourR = await pool.query(`SELECT EXTRACT(HOUR FROM completed_at)::int AS hr, COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 GROUP BY hr ORDER BY cnt DESC LIMIT 1`, [userId]);
     const fourWeeksAgo = new Date(weekStart); fourWeeksAgo.setDate(fourWeeksAgo.getDate()-28);
     const eightWeeksAgo = new Date(weekStart); eightWeeksAgo.setDate(eightWeeksAgo.getDate()-56);
-    const accuracyR = await pool.query(
-      `SELECT AVG(CASE WHEN completed_at>=$2 THEN ratio END) AS recent,
-              AVG(CASE WHEN completed_at<$2 AND completed_at>=$3 THEN ratio END) AS prior
-       FROM (SELECT completed_at,
-               LEAST(estimated_time::float/NULLIF(actual_time,0), actual_time::float/NULLIF(estimated_time,0))*100 AS ratio
-             FROM tasks_completed WHERE user_id=$1 AND estimated_time>0 AND actual_time>0 AND completed_at>=$3) sub`,
-      [userId, fourWeeksAgo.toISOString(), eightWeeksAgo.toISOString()]
-    );
+    const accuracyR = await pool.query(`SELECT AVG(CASE WHEN completed_at>=$2 THEN ratio END) AS recent, AVG(CASE WHEN completed_at<$2 AND completed_at>=$3 THEN ratio END) AS prior FROM (SELECT completed_at, LEAST(estimated_time::float/NULLIF(actual_time,0),actual_time::float/NULLIF(estimated_time,0))*100 AS ratio FROM tasks_completed WHERE user_id=$1 AND estimated_time>0 AND actual_time>0 AND completed_at>=$3) sub`, [userId, fourWeeksAgo.toISOString(), eightWeeksAgo.toISOString()]);
     const recentAcc = Math.round(parseFloat(accuracyR.rows[0]?.recent)||0);
     const priorAcc  = Math.round(parseFloat(accuracyR.rows[0]?.prior)||0);
-    // Grade percentile
-    const gradeRankR = await pool.query(
-      `WITH ranked AS (SELECT user_id, PERCENT_RANK() OVER (ORDER BY tasks_completed ASC)*100 AS pct
-         FROM weekly_leaderboard WHERE grade=(SELECT grade FROM users WHERE id=$1) AND week_start=$2)
-       SELECT ROUND(pct) AS pct FROM ranked WHERE user_id=$1`, [userId, weekStartISO]
-    );
-
+    const gradeRankR = await pool.query(`WITH ranked AS (SELECT user_id, PERCENT_RANK() OVER (ORDER BY tasks_completed ASC)*100 AS pct FROM weekly_leaderboard WHERE grade=(SELECT grade FROM users WHERE id=$1) AND week_start=$2) SELECT ROUND(pct) AS pct FROM ranked WHERE user_id=$1`, [userId, weekStartISO]);
     res.json({
       globalCompletionsToday: parseInt(globalTodayR.rows[0].cnt),
       userCompletionsToday:   parseInt(userTodayR.rows[0].cnt),
@@ -5033,29 +5019,53 @@ app.post('/api/admin/users/:id/grant-shield', authenticateToken, requireAdmin, a
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/admin/users/:id/grant-hacked-insignia — grant the "Hacked PlanAssist" insignia
-// This insignia can ONLY be obtained through this endpoint — it has no streak threshold.
+// POST /api/admin/users/:id/set-credits
+app.post('/api/admin/users/:id/set-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { credits } = req.body;
+    if (credits === undefined || isNaN(parseInt(credits))) return res.status(400).json({ error: 'credits required' });
+    const targetId = parseInt(req.params.id);
+    const newBalance = Math.max(0, parseInt(credits));
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id=$1', [targetId]);
+    if (!prev.rows[0]) return res.status(404).json({ error: 'User not found' });
+    await pool.query('UPDATE users SET credits=$1 WHERE id=$2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CREDITS', targetId, prev.rows[0].name, { prev: prev.rows[0].credits, new: newBalance });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) { console.error('Admin set credits error:', err); res.status(500).json({ error: 'Failed to set credits' }); }
+});
+
+// POST /api/admin/users/:id/adjust-credits
+app.post('/api/admin/users/:id/adjust-credits', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { delta, reason } = req.body;
+    if (delta === undefined || isNaN(parseInt(delta))) return res.status(400).json({ error: 'delta required' });
+    const targetId = parseInt(req.params.id);
+    const prev = await pool.query('SELECT credits, name FROM users WHERE id=$1', [targetId]);
+    if (!prev.rows[0]) return res.status(404).json({ error: 'User not found' });
+    const newBalance = Math.max(0, (prev.rows[0].credits || 0) + parseInt(delta));
+    await pool.query('UPDATE users SET credits=$1 WHERE id=$2', [newBalance, targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'ADJUST_CREDITS', targetId, prev.rows[0].name, { delta: parseInt(delta), prev: prev.rows[0].credits, new: newBalance, reason });
+    res.json({ success: true, credits: newBalance });
+  } catch (err) { console.error('Admin adjust credits error:', err); res.status(500).json({ error: 'Failed to adjust credits' }); }
+});
+
+// POST /api/admin/users/:id/grant-hacked-insignia
 app.post('/api/admin/users/:id/grant-hacked-insignia', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
     const label = 'Hacked PlanAssist';
     const targetRes = await pool.query('SELECT name FROM users WHERE id=$1', [targetId]);
     if (!targetRes.rows[0]) return res.status(404).json({ error: 'User not found' });
-    await pool.query(
-      `INSERT INTO insignia_unlocks (user_id, label, unlocked_at)
-       VALUES ($1, $2, NOW()) ON CONFLICT (user_id, label) DO NOTHING`,
-      [targetId, label]
-    );
+    await pool.query(`INSERT INTO insignia_unlocks (user_id, label, unlocked_at) VALUES ($1,$2,NOW()) ON CONFLICT (user_id, label) DO NOTHING`, [targetId, label]);
     const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_HACKED_INSIGNIA', targetId, targetRes.rows[0].name, {});
     res.json({ success: true });
-  } catch (err) {
-    console.error('Grant hacked insignia error:', err);
-    res.status(500).json({ error: 'Failed to grant insignia' });
-  }
+  } catch (err) { console.error('Grant hacked insignia error:', err); res.status(500).json({ error: 'Failed to grant insignia' }); }
 });
 
-// POST /api/admin/users/:id/revoke-hacked-insignia — revoke the "Hacked PlanAssist" insignia
+// POST /api/admin/users/:id/revoke-hacked-insignia
 app.post('/api/admin/users/:id/revoke-hacked-insignia', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
@@ -5069,48 +5079,7 @@ app.post('/api/admin/users/:id/revoke-hacked-insignia', authenticateToken, requi
     const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'REVOKE_HACKED_INSIGNIA', targetId, targetRes.rows[0].name, {});
     res.json({ success: true });
-  } catch (err) {
-    console.error('Revoke hacked insignia error:', err);
-    res.status(500).json({ error: 'Failed to revoke insignia' });
-  }
-});
-
-// POST /api/admin/users/:id/set-credits — set a user's credit balance to an exact value
-app.post('/api/admin/users/:id/set-credits', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { credits } = req.body;
-    if (credits === undefined || isNaN(parseInt(credits))) return res.status(400).json({ error: 'credits (integer) required' });
-    const targetId = parseInt(req.params.id);
-    const newBalance = Math.max(0, parseInt(credits));
-    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
-    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CREDITS', targetId, prev.rows[0].name, { prev: prev.rows[0].credits, new: newBalance });
-    res.json({ success: true, credits: newBalance });
-  } catch (err) {
-    console.error('Admin set credits error:', err);
-    res.status(500).json({ error: 'Failed to set credits' });
-  }
-});
-
-// POST /api/admin/users/:id/adjust-credits — add or subtract credits from a user's balance
-app.post('/api/admin/users/:id/adjust-credits', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { delta, reason } = req.body;
-    if (delta === undefined || isNaN(parseInt(delta))) return res.status(400).json({ error: 'delta (integer) required' });
-    const targetId = parseInt(req.params.id);
-    const prev = await pool.query('SELECT credits, name FROM users WHERE id = $1', [targetId]);
-    if (prev.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const newBalance = Math.max(0, (prev.rows[0].credits || 0) + parseInt(delta));
-    await pool.query('UPDATE users SET credits = $1 WHERE id = $2', [newBalance, targetId]);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'ADJUST_CREDITS', targetId, prev.rows[0].name, { delta: parseInt(delta), prev: prev.rows[0].credits, new: newBalance, reason });
-    res.json({ success: true, credits: newBalance });
-  } catch (err) {
-    console.error('Admin adjust credits error:', err);
-    res.status(500).json({ error: 'Failed to adjust credits' });
-  }
+  } catch (err) { console.error('Revoke hacked insignia error:', err); res.status(500).json({ error: 'Failed to revoke insignia' }); }
 });
 
 // POST /api/admin/grant-shields-all — grant one shield to ALL users
@@ -5170,8 +5139,6 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
       [req.params.id]
     );
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-
-    // Only fetch active (non-deleted, non-completed) tasks for the Active Tasks panel
     const tasksRes = await pool.query(
       `SELECT id, title, segment, class, deadline_date, deadline_time,
               completed, deleted, manually_created, session_active
@@ -5190,7 +5157,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
       `SELECT label, unlocked_at FROM insignia_unlocks WHERE user_id=$1 ORDER BY unlocked_at ASC`,
       [req.params.id]
     );
-    res.json({ user: { ...userRes.rows[0], credits: userRes.rows[0].credits }, tasks: tasksRes.rows, recentCompletions: completedRes.rows, insignia: insigniaRes.rows });
+    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, recentCompletions: completedRes.rows, insignia: insigniaRes.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user detail' });
   }
@@ -5272,34 +5239,27 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
 app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const targetId = req.params.id;
-    await pool.query(
-      `UPDATE users SET canvas_api_token = NULL, canvas_api_token_iv = NULL WHERE id = $1`, [targetId]
-    );
-    invalidateCachedToken(parseInt(targetId)); // Clear decrypt cache for this user
+    await pool.query(`UPDATE users SET canvas_api_token = NULL, canvas_api_token_iv = NULL WHERE id = $1`, [targetId]);
+    invalidateCachedToken(parseInt(targetId));
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'CLEAR_CANVAS_TOKEN', parseInt(targetId), targetRes.rows[0]?.name, {});
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to clear token' });
-  }
+  } catch (err) { res.status(500).json({ error: 'Failed to clear token' }); }
 });
 
 // GET /api/admin/users/:id/canvas-token — decrypt and return the user's Canvas API token
 app.get('/api/admin/users/:id/canvas-token', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
-    const userRow = await pool.query('SELECT canvas_api_token, canvas_api_token_iv, name FROM users WHERE id = $1', [targetId]);
-    if (userRow.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const userRow = await pool.query('SELECT canvas_api_token, canvas_api_token_iv, name FROM users WHERE id=$1', [targetId]);
+    if (!userRow.rows[0]) return res.status(404).json({ error: 'User not found' });
     const u = userRow.rows[0];
     const decrypted = getDecryptedCanvasToken(targetId, u);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'VIEW_CANVAS_TOKEN', targetId, u.name, {});
     res.json({ token: decrypted || null });
-  } catch (err) {
-    console.error('Admin view canvas token error:', err);
-    res.status(500).json({ error: 'Failed to retrieve token' });
-  }
+  } catch (err) { console.error('Admin view canvas token error:', err); res.status(500).json({ error: 'Failed to retrieve token' }); }
 });
 
 // POST /api/admin/users/:id/set-canvas-token — replace a user's Canvas API token
@@ -5314,19 +5274,13 @@ app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requireAdmi
     encrypted += cipher.final('hex');
     const authTag = cipher.getAuthTag().toString('hex');
     const encryptedToken = `${encrypted}:${authTag}`;
-    await pool.query(
-      'UPDATE users SET canvas_api_token = $1, canvas_api_token_iv = $2 WHERE id = $3',
-      [encryptedToken, iv.toString('hex'), targetId]
-    );
+    await pool.query('UPDATE users SET canvas_api_token=$1, canvas_api_token_iv=$2 WHERE id=$3', [encryptedToken, iv.toString('hex'), targetId]);
     invalidateCachedToken(targetId);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const targetRes = await pool.query('SELECT name FROM users WHERE id=$1', [targetId]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CANVAS_TOKEN', targetId, targetRes.rows[0]?.name, {});
     res.json({ success: true });
-  } catch (err) {
-    console.error('Admin set canvas token error:', err);
-    res.status(500).json({ error: 'Failed to set token' });
-  }
+  } catch (err) { console.error('Admin set canvas token error:', err); res.status(500).json({ error: 'Failed to set token' }); }
 });
 
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
@@ -6291,38 +6245,25 @@ app.get('/api/studios/:id/leaderboard', authenticateToken, async (req, res) => {
   try {
     const studioId = parseInt(req.params.id);
     const userId = req.user.id;
-
     const studioRes = await pool.query('SELECT * FROM hpt_studios WHERE id=$1', [studioId]);
     if (!studioRes.rows[0]) return res.status(404).json({ error: 'Studio not found' });
     const studio = studioRes.rows[0];
-
     let userIds = [];
     if (studio.setup_type === 'course' && studio.course_id) {
-      const r = await pool.query(
-        `SELECT DISTINCT c.user_id FROM courses c
-         JOIN users u ON u.id=c.user_id WHERE c.course_id=$1 AND u.is_banned=false`,
-        [studio.course_id]
-      );
+      const r = await pool.query(`SELECT DISTINCT c.user_id FROM courses c JOIN users u ON u.id=c.user_id WHERE c.course_id=$1 AND u.is_banned=false`, [studio.course_id]);
       userIds = r.rows.map(r => r.user_id);
     } else {
-      const r = await pool.query(
-        `SELECT sm.user_id FROM hpt_studio_members sm
-         JOIN users u ON u.id=sm.user_id WHERE sm.studio_id=$1 AND u.is_banned=false`,
-        [studioId]
-      );
+      const r = await pool.query(`SELECT sm.user_id FROM hpt_studio_members sm JOIN users u ON u.id=sm.user_id WHERE sm.studio_id=$1 AND u.is_banned=false`, [studioId]);
       userIds = r.rows.map(r => r.user_id);
     }
-
     if (!userIds.includes(userId)) return res.status(403).json({ error: 'Not a member of this studio' });
     if (userIds.length === 0) return res.json([]);
-
     const now = new Date();
     const dow = now.getDay();
     const weekStart = new Date(now);
     weekStart.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
     weekStart.setHours(0,0,0,0);
     const weekStartStr = weekStart.toISOString().slice(0,10);
-
     const rows = await pool.query(
       `SELECT u.id, u.name, u.insignia_selected,
               COALESCE(wl.tasks_completed, 0) AS tasks_completed
@@ -6332,11 +6273,8 @@ app.get('/api/studios/:id/leaderboard', authenticateToken, async (req, res) => {
        ORDER BY tasks_completed DESC`,
       [userIds, weekStartStr]
     );
-
     res.json(rows.rows.map((r, i) => ({
-      rank: i + 1,
-      user_id: r.id,
-      user_name: r.name,
+      rank: i + 1, user_id: r.id, user_name: r.name,
       insignia_selected: r.insignia_selected || 'Default',
       tasks_completed: parseInt(r.tasks_completed),
     })));
@@ -6476,40 +6414,10 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
         [userId, todayDate]
       );
 
-      // Active agenda (most recently updated non-finished agenda for this user)
-      let activeAgenda = null;
-      const agendaRes = await pool.query(
-        `SELECT id, name, rows, current_row, current_row_elapsed, current_row_countdown
-         FROM agendas
-         WHERE user_id=$1 AND finished=false
-         ORDER BY updated_at DESC LIMIT 1`,
-        [userId]
-      );
-      if (agendaRes.rows[0]) {
-        const ag = agendaRes.rows[0];
-        activeAgenda = {
-          id: ag.id, name: ag.name, rows: ag.rows,
-          currentRow: ag.current_row,
-          currentRowElapsed: ag.current_row_elapsed,
-          currentRowCountdown: ag.current_row_countdown,
-        };
-      }
-
-      // Recent agenda history (last 5 finished agendas)
-      const agendaHistRes = await pool.query(
-        `SELECT id, name, rows, current_row, updated_at
-         FROM agendas
-         WHERE user_id=$1 AND finished=true
-         ORDER BY updated_at DESC LIMIT 5`,
-        [userId]
-      );
-
       return {
         user: { id: user.id, name: user.name, grade: user.grade, lastSync: user.last_sync },
         isActive: !!activeTask,
         activeTask,
-        activeAgenda,
-        agendaHistory: agendaHistRes.rows,
         priorities,
         todayCompletions,
         urgentTasks: urgentRes.rows,
@@ -7006,11 +6914,11 @@ app.post('/api/rewards/claim-reactions', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-// POST /api/rewards/daily-chest — claim daily chest (once per UTC calendar day, server-side)
+// POST /api/rewards/daily-chest — claim daily chest (once per calendar day in user's timezone)
+// POST /api/rewards/daily-chest — claim daily chest (once per UTC calendar day, server-authoritative)
 app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
-  // Use the server's UTC date as the authoritative chest date.
-  // Never trust the client-supplied date — it can be spoofed by changing the device timezone.
-  const todayUTC = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD' in UTC
+  // Use the server's UTC date — never trust the client-supplied date (timezone exploit)
+  const todayUTC = new Date().toISOString().slice(0, 10);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -7021,15 +6929,7 @@ app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Already claimed today', nextAvailable: todayUTC });
     }
-    const CHEST_PRIZES = [
-      ...Array(12).fill(0),  ...Array(10).fill(2),  ...Array(9).fill(4),
-      ...Array(8).fill(6),   ...Array(7).fill(8),   ...Array(7).fill(10),
-      ...Array(6).fill(12),  ...Array(6).fill(15),  ...Array(5).fill(18),
-      ...Array(5).fill(20),  ...Array(4).fill(25),  ...Array(4).fill(30),
-      ...Array(3).fill(35),  ...Array(2).fill(40),  ...Array(1).fill(45),
-      ...Array(1).fill(50),
-    ];
-    const prize = CHEST_PRIZES[Math.floor(Math.random() * CHEST_PRIZES.length)];
+    const prize = Math.floor(Math.random() * 51);
     await client.query(
       'UPDATE users SET credits = credits + $1, last_daily_chest = $2 WHERE id = $3',
       [prize, todayUTC, req.user.id]
