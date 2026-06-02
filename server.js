@@ -2385,11 +2385,34 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
 
         if (completionFlip) {
           completionFlips++;
-          console.log(`  ★ Completion flip detected for "${existing.title}" → updating leaderboard + feed`);
-          incrementLeaderboardForUser(userId).catch(err =>
-            console.error('[LEADERBOARD] sync flip error:', err.message));
-          addToCompletionFeed(userId, existing.title, existing.class).catch(err =>
-            console.error('[FEED] sync flip error:', err.message));
+          console.log(`  ★ Completion flip detected for "${existing.title}" → checking tasks_completed…`);
+          // Guard 1: task must not already be in tasks_completed (prevents double-counting
+          //          on re-syncs of tasks that were completed outside PlanAssist).
+          // Guard 2: the completion must be within this calendar week — tasks submitted
+          //          weeks ago and now entering the sync window for the first time should
+          //          not retroactively count toward this week's leaderboard.
+          const alreadyRecordedFlip = await pool.query(
+            'SELECT 1 FROM tasks_completed WHERE id = $1', [existing.id]
+          );
+          if (alreadyRecordedFlip.rowCount === 0) {
+            const weekStart = new Date();
+            weekStart.setHours(0, 0, 0, 0);
+            weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+            const completionDate = t.submittedAt ? new Date(t.submittedAt)
+              : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
+            const isThisWeek = completionDate && completionDate >= weekStart;
+            if (isThisWeek) {
+              console.log(`  ★ → confirmed new this-week completion, firing leaderboard + feed`);
+              incrementLeaderboardForUser(userId).catch(err =>
+                console.error('[LEADERBOARD] sync flip error:', err.message));
+              addToCompletionFeed(userId, existing.title, existing.class).catch(err =>
+                console.error('[FEED] sync flip error:', err.message));
+            } else {
+              console.log(`  ★ → completion date outside this week, skipping leaderboard`);
+            }
+          } else {
+            console.log(`  ★ → already in tasks_completed, skipping leaderboard`);
+          }
         }
         if (gradeFlipped) {
           console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
@@ -2787,9 +2810,26 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
               );
               console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
             }
-            // Leaderboard fires regardless of deleted status — student submitted on Canvas
-            updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
-            console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip)`);
+            // Guard: only increment leaderboard if this completion is genuinely new this week.
+            const alreadyCounted = await pool.query(
+              'SELECT 1 FROM tasks_completed WHERE id = $1', [existingTask.id]
+            );
+            if (alreadyCounted.rowCount > 0) {
+              console.log(`  ★ Task ${existingTask.id} already in tasks_completed — skipping leaderboard`);
+            } else {
+              const weekStart = new Date();
+              weekStart.setHours(0,0,0,0);
+              weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+              const completionDate = incomingTask.submittedAt ? new Date(incomingTask.submittedAt)
+                : (incomingTask.deadlineDate ? new Date(incomingTask.deadlineDate + 'T00:00:00') : null);
+              const isThisWeek = completionDate && completionDate >= weekStart;
+              if (isThisWeek) {
+                updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
+                console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip, this week)`);
+              } else {
+                console.log(`  ★ Task ${existingTask.id} completed outside this week — skipping leaderboard`);
+              }
+            }
           }
 
           // If task was previously dismissed (deleted=true), treat it as a new task for sidebar/count purposes
