@@ -1906,6 +1906,9 @@ app.get('/api/courses/:courseId/assignment-groups', authenticateToken, async (re
 app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) => {
   try {
     const { courseId } = req.params;
+    if (!courseId || courseId === 'null' || isNaN(parseInt(courseId))) {
+      return res.json({ averageScore: null, studentCount: 0 });
+    }
     
     const result = await pool.query(
       `SELECT AVG(
@@ -6322,12 +6325,11 @@ app.get('/api/studios/:id/leaderboard', authenticateToken, async (req, res) => {
 
     const rows = await pool.query(
       `SELECT u.id, u.name, u.insignia_selected,
-              COALESCE(wl.tasks_completed, 0) AS tasks_completed,
-              COALESCE(wl.total_study_mins, 0) AS total_study_mins
+              COALESCE(wl.tasks_completed, 0) AS tasks_completed
        FROM users u
        LEFT JOIN weekly_leaderboard wl ON wl.user_id=u.id AND wl.week_start=$2
        WHERE u.id=ANY($1) AND u.is_banned=false
-       ORDER BY tasks_completed DESC, total_study_mins DESC`,
+       ORDER BY tasks_completed DESC`,
       [userIds, weekStartStr]
     );
 
@@ -6337,7 +6339,6 @@ app.get('/api/studios/:id/leaderboard', authenticateToken, async (req, res) => {
       user_name: r.name,
       insignia_selected: r.insignia_selected || 'Default',
       tasks_completed: parseInt(r.tasks_completed),
-      total_study_mins: parseInt(r.total_study_mins),
     })));
   } catch (err) {
     console.error('Studio leaderboard error:', err);
