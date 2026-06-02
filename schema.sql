@@ -194,8 +194,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- State flags
     completed               BOOLEAN DEFAULT FALSE,
     deleted                 BOOLEAN DEFAULT FALSE,          -- Ignored/checked off; preserved across syncs
-    ignored                 BOOLEAN DEFAULT FALSE,          -- Explicitly ignored (shown in Resolved tab)
-    is_new                  BOOLEAN DEFAULT FALSE,          -- Freshly imported; pending user acknowledgement
     session_active          BOOLEAN DEFAULT FALSE,          -- Timer is currently running
     session_heartbeat       TIMESTAMPTZ,                    -- Last heartbeat from an active timer (NULL if not in session)
     split_origin            BOOLEAN DEFAULT FALSE,          -- Original task before a split was performed
@@ -208,7 +206,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     current_score           NUMERIC(10,2),
     current_grade           VARCHAR(50),
     grading_type            VARCHAR(50),                    -- 'points' | 'percent' | 'letter_grade' | 'gpa_scale' | 'pass_fail' | 'not_graded'
-    grade_id                INTEGER,                        -- Monotonically increasing; used to detect new grade events
     unlock_at               TIMESTAMP,
     lock_at                 TIMESTAMP,
     submitted_at            TIMESTAMP,
@@ -227,8 +224,6 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_date       DATE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_time       TIME;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_estimated_time INTEGER;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS accumulated_time    INTEGER DEFAULT 0;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ignored             BOOLEAN DEFAULT FALSE;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_new              BOOLEAN DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_active      BOOLEAN DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS session_heartbeat   TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS split_origin        BOOLEAN DEFAULT FALSE;
@@ -240,7 +235,11 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignment_group_id BIGINT;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_score       NUMERIC(10,2);
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_grade       VARCHAR(50);
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grading_type        VARCHAR(50);
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS grade_id            INTEGER;
+-- Remove dead columns (ignored and is_new were never used in production)
+ALTER TABLE tasks DROP COLUMN IF EXISTS ignored;
+ALTER TABLE tasks DROP COLUMN IF EXISTS is_new;
+-- Remove grade_id — legacy grade-change counter superseded by grade_history
+ALTER TABLE tasks DROP COLUMN IF EXISTS grade_id;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unlock_at           TIMESTAMP;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lock_at             TIMESTAMP;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submitted_at        TIMESTAMP;
@@ -270,7 +269,6 @@ CREATE INDEX IF NOT EXISTS idx_tasks_url              ON tasks(url);
 CREATE INDEX IF NOT EXISTS idx_tasks_deadline_date    ON tasks(deadline_date);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed        ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_deleted          ON tasks(deleted);
-CREATE INDEX IF NOT EXISTS idx_tasks_is_new           ON tasks(is_new);
 CREATE INDEX IF NOT EXISTS idx_tasks_segment          ON tasks(segment);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignment_id    ON tasks(assignment_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_quiz_id          ON tasks(quiz_id) WHERE quiz_id IS NOT NULL;
@@ -278,7 +276,6 @@ CREATE INDEX IF NOT EXISTS idx_tasks_inactive         ON tasks(user_id, inactive
 CREATE INDEX IF NOT EXISTS idx_tasks_course_id        ON tasks(course_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignment_group ON tasks(assignment_group_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_session_active   ON tasks(user_id, session_active) WHERE session_active = TRUE;
-CREATE INDEX IF NOT EXISTS idx_tasks_user_grade_id    ON tasks(user_id, grade_id) WHERE grade_id IS NOT NULL;
 
 
 -- ============================================================================
