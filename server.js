@@ -3915,12 +3915,15 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
       'UPDATE users SET insignia_days = $1 WHERE id = $2 AND insignia_days != $1',
       [days, req.user.id]
     );
+    // Respect notif_achievements pref — only mark unread if the user wants achievement alerts
+    const prefR = await pool.query('SELECT notif_achievements FROM users WHERE id=$1', [req.user.id]);
+    const wantsAchievNotifs = prefR.rows[0]?.notif_achievements !== false;
     const newlyUnlocked = [];
     for (const [threshold, label] of INSIGNIA_THRESHOLDS) {
       if (days >= threshold) {
         const ins = await pool.query(
-          'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, true) ON CONFLICT DO NOTHING RETURNING label',
-          [req.user.id, label]
+          'INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING label',
+          [req.user.id, label, wantsAchievNotifs]
         ).catch(() =>
           pool.query('INSERT INTO insignia_unlocks (user_id, label) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING label', [req.user.id, label])
         );
@@ -3952,11 +3955,15 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const newBadges = [];
 
+    // Respect notif_achievements pref
+    const prefR = await pool.query('SELECT notif_achievements FROM users WHERE id=$1', [userId]);
+    const wantsAchievNotifs = prefR.rows[0]?.notif_achievements !== false;
+
     // Helper: award badge if not already awarded
     const award = async (key, awardedAt) => {
       const r = await pool.query(
-        'INSERT INTO user_badges (user_id, badge_key, awarded_at, unread) VALUES ($1,$2,$3,true) ON CONFLICT DO NOTHING RETURNING badge_key',
-        [userId, key, awardedAt || new Date()]
+        'INSERT INTO user_badges (user_id, badge_key, awarded_at, unread) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING badge_key',
+        [userId, key, awardedAt || new Date(), wantsAchievNotifs]
       ).catch(() =>
         pool.query('INSERT INTO user_badges (user_id, badge_key, awarded_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING badge_key', [userId, key, awardedAt || new Date()])
       );
@@ -6967,7 +6974,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const result = await pool.query(
       `SELECT * FROM (
-         -- Unread grade notifications (must have graded_at or submitted_at — synced_at alone is not a user-facing date)
+         -- Unread grade notifications
          SELECT 'grade_' || id::text AS id, 'grade' AS type, title,
                 course_name AS body, html_url AS link_url, unread AS is_unread,
                 COALESCE(graded_at, submitted_at) AS event_time,
@@ -6980,7 +6987,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
          UNION ALL
 
-         -- Unread insignia unlocks (must have unlocked_at)
+         -- Unread insignia unlocks
          SELECT 'insignia_' || id::text, 'insignia',
                 '🎖️ ' || label || ' Insignia Unlocked',
                 'You unlocked a new Insignia tier!', NULL, unread,
@@ -6992,7 +6999,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
          UNION ALL
 
-         -- Unread badge awards (must have awarded_at)
+         -- Unread badge awards
          SELECT 'badge_' || id::text, 'badge',
                 '🏆 ' || REPLACE(INITCAP(REPLACE(badge_key,'_',' ')),' ',' ') || ' Badge Earned',
                 'You earned a new Gallery badge!', NULL, unread,
@@ -7004,7 +7011,8 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
          UNION ALL
 
-         -- Canvas activity (announcements, discussions, messages) — event_at is NOT NULL by schema
+         -- Canvas activity (announcements, discussions, messages) — ALL items for Updates tab
+         -- (unread flag preserved per-row; frontend filters by tab)
          SELECT 'canvas_' || id::text, type, title, body, link_url, unread,
                 event_at, id,
                 NULL::numeric, NULL::numeric, NULL::varchar, NULL::varchar,
@@ -7014,7 +7022,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 
          UNION ALL
 
-         -- Unread studio joins (hpt_studio_members)
+         -- Unread studio joins
          SELECT 'studio_' || sm.id::text, 'studio',
                 '📚 Joined Studio: ' || s.name,
                 (SELECT hu.name FROM hpt_users hu WHERE hu.id = s.created_by), NULL, sm.unread,
@@ -7026,10 +7034,19 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
            AND sm.joined_at IS NOT NULL
        ) combined
        WHERE event_time IS NOT NULL
-       ORDER BY event_time DESC
-       LIMIT 100`,
+       ORDER BY is_unread DESC, event_time DESC
+       LIMIT 200`,
       [userId]
     );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[NOTIFICATIONS] fetch error:', err.message);
+    if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
+      return res.json([]);
+    }
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
+});
     res.json(result.rows);
   } catch (err) {
     // If canvas_activity or new columns don't exist yet (pre-migration), return empty
