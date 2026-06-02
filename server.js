@@ -1368,9 +1368,10 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch courses from Canvas', details: err.message });
     }
 
-    // Step 2: Fetch assignments for ALL courses IN PARALLEL (90-day window)
+    // Step 2: Fetch assignments for ALL courses IN PARALLEL
+    // Window: 7 days ago → 90 days out, so recently-expired tasks aren't missed on sync
     const ninetyDaysOut = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
-    const now = new Date();
+    const sevenDaysBack = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     console.log('[MAIN SYNC] Fetching assignments in parallel...');
     const courseResults = await Promise.all(
       courses.map(async (course) => {
@@ -1388,7 +1389,7 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
               const effectiveDue = a.due_at || a.lock_at;
               if (!effectiveDue) return false;
               const d = new Date(effectiveDue);
-              return d >= now && d <= ninetyDaysOut;
+              return d >= sevenDaysBack && d <= ninetyDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (err) {
@@ -1498,24 +1499,26 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch courses', details: err.message });
     }
 
-    // 14-day window
+    // 14-day forward + 7-day lookback — matches main sync so recently-expired tasks
+    // are not marked inactive just because they fell outside the window
     const now = new Date();
     const fourteenDaysOut = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
-    const dueAfter = now.toISOString();
-    const dueBefore = fourteenDaysOut.toISOString();
+    const sevenDaysBack = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
     // updated_since: use last_sync if available, otherwise 24h ago as safe fallback
     const updatedSince = userRow.last_sync
       ? new Date(userRow.last_sync).toISOString()
       : new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 
-    console.log(`[BG SYNC] Window: ${dueAfter} → ${dueBefore} | updated_since: ${updatedSince}`);
+    console.log(`[BG SYNC] Window: ${sevenDaysBack.toISOString()} → ${fourteenDaysOut.toISOString()} | updated_since: ${updatedSince}`);
 
     const courseResults = await Promise.all(
       courses.map(async (course) => {
         try {
+          // bucket=upcoming removed — Canvas filters that to future-only, causing
+          // recently-expired assignments to be missed and incorrectly marked inactive
           const resp = await axios.get(
-            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&bucket=upcoming&updated_since=${encodeURIComponent(updatedSince)}`,
+            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100&updated_since=${encodeURIComponent(updatedSince)}`,
             { headers, timeout: 15000 }
           );
           const all = Array.isArray(resp.data) ? resp.data : [];
@@ -1524,7 +1527,7 @@ app.post('/api/canvas/background-sync', authenticateToken, async (req, res) => {
               const effectiveDue = a.due_at || a.lock_at;
               if (!effectiveDue) return false;
               const d = new Date(effectiveDue);
-              return d >= now && d <= fourteenDaysOut;
+              return d >= sevenDaysBack && d <= fourteenDaysOut;
             })
             .map(a => ({ ...a, course_name: course.name, course_id: course.id }));
         } catch (err) {
@@ -2293,13 +2296,6 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
       byUrlMap.get(r.url).push(r);
     });
 
-    // ── Step 2: Pre-fetch max grade_id ──
-    const gradeIdRes = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [userId]
-    );
-    let nextGradeId = parseInt(gradeIdRes.rows[0].max_id) + 1;
-
     const sortedTasks = [...tasks].sort((a, b) => {
       const dA = new Date(`${a.deadlineDate}T${a.deadlineTime || '23:59:59'}Z`);
       const dB = new Date(`${b.deadlineDate}T${b.deadlineTime || '23:59:59'}Z`);
@@ -2339,11 +2335,6 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         const scoreChanged = incomingScore != null && incomingScore !== existingScore;
         const gradeChanged = t.currentGrade != null && t.currentGrade !== existing.current_grade;
         const gradeFlipped = (scoreChanged || gradeChanged) && !existing.segment;
-        let gradeIdToUse = existing.grade_id;
-        if (gradeFlipped) {
-          gradeIdToUse = nextGradeId++;
-        }
-
         if (existing.segment) {
           // Segment task: only update display fields
           await pool.query(
@@ -2365,15 +2356,15 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                quiz_id=$9, points_possible=$10, assignment_group_id=$11,
                current_score=$12, current_grade=$13, grading_type=$14,
                unlock_at=$15, lock_at=$16, submitted_at=$17,
-               is_missing=$18, is_late=$19, grade_id=$20,
-               completed=$21, deleted=CASE WHEN $21 THEN true ELSE deleted END
-             WHERE id=$22 AND user_id=$23`,
+               is_missing=$18, is_late=$19,
+               completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
+             WHERE id=$21 AND user_id=$22`,
             [t.title, t.class, t.description || '', t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
              t.quizId ?? null, t.pointsPossible ?? null, t.assignmentGroupId ?? null,
              t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
              t.unlockAt ?? null, t.lockAt ?? null, t.submittedAt ?? null,
-             t.isMissing ?? false, t.isLate ?? false, gradeIdToUse,
+             t.isMissing ?? false, t.isLate ?? false,
              nowCompleted, existing.id, userId]
           );
         }
@@ -2387,7 +2378,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             console.error('[FEED] sync flip error:', err.message));
         }
         if (gradeFlipped) {
-          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore} (grade_id=${gradeIdToUse})`);
+          console.log(`  ★ Grade change for "${existing.title}": ${existing.current_score}→${t.currentScore}`);
         }
         updatedCount++;
         insertedTaskIds.push(existing.id);
@@ -2401,8 +2392,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               course_id, assignment_id, quiz_id, points_possible, assignment_group_id,
               current_score, current_grade, grading_type,
               unlock_at, lock_at, submitted_at, is_missing, is_late,
-              completed, deleted, manually_created, is_new)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+              completed, deleted, manually_created)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
            RETURNING id`,
           [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
@@ -2412,7 +2403,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
            t.gradingType || 'points', t.unlockAt ?? null, t.lockAt ?? null,
            t.submittedAt ?? null, t.isMissing ?? false, t.isLate ?? false,
            t.completed ?? false, t.completed ?? false, // deleted if already completed
-           false, true] // manually_created=false, is_new=true
+           false] // manually_created=false
         );
         const newId = result.rows[0].id;
         insertedTaskIds.push(newId);
@@ -2545,14 +2536,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     let updatedCount = 0;
     let newCount = 0;
     const insertedTasks = [];
-
-    // Pre-fetch max grade_id once to avoid race conditions when multiple
-    // grade changes are detected in the same sync — increment locally
-    const gradeIdBaseResult = await pool.query(
-      'SELECT COALESCE(MAX(grade_id), 0) AS max_id FROM tasks WHERE user_id = $1',
-      [req.user.id]
-    );
-    let nextGradeId = parseInt(gradeIdBaseResult.rows[0].max_id) + 1;
 
     for (const incomingTask of sortedTasks) {
       // Check if this task already exists (match by assignment_id first, then URL)
@@ -2742,15 +2725,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             (existingTask.current_score != null ? parseFloat(existingTask.current_score) : null);
           const gradeChanged = incomingTask.currentGrade != null &&
             incomingTask.currentGrade !== existingTask.current_grade;
-          if (hasCanvasData && (scoreChanged || gradeChanged)) {
-            await pool.query(
-              'UPDATE tasks SET grade_id = $1 WHERE id = $2 AND user_id = $3',
-              [nextGradeId, existingTask.id, req.user.id]
-            );
-            console.log(`  ★ Grade change detected for task ${existingTask.id}, assigned grade_id=${nextGradeId}`);
-            nextGradeId++;
-          }
-
           // If Canvas now marks the task completed and it wasn't before:
           if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
             // Only write tasks_completed if user hasn't manually resolved it already
@@ -2947,14 +2921,14 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 
     // === CLEANUP PAST DUE TASKS ===
-    // After sync, mark any incomplete tasks that are past their deadline as deleted
-    // This prevents old unfinished tasks from cluttering the task list
+    // After sync, mark any incomplete tasks that are significantly past their deadline as deleted.
+    // Using 7-day grace period — tasks that expired yesterday still need to be visible.
+    // This is especially important end-of-term when many tasks go past due in quick succession.
     console.log(`\n=== CLEANING UP PAST DUE TASKS ===`);
     
-    // Define today's date at midnight for comparison
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayDateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const sevenDaysAgoStr = sevenDaysAgo.toISOString().split('T')[0];
     
     const cleanupResult = await pool.query(
       `UPDATE tasks 
@@ -2962,9 +2936,10 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
        WHERE user_id = $1 
          AND completed = false 
          AND deleted = false 
+         AND manually_created = false
          AND deadline_date < $2
        RETURNING id, title, deadline_date`,
-      [req.user.id, todayDateStr]
+      [req.user.id, sevenDaysAgoStr]
     );
     
     const cleanedUpCount = cleanupResult.rows.length;
@@ -5156,7 +5131,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
               u.is_new_user, u.campus, u.tz_periods, u.schedule_enhanced, u.created_at, u.last_sync,
-              u.streak_shields_available,
+              u.streak_shields_available, u.credits,
               u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
               MAX(tc.completed_at) AS last_completion,
