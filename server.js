@@ -4104,6 +4104,184 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
   }
 });
 
+// GET /api/hub/insights — global aggregates for rich Insight cards on the Hub.
+// Returns lightweight global stats only; no PII exposed.
+app.get('/api/hub/insights', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date();
+
+    // ── Global: completions today ────────────────────────────────────────────
+    const todayUTC = now.toISOString().slice(0, 10);
+    const globalTodayR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE completed_at::date = $1::date`,
+      [todayUTC]
+    );
+    const globalCompletionsToday = parseInt(globalTodayR.rows[0].cnt);
+
+    // ── User: completions today ──────────────────────────────────────────────
+    const userTodayR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id = $1 AND completed_at::date = $2::date`,
+      [userId, todayUTC]
+    );
+    const userCompletionsToday = parseInt(userTodayR.rows[0].cnt);
+
+    // ── Global: average tasks completed this week (per active user) ──────────
+    const weekStart = new Date(now);
+    const dayOfWeek = weekStart.getDay();
+    weekStart.setDate(weekStart.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+    weekStart.setHours(0, 0, 0, 0);
+    const weekStartISO = weekStart.toISOString().slice(0, 10);
+
+    const globalWeekR = await pool.query(
+      `SELECT AVG(cnt)::numeric(6,1) AS avg_tasks
+       FROM (
+         SELECT user_id, COUNT(*) AS cnt
+         FROM tasks_completed
+         WHERE completed_at >= $1
+         GROUP BY user_id
+         HAVING COUNT(*) > 0
+       ) sub`,
+      [weekStartISO]
+    );
+    const globalAvgWeek = parseFloat(globalWeekR.rows[0].avg_tasks) || 0;
+
+    // ── Global: streak percentile for this user ──────────────────────────────
+    const userStreakR = await pool.query(
+      `SELECT insignia_days FROM users WHERE id = $1`, [userId]
+    );
+    const userStreakDays = userStreakR.rows[0]?.insignia_days || 0;
+
+    const streakPercentileR = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE insignia_days < $1)::float /
+         NULLIF(COUNT(*), 0) * 100 AS percentile
+       FROM users
+       WHERE is_banned = false AND insignia_days > 0`,
+      [userStreakDays]
+    );
+    const streakPercentile = Math.round(parseFloat(streakPercentileR.rows[0]?.percentile) || 0);
+
+    // ── Global: average session length in minutes (across all users) ─────────
+    const globalSessionR = await pool.query(
+      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins
+       FROM tasks_completed
+       WHERE actual_time > 0 AND actual_time < 300`  // cap outliers at 5h
+    );
+    const globalAvgSessionMins = parseFloat(globalSessionR.rows[0].avg_mins) || 0;
+
+    // ── User: average session length ─────────────────────────────────────────
+    const userSessionR = await pool.query(
+      `SELECT AVG(actual_time)::numeric(6,1) AS avg_mins
+       FROM tasks_completed
+       WHERE user_id = $1 AND actual_time > 0 AND actual_time < 300`,
+      [userId]
+    );
+    const userAvgSessionMins = parseFloat(userSessionR.rows[0].avg_mins) || 0;
+
+    // ── User: completions last week (for momentum comparison) ────────────────
+    const lastWeekStart = new Date(weekStart);
+    lastWeekStart.setDate(lastWeekStart.getDate() - 7);
+    const lastWeekStartISO = lastWeekStart.toISOString().slice(0, 10);
+
+    const userLastWeekR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id = $1 AND completed_at >= $2 AND completed_at < $3`,
+      [userId, lastWeekStartISO, weekStartISO]
+    );
+    const userCompletionsLastWeek = parseInt(userLastWeekR.rows[0].cnt);
+
+    // ── User: completions this week ──────────────────────────────────────────
+    const userWeekR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed
+       WHERE user_id = $1 AND completed_at >= $2`,
+      [userId, weekStartISO]
+    );
+    const userCompletionsThisWeek = parseInt(userWeekR.rows[0].cnt);
+
+    // ── User: most productive day of week ────────────────────────────────────
+    const bestDayR = await pool.query(
+      `SELECT TO_CHAR(completed_at, 'Day') AS dow, COUNT(*) AS cnt
+       FROM tasks_completed
+       WHERE user_id = $1
+       GROUP BY dow ORDER BY cnt DESC LIMIT 1`,
+      [userId]
+    );
+    const bestDay = bestDayR.rows[0]?.dow?.trim() || null;
+
+    // ── User: peak productivity hour ─────────────────────────────────────────
+    const peakHourR = await pool.query(
+      `SELECT EXTRACT(HOUR FROM completed_at)::int AS hr, COUNT(*) AS cnt
+       FROM tasks_completed
+       WHERE user_id = $1
+       GROUP BY hr ORDER BY cnt DESC LIMIT 1`,
+      [userId]
+    );
+    const peakHour = peakHourR.rows[0]?.hr ?? null;
+
+    // ── User: accuracy trend (last 4 weeks vs prior 4 weeks) ─────────────────
+    const fourWeeksAgo = new Date(weekStart);
+    fourWeeksAgo.setDate(fourWeeksAgo.getDate() - 28);
+    const eightWeeksAgo = new Date(weekStart);
+    eightWeeksAgo.setDate(eightWeeksAgo.getDate() - 56);
+
+    const accuracyTrendR = await pool.query(
+      `SELECT
+         AVG(CASE WHEN completed_at >= $2 THEN ratio END) AS recent_acc,
+         AVG(CASE WHEN completed_at < $2 AND completed_at >= $3 THEN ratio END) AS prior_acc
+       FROM (
+         SELECT completed_at,
+           LEAST(estimated_time::float / NULLIF(actual_time,0),
+                 actual_time::float / NULLIF(estimated_time,0)) * 100 AS ratio
+         FROM tasks_completed
+         WHERE user_id = $1 AND estimated_time > 0 AND actual_time > 0
+           AND completed_at >= $3
+       ) sub`,
+      [userId, fourWeeksAgo.toISOString(), eightWeeksAgo.toISOString()]
+    );
+    const recentAcc  = Math.round(parseFloat(accuracyTrendR.rows[0]?.recent_acc)  || 0);
+    const priorAcc   = Math.round(parseFloat(accuracyTrendR.rows[0]?.prior_acc)   || 0);
+    const accuracyDelta = (recentAcc && priorAcc) ? (recentAcc - priorAcc) : null;
+
+    // ── Grade rank ───────────────────────────────────────────────────────────
+    const gradeRankR = await pool.query(
+      `WITH ranked AS (
+         SELECT user_id,
+           PERCENT_RANK() OVER (ORDER BY tasks_completed ASC) * 100 AS pct
+         FROM weekly_leaderboard
+         WHERE grade = (SELECT grade FROM users WHERE id=$1)
+           AND week_start = $2
+       )
+       SELECT ROUND(pct) AS pct FROM ranked WHERE user_id = $1`,
+      [userId, weekStartISO]
+    );
+    const gradePercentile = gradeRankR.rows[0]?.pct != null
+      ? Math.round(parseFloat(gradeRankR.rows[0].pct)) : null;
+
+    res.json({
+      globalCompletionsToday,
+      userCompletionsToday,
+      globalAvgWeek,
+      userCompletionsThisWeek,
+      userCompletionsLastWeek,
+      streakPercentile,
+      userStreakDays,
+      globalAvgSessionMins,
+      userAvgSessionMins,
+      bestDay,
+      peakHour,
+      accuracyDelta,
+      recentAcc,
+      gradePercentile,
+    });
+  } catch (err) {
+    console.error('Hub insights error:', err);
+    res.status(500).json({ error: 'Failed to load insights' });
+  }
+});
+
 // Update user feed preference
 app.put('/api/user/feed-preference', authenticateToken, async (req, res) => {
   try {
@@ -6514,6 +6692,29 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
       goalSnapshot = goalsR.rows[idx];
     }
 
+    // ── Global comparison stats for HPT insights ──────────────────────────────
+    const globalTodayAllR = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1`, [todayStr]
+    );
+    const globalCompletionsToday = parseInt(globalTodayAllR.rows[0].cnt);
+
+    const globalWeekAvgR = await pool.query(
+      `SELECT AVG(cnt)::numeric(6,1) AS avg_tasks
+       FROM (SELECT user_id, COUNT(*) AS cnt FROM tasks_completed
+             WHERE completed_at >= $1 GROUP BY user_id HAVING COUNT(*) > 0) sub`,
+      [weekStart.toISOString()]
+    );
+    const globalAvgWeek = parseFloat(globalWeekAvgR.rows[0].avg_tasks) || 0;
+
+    const globalAccR = await pool.query(
+      `SELECT ROUND(AVG(LEAST(estimated_time::float/NULLIF(actual_time,0),
+                              actual_time::float/NULLIF(estimated_time,0))*100)) AS avg_acc
+       FROM tasks_completed WHERE estimated_time > 0 AND actual_time > 0`
+    );
+    const globalAvgAccuracy = parseInt(globalAccR.rows[0].avg_acc) || 0;
+
+    const perStudentWeek = userIds.length > 0 ? (tasksWeek / userIds.length) : 0;
+
     res.json({
       stats: { tasksToday, tasksWeek, totalStudyMins, accuracy, streak },
       feed: feedR.rows,
@@ -6521,6 +6722,10 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
       goalSnapshot,
       inProgress,
       studentCount: userIds.length,
+      globalCompletionsToday,
+      globalAvgWeek,
+      globalAvgAccuracy,
+      perStudentWeek: parseFloat(perStudentWeek.toFixed(1)),
     });
   } catch (err) {
     console.error('[HPT HUB] error:', err.message, err.stack?.split('\n')[1]);
