@@ -6384,7 +6384,10 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
     const now = new Date();
     // Heartbeat threshold — if last heartbeat > 3 min ago, session is considered stale
     const heartbeatCutoff = new Date(now.getTime() - 3 * 60 * 1000).toISOString();
-    const todayDate = now.toISOString().slice(0, 10);
+    // Use the client-supplied local date if provided (avoids UTC rollover issues).
+    const todayDate = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? req.query.date
+      : now.toISOString().slice(0, 10);
 
     const students = await Promise.all(userIds.map(async (userId) => {
       // Basic user info
