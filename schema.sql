@@ -247,6 +247,7 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_missing          BOOLEAN DEFAULT F
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_late             BOOLEAN DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS quiz_id             BIGINT;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS inactive            BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS restorative         BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Widen NUMERIC columns to NUMERIC(10,2) to prevent overflow from large Canvas point values.
 -- NUMERIC(6,2) caps at 9999.99 and NUMERIC(8,2) caps at 999999.99 — both reachable in
