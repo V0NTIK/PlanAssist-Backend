@@ -5187,7 +5187,7 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
 // PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin)
 app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, grade, campus, is_admin } = req.body;
+    const { name, grade, campus, is_admin, email, password } = req.body;
     const targetId = parseInt(req.params.id);
 
     // Prevent self-demotion
@@ -5206,6 +5206,17 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
       fields.push(`tz_periods = $${idx++}`); vals.push(getEffectivePeriods(resolvedCampus));
     }
     if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
+    if (email !== undefined && email.trim()) {
+      // Check for duplicate email
+      const existing = await pool.query('SELECT id FROM users WHERE email=$1 AND id!=$2', [email.trim().toLowerCase(), targetId]);
+      if (existing.rows.length > 0) return res.status(400).json({ error: 'Email already in use by another account.' });
+      fields.push(`email = $${idx++}`); vals.push(email.trim().toLowerCase());
+    }
+    if (password !== undefined && password.trim()) {
+      if (password.trim().length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+      const hashed = await bcrypt.hash(password.trim(), 10);
+      fields.push(`password = $${idx++}`); vals.push(hashed);
+    }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
     vals.push(targetId);
@@ -5213,10 +5224,13 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
 
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, req.body);
+    const logFields = { ...req.body };
+    if (logFields.password) logFields.password = '[REDACTED]'; // never log plaintext passwords
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, logFields);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to update user' });
+    console.error('Admin edit user error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to update user' });
   }
 });
 
