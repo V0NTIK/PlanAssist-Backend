@@ -3457,7 +3457,8 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       // Feed: only Canvas tasks done in Session/Agenda with time > 0
       addToCompletionFeed(req.user.id, task.title, task.class, {
         manuallyCreated: task.manually_created || false,
-        timeSpent: timeSpent || 0
+        timeSpent: timeSpent || 0,
+        restorative: task.restorative || false
       }).catch(err => console.error('Feed update failed:', err));
 
       // Leaderboard: only if Canvas has confirmed the submission (canvasCompleted=true)
@@ -4267,7 +4268,7 @@ async function updateLeaderboardOnCompletion(userId) {
 }
 
 // Helper function to add to completion feed
-async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreated = false, timeSpent = 0 } = {}) {
+async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreated = false, timeSpent = 0, restorative = false } = {}) {
   try {
     // ── Always increment insignia_days on the first completion of each UTC day ──
     // This runs regardless of feed opt-in, manual creation, or time spent,
@@ -4286,9 +4287,9 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
       console.log(`[INSIGNIA] Incremented insignia_days for user ${userId}`);
     }
 
-    // ── Feed entry: only Canvas tasks completed with time > 0 ──
+    // ── Feed entry: only Canvas tasks completed with time > 0, never restorative ──
     // Feed rule: only Canvas tasks (not manually created) completed with time > 0
-    if (manuallyCreated || !(timeSpent > 0)) return;
+    if (manuallyCreated || !(timeSpent > 0) || restorative) return;
 
     // Get user info
     const userResult = await pool.query(
@@ -5531,8 +5532,9 @@ app.post('/api/tasks/:taskId/restore', authenticateToken, async (req, res) => {
     );
 
     // Restore the task — deadline order is automatic, no priority needed
+    // Mark restorative=TRUE permanently so this task never appears in the feed again.
     await pool.query(
-      `UPDATE tasks SET completed = FALSE, deleted = FALSE
+      `UPDATE tasks SET completed = FALSE, deleted = FALSE, restorative = TRUE
        WHERE id = $1 AND user_id = $2`,
       [taskId, req.user.id]
     );
@@ -6384,7 +6386,6 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
     const now = new Date();
     // Heartbeat threshold — if last heartbeat > 3 min ago, session is considered stale
     const heartbeatCutoff = new Date(now.getTime() - 3 * 60 * 1000).toISOString();
-    // Use the client-supplied local date if provided (avoids UTC rollover issues).
     const todayDate = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
       ? req.query.date
       : now.toISOString().slice(0, 10);
@@ -6586,8 +6587,6 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     }
 
     const now = new Date();
-    // Use the client-supplied local date if provided (avoids UTC rollover issues
-    // for NA teachers checking in the evening when UTC is already tomorrow).
     const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
       ? req.query.date
       : now.toISOString().slice(0, 10);
