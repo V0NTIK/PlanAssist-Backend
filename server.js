@@ -6583,7 +6583,11 @@ app.get('/api/hpt/hub', authenticateHPT, async (req, res) => {
     }
 
     const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
+    // Use the client-supplied local date if provided (avoids UTC rollover issues
+    // for NA teachers checking in the evening when UTC is already tomorrow).
+    const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? req.query.date
+      : now.toISOString().slice(0, 10);
     const weekStart = new Date(now);
     const dow = weekStart.getDay();
     weekStart.setDate(weekStart.getDate() - (dow === 0 ? 6 : dow - 1));
