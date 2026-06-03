@@ -815,7 +815,7 @@ app.post('/api/auth/login', async (req, res) => {
 const CAMPUS_PERIODS = {
   'Ashland':        '2-6',
   'Barbados':       '1-5',
-  'Calgary':        '4-8',
+  'Calgary':        '3-7',
   'Chesapeake':     '2-6',
   'Chicago':        '3-7',
   'Council Bluffs': '3-7',
@@ -853,7 +853,7 @@ const CAMPUS_PERIODS = {
 const CAMPUS_PERIODS_DST = {
   'Ashland':        '2-6',
   'Barbados':       '2-6',
-  'Calgary':        '4-8',
+  'Calgary':        '3-7',
   'Chesapeake':     '2-6',
   'Chicago':        '3-7',
   'Council Bluffs': '3-7',
@@ -1377,11 +1377,19 @@ app.post('/api/canvas/sync', authenticateToken, async (req, res) => {
     const courseResults = await Promise.all(
       courses.map(async (course) => {
         try {
-          const resp = await axios.get(
-            `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`,
-            { headers, timeout: 15000 }
-          );
-          const all = Array.isArray(resp.data) ? resp.data : [];
+          // Paginate through all assignments (Canvas caps at 100 per page)
+          let allAssignments = [];
+          let url = `${CANVAS_API_BASE}/courses/${course.id}/assignments?include[]=submission&per_page=100`;
+          while (url) {
+            const resp = await axios.get(url, { headers, timeout: 15000 });
+            const page = Array.isArray(resp.data) ? resp.data : [];
+            allAssignments = allAssignments.concat(page);
+            // Follow Link: next header for pagination
+            const linkHeader = resp.headers?.link || '';
+            const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+            url = nextMatch ? nextMatch[1] : null;
+          }
+          const all = allAssignments;
           console.log(`  [MAIN SYNC] ${course.name}: ${all.length} assignments`);
           return all
             .filter(a => {
@@ -4927,7 +4935,7 @@ const auditLog = async (adminId, adminName, action, targetUserId, targetUserName
 app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, user_id, user_email, user_name, feedback_text, created_at
+      `SELECT id, user_id, user_email, user_name, feedback_text, created_at, checked
        FROM feedback
        ORDER BY created_at DESC
        LIMIT 200`
@@ -4937,6 +4945,35 @@ app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res)
     console.error('Get admin feedback error:', err);
     res.status(500).json({ error: 'Failed to fetch feedback' });
   }
+});
+
+// PATCH /api/admin/feedback/:id/checked — toggle checked status
+app.patch('/api/admin/feedback/:id/checked', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { checked } = req.body;
+    await pool.query('UPDATE feedback SET checked = $1 WHERE id = $2', [!!checked, req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/admin/log — get shared admin log content
+app.get('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT content, updated_at FROM admin_log WHERE id = 1');
+    res.json({ content: r.rows[0]?.content || '', updatedAt: r.rows[0]?.updated_at || null });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/admin/log — save shared admin log content
+app.put('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { content } = req.body;
+    await pool.query(
+      'UPDATE admin_log SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
+      [content || '', req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /api/admin/announcements — all active (and recent inactive) for admin view
@@ -5376,7 +5413,7 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
       `SELECT u.name as user_name, t.url, COUNT(*) as count
        FROM tasks t JOIN users u ON u.id = t.user_id
        WHERE t.deleted = false AND t.completed = false AND t.url IS NOT NULL
-         AND t.segment IS NULL
+         AND t.segment IS NULL AND t.manually_created = false
        GROUP BY u.name, t.url HAVING COUNT(*) > 1
        ORDER BY count DESC LIMIT 20`
     );
@@ -7022,29 +7059,39 @@ app.post('/api/rewards/claim-reactions', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-// POST /api/rewards/daily-chest — claim daily chest (once per calendar day in user's timezone)
-// POST /api/rewards/daily-chest — claim daily chest (once per UTC calendar day, server-authoritative)
+// POST /api/rewards/daily-chest — claim daily chest (24-hour cooldown, server-authoritative)
+// Uses a 24-hour window from the last claim timestamp — not a calendar date —
+// so switching timezones or waiting for UTC midnight cannot be exploited.
 app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
-  // Use the server's UTC date — never trust the client-supplied date (timezone exploit)
-  const todayUTC = new Date().toISOString().slice(0, 10);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const r = await client.query('SELECT credits, last_daily_chest FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
     const lastChest = r.rows[0]?.last_daily_chest;
-    const lastChestStr = lastChest ? (lastChest instanceof Date ? lastChest.toISOString().slice(0,10) : String(lastChest).slice(0,10)) : null;
-    if (lastChestStr === todayUTC) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Already claimed today', nextAvailable: todayUTC });
+    const now = new Date();
+    // Enforce 24-hour cooldown from the last claim timestamp
+    if (lastChest) {
+      const lastClaimMs = new Date(lastChest).getTime();
+      const msElapsed = now.getTime() - lastClaimMs;
+      if (msElapsed < 24 * 60 * 60 * 1000) {
+        await client.query('ROLLBACK');
+        const nextAvailable = new Date(lastClaimMs + 24 * 60 * 60 * 1000).toISOString();
+        return res.status(400).json({ error: 'Already claimed today', nextAvailable });
+      }
     }
     const prize = Math.floor(Math.random() * 51);
     await client.query(
       'UPDATE users SET credits = credits + $1, last_daily_chest = $2 WHERE id = $3',
-      [prize, todayUTC, req.user.id]
+      [prize, now.toISOString(), req.user.id]
     );
     await client.query('COMMIT');
     const balR = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
     res.json({ prize, credits: balR.rows[0].credits });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Chest claim failed' });
+  } finally { client.release(); }
+});
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: 'Chest claim failed' });
