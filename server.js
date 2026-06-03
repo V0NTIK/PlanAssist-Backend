@@ -6435,6 +6435,67 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
         [userId, todayDate]
       );
 
+      // Active agenda (unfinished) — grab the most recently updated one
+      const activeAgendaRes = await pool.query(
+        `SELECT id, name, rows, current_row, current_row_countdown, updated_at
+         FROM agendas
+         WHERE user_id=$1 AND finished=false
+         ORDER BY updated_at DESC LIMIT 1`,
+        [userId]
+      );
+      let activeAgenda = null;
+      if (activeAgendaRes.rows[0]) {
+        const a = activeAgendaRes.rows[0];
+        const rawRows = a.rows || [];
+        // Hydrate task titles
+        const taskIds = [...new Set(rawRows.map(r => r.taskId).filter(Boolean))];
+        const taskTitleMap = {};
+        if (taskIds.length > 0) {
+          const tRes = await pool.query('SELECT id, title FROM tasks WHERE id=ANY($1)', [taskIds]);
+          tRes.rows.forEach(t => { taskTitleMap[t.id] = t.title; });
+        }
+        activeAgenda = {
+          id: a.id,
+          name: a.name,
+          rows: rawRows.map(r => ({
+            task: taskTitleMap[r.taskId] || r.task || null,
+            zone: r.zone || null,
+            timeMins: r.timeMins || 25,
+          })),
+          currentRow: a.current_row ?? 0,
+          currentRowCountdown: a.current_row_countdown ?? null,
+        };
+      }
+
+      // Agenda history — last 5 finished agendas (no need to hydrate titles for history)
+      const agendaHistRes = await pool.query(
+        `SELECT id, name, rows, current_row, updated_at
+         FROM agendas
+         WHERE user_id=$1 AND finished=true
+         ORDER BY updated_at DESC LIMIT 5`,
+        [userId]
+      );
+      const agendaHistory = await Promise.all(agendaHistRes.rows.map(async a => {
+        const rawRows = a.rows || [];
+        const taskIds = [...new Set(rawRows.map(r => r.taskId).filter(Boolean))];
+        const taskTitleMap = {};
+        if (taskIds.length > 0) {
+          const tRes = await pool.query('SELECT id, title FROM tasks WHERE id=ANY($1)', [taskIds]);
+          tRes.rows.forEach(t => { taskTitleMap[t.id] = t.title; });
+        }
+        return {
+          id: a.id,
+          name: a.name,
+          rows: rawRows.map(r => ({
+            task: taskTitleMap[r.taskId] || r.task || null,
+            zone: r.zone || null,
+            timeMins: r.timeMins || 25,
+          })),
+          current_row: a.current_row ?? 0,
+          updated_at: a.updated_at,
+        };
+      }));
+
       return {
         user: { id: user.id, name: user.name, grade: user.grade, lastSync: user.last_sync },
         isActive: !!activeTask,
@@ -6442,6 +6503,8 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
         priorities,
         todayCompletions,
         urgentTasks: urgentRes.rows,
+        activeAgenda,
+        agendaHistory,
       };
     }));
 
