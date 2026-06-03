@@ -97,6 +97,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_studios              BOOLEAN   
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
 ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
 ALTER TABLE users DROP COLUMN IF EXISTS tz_periods_dst;
+
+-- Backfill Calgary users whose tz_periods was incorrectly set to '4-8'
+UPDATE users SET tz_periods = '3-7' WHERE campus = 'Calgary' AND tz_periods = '4-8';
 ALTER TABLE users DROP COLUMN IF EXISTS email_notifications;
 ALTER TABLE users DROP COLUMN IF EXISTS calendar_today_centered;
 
