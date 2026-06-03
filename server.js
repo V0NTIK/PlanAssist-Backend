@@ -5079,7 +5079,7 @@ app.post('/api/admin/users/:id/grant-hacked-insignia', authenticateToken, requir
     const label = 'Hacked PlanAssist';
     const targetRes = await pool.query('SELECT name FROM users WHERE id=$1', [targetId]);
     if (!targetRes.rows[0]) return res.status(404).json({ error: 'User not found' });
-    await pool.query(`INSERT INTO insignia_unlocks (user_id, label, unlocked_at) VALUES ($1,$2,NOW()) ON CONFLICT (user_id, label) DO NOTHING`, [targetId, label]);
+    await pool.query(`INSERT INTO insignia_unlocks (user_id, label, unlocked_at, unread) VALUES ($1,$2,NOW(),true) ON CONFLICT (user_id, label) DO NOTHING`, [targetId, label]);
     const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
     await auditLog(req.user.id, adminRes.rows[0]?.name, 'GRANT_HACKED_INSIGNIA', targetId, targetRes.rows[0].name, {});
     res.json({ success: true });
@@ -6811,7 +6811,9 @@ app.post('/api/credits/buy-insignia', authenticateToken, async (req, res) => {
     if ((balR.rows[0]?.credits ?? 0) < cost) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Insufficient credits', credits: balR.rows[0]?.credits ?? 0, cost }); }
     // Deduct and unlock
     await client.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [cost, req.user.id]);
-    await client.query('INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1,$2,true) ON CONFLICT DO NOTHING', [req.user.id, label]);
+    const prefR = await client.query('SELECT notif_achievements FROM users WHERE id=$1', [req.user.id]);
+    const wantsNotif = prefR.rows[0]?.notif_achievements !== false;
+    await client.query('INSERT INTO insignia_unlocks (user_id, label, unread) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, label, wantsNotif]);
     await client.query('COMMIT');
     const updated = await pool.query('SELECT credits FROM users WHERE id=$1', [req.user.id]);
     res.json({ success: true, credits: updated.rows[0].credits });
@@ -6845,11 +6847,12 @@ app.get('/api/rewards/status', authenticateToken, async (req, res) => {
     const spinsAvailable = lb ? Math.max(0, lb.tasks_completed - lb.spins_taken) : 0;
     const weeklyEntry = lb ? { tasks: lb.tasks_completed, spinsTaken: lb.spins_taken, spinsAvailable } : null;
 
-    // Claimable reactions (reacted within last 7 days, not yet claimed, on this user's entries)
+    // Claimable reactions (reacted within last 7 days, not yet claimed, on this user's entries, not self-reactions)
     const reactionR = await pool.query(
       `SELECT COUNT(*) AS cnt FROM feed_reactions fr
        JOIN completion_feed cf ON cf.id = fr.feed_entry_id
        WHERE cf.user_id = $1
+         AND fr.user_id != $1
          AND fr.credits_claimed = false
          AND fr.created_at >= NOW() - INTERVAL '7 days'`,
       [userId]
@@ -7040,16 +7043,6 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('[NOTIFICATIONS] fetch error:', err.message);
-    if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
-      return res.json([]);
-    }
-    res.status(500).json({ error: 'Failed to load notifications' });
-  }
-});
-    res.json(result.rows);
-  } catch (err) {
-    // If canvas_activity or new columns don't exist yet (pre-migration), return empty
     console.error('[NOTIFICATIONS] fetch error:', err.message);
     if (err.message.includes('does not exist') || err.message.includes('column') || err.message.includes('relation')) {
       return res.json([]);
