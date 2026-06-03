@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
                                     CHECK (streak_shield_mode IN ('manual', 'automatic')),
     -- Credits currency
     credits                     INTEGER         NOT NULL DEFAULT 0,
-    last_daily_chest            DATE,           -- Date (user local) of last chest claim — YYYY-MM-DD
+    last_daily_chest            TIMESTAMPTZ,    -- Timestamp of last chest claim; 24-hour cooldown enforced server-side
     -- Campus & period offsets (replaces present_periods)
     campus                      VARCHAR(50)     DEFAULT 'Ashland',
     tz_periods                  VARCHAR(10)     DEFAULT '2-6',      -- Present periods
@@ -77,7 +77,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS insignia_selected          VARCHAR(30
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER      DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS credits                    INTEGER      NOT NULL DEFAULT 0;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_chest           DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_chest           TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
@@ -619,6 +619,22 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_user_id    ON feedback(user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at DESC);
 
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS checked BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ============================================================================
+-- ADMIN LOG
+-- Single-row table holding admin-editable shared log/notes document.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS admin_log (
+    id          INTEGER PRIMARY KEY DEFAULT 1,
+    content     TEXT NOT NULL DEFAULT '',
+    updated_at  TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_by  INTEGER REFERENCES users(id)
+);
+
+INSERT INTO admin_log (id, content) VALUES (1, '')
+ON CONFLICT (id) DO NOTHING;
+
 
 -- ============================================================================
 -- HELP CONTENT
@@ -755,7 +771,9 @@ WHERE label NOT IN ('Default','Bronze','Silver','Gold',
                     'Obsidian','Diamond','Antimatter',
                     -- purchased insignias
                     'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
-                    'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core');
+                    'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core',
+                    -- admin-granted insignias
+                    'Hacked PlanAssist');
 
 -- Rename old earned Aether → Antimatter (Aether is now a purchased insignia name)
 -- Any existing Aether rows are from the old earned tier and should become Antimatter.
@@ -770,7 +788,8 @@ WHERE insignia_selected NOT IN (
   'Emerald','Sapphire','Ruby','Amethyst',
   'Obsidian','Diamond','Antimatter',
   'Meteorite','Dragonbone','Celestium','Aether','Soulstone',
-  'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core'
+  'Starlight','Astral Crystal','Dark Matter','Neutronium','Singularity Core',
+  'Hacked PlanAssist'
 );
 
 -- Backfill first_completion gallery badge
@@ -1042,7 +1061,17 @@ DROP TABLE IF EXISTS notifications CASCADE;
 
 -- ALTER TABLE migrations for live DB (no-ops if columns already exist)
 ALTER TABLE users             ADD COLUMN IF NOT EXISTS credits          INTEGER  NOT NULL DEFAULT 0;
-ALTER TABLE users             ADD COLUMN IF NOT EXISTS last_daily_chest DATE;
+ALTER TABLE users             ADD COLUMN IF NOT EXISTS last_daily_chest TIMESTAMPTZ;
+-- Migrate existing DATE column to TIMESTAMPTZ if needed
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='users' AND column_name='last_daily_chest' AND data_type='date'
+  ) THEN
+    ALTER TABLE users ALTER COLUMN last_daily_chest TYPE TIMESTAMPTZ
+      USING last_daily_chest::TIMESTAMPTZ;
+  END IF;
+END $$;
 ALTER TABLE weekly_leaderboard ADD COLUMN IF NOT EXISTS spins_taken     INTEGER  NOT NULL DEFAULT 0;
 ALTER TABLE feed_reactions    ADD COLUMN IF NOT EXISTS credits_claimed  BOOLEAN  NOT NULL DEFAULT FALSE;
 
