@@ -7092,11 +7092,6 @@ app.post('/api/rewards/daily-chest', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Chest claim failed' });
   } finally { client.release(); }
 });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    res.status(500).json({ error: 'Chest claim failed' });
-  } finally { client.release(); }
-});
 // and canvas_activity (announcements, discussions, messages).
 // No separate notifications table; unread flags live on the source rows.
 // ============================================================================
