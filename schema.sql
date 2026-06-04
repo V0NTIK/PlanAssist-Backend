@@ -78,6 +78,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shields_available   INTEGER   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_shield_mode         VARCHAR(10)  DEFAULT 'manual';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS credits                    INTEGER      NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_chest           TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_public             BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
