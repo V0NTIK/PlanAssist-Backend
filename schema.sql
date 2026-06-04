@@ -641,6 +641,20 @@ ON CONFLICT (id) DO NOTHING;
 
 
 -- ============================================================================
+-- IP BLACKLIST
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS ip_blacklist (
+    id          SERIAL PRIMARY KEY,
+    ip_address  VARCHAR(45) NOT NULL UNIQUE,
+    reason      TEXT,
+    blocked_by  INTEGER REFERENCES users(id),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ip_blacklist_ip ON ip_blacklist(ip_address);
+
+
+-- ============================================================================
 -- HELP CONTENT
 -- Single-row table holding admin-editable help page markdown.
 -- ============================================================================
