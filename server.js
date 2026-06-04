@@ -30,6 +30,29 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+// ── IP Blacklist middleware ────────────────────────────────────────────────
+// Cache loaded once at startup and refreshed after any admin change.
+let ipBlacklistCache = new Set();
+async function loadIpBlacklist() {
+  try {
+    const r = await pool.query('SELECT ip_address FROM ip_blacklist');
+    ipBlacklistCache = new Set(r.rows.map(r => r.ip_address));
+    console.log(`[IP BLACKLIST] Loaded ${ipBlacklistCache.size} blocked IPs`);
+  } catch (e) { console.error('[IP BLACKLIST] Load error:', e.message); }
+}
+// Load on startup (after pool is ready) — deferred slightly so pool is connected
+setTimeout(loadIpBlacklist, 3000);
+
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection?.remoteAddress || '';
+  // Normalize IPv4-mapped IPv6 (::ffff:1.2.3.4 → 1.2.3.4)
+  const normalized = ip.replace(/^::ffff:/, '');
+  if (ipBlacklistCache.has(normalized) || ipBlacklistCache.has(ip)) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  next();
+});
+
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -5014,6 +5037,7 @@ app.patch('/api/admin/feedback/:id/checked', authenticateToken, requireAdmin, as
 });
 
 // GET /api/admin/log — get shared admin log content
+// GET /api/admin/log — get shared admin log content
 app.get('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const r = await pool.query('SELECT content, updated_at FROM admin_log WHERE id = 1');
@@ -5029,6 +5053,47 @@ app.put('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
       'UPDATE admin_log SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
       [content || '', req.user.id]
     );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── IP Blacklist admin endpoints ──────────────────────────────────────────
+// GET /api/admin/ip-blacklist
+app.get('/api/admin/ip-blacklist', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT b.id, b.ip_address, b.reason, b.created_at, u.name AS blocked_by_name
+       FROM ip_blacklist b LEFT JOIN users u ON u.id = b.blocked_by
+       ORDER BY b.created_at DESC`
+    );
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/admin/ip-blacklist — add IP
+app.post('/api/admin/ip-blacklist', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { ip_address, reason } = req.body;
+    if (!ip_address?.trim()) return res.status(400).json({ error: 'IP address required' });
+    // Basic validation: IPv4 or IPv6
+    const ip = ip_address.trim();
+    const ipv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(ip);
+    const ipv6 = /^[0-9a-fA-F:]+$/.test(ip);
+    if (!ipv4 && !ipv6) return res.status(400).json({ error: 'Invalid IP address format' });
+    await pool.query(
+      'INSERT INTO ip_blacklist (ip_address, reason, blocked_by) VALUES ($1, $2, $3) ON CONFLICT (ip_address) DO UPDATE SET reason = $2, blocked_by = $3',
+      [ip, reason?.trim() || null, req.user.id]
+    );
+    await loadIpBlacklist(); // refresh cache immediately
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/admin/ip-blacklist/:id — remove IP
+app.delete('/api/admin/ip-blacklist/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM ip_blacklist WHERE id = $1', [req.params.id]);
+    await loadIpBlacklist(); // refresh cache immediately
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5441,7 +5506,7 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
     // a) Users who haven't synced recently (no Main/Background Sync in 7 days)
     // Uses last_sync column updated by sync-save endpoint
     const staleSyncRes = await pool.query(
-      `SELECT id, name, email, grade, last_sync
+      `SELECT id, name, email, grade, campus, last_sync
        FROM users
        WHERE is_new_user = false
          AND (last_sync IS NULL OR last_sync < NOW() - INTERVAL '7 days')
@@ -5490,7 +5555,7 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
 
     // f) New user signups (last 14 days)
     const newUsersRes = await pool.query(
-      `SELECT id, name, email, grade, created_at, is_new_user
+      `SELECT id, name, email, grade, campus, created_at, is_new_user
        FROM users
        WHERE created_at > NOW() - INTERVAL '3 days'
        ORDER BY created_at DESC`
