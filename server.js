@@ -3835,7 +3835,8 @@ app.get('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
 app.post('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => {
   try {
     const { emoji } = req.body;
-    if (!emoji) return res.status(400).json({ error: 'emoji required' });
+    const ALLOWED_EMOJIS = ['👏','⚡','🔥','💯','🎯'];
+    if (!emoji || !ALLOWED_EMOJIS.includes(emoji)) return res.status(400).json({ error: 'Invalid emoji' });
     await pool.query(
       `INSERT INTO feed_reactions (feed_entry_id, user_id, emoji)
        VALUES ($1, $2, $3)
