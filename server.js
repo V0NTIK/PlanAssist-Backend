@@ -801,7 +801,9 @@ app.post('/api/auth/login', async (req, res) => {
         email: user.email, 
         name: user.name,
         isNewUser: user.is_new_user,
-        showInFeed: user.show_in_feed !== false
+        showInFeed: user.show_in_feed !== false,
+      profilePublic: user.profile_public !== false,
+        profilePublic: user.profile_public !== false
       } 
     });
   } catch (error) {
@@ -928,7 +930,7 @@ function getEffectivePeriods(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, last_sync FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -2527,12 +2529,18 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             inactiveResult.rows.forEach(t => console.log(`  - "${t.title}"`));
           }
         }
-        // Re-activate tasks that re-appear in Canvas after being marked inactive
-        if (insertedTaskIds.length > 0) {
+        // Re-activate tasks that re-appear in Canvas after being marked inactive.
+        // Uses assignment_id (not just insertedTaskIds) so existing tasks that were
+        // inactive but returned in the Canvas response are also un-flagged.
+        if (seenAssignmentIds.length > 0) {
           await pool.query(
             `UPDATE tasks SET inactive = false
-             WHERE user_id = $1 AND id = ANY($2) AND inactive = true`,
-            [userId, insertedTaskIds]
+             WHERE user_id = $1
+               AND inactive = true
+               AND manually_created = false
+               AND assignment_id IS NOT NULL
+               AND assignment_id::text = ANY($2)`,
+            [userId, seenAssignmentIds]
           );
         }
       } catch (inactiveErr) {
@@ -4054,7 +4062,7 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
 app.get('/api/completion-feed', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT cf.id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at,
+      `SELECT cf.id, cf.user_id, cf.user_name, cf.user_grade, cf.task_title, cf.task_class, cf.completed_at,
               COALESCE(u.insignia_selected, 'Default') AS insignia,
               COALESCE(
                 (SELECT json_agg(json_build_object('emoji', fr.emoji, 'count', fr.cnt))
@@ -4091,7 +4099,7 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     
     // Get top 10 for this grade this week, join with users for insignia
     const result = await pool.query(
-      `SELECT wl.user_name, wl.grade, wl.tasks_completed, wl.updated_at,
+      `SELECT wl.user_id, wl.user_name, wl.grade, wl.tasks_completed, wl.updated_at,
               COALESCE(u.insignia_selected, 'Default') AS insignia
        FROM weekly_leaderboard wl
        LEFT JOIN users u ON u.id = wl.user_id
@@ -4199,17 +4207,65 @@ app.get('/api/hub/insights', authenticateToken, async (req, res) => {
 app.put('/api/user/feed-preference', authenticateToken, async (req, res) => {
   try {
     const { showInFeed } = req.body;
-    
-    await pool.query(
-      'UPDATE users SET show_in_feed = $1 WHERE id = $2',
-      [showInFeed, req.user.id]
-    );
-    
+    await pool.query('UPDATE users SET show_in_feed = $1 WHERE id = $2', [showInFeed, req.user.id]);
     res.json({ success: true, showInFeed });
   } catch (error) {
     console.error('Update feed preference error:', error);
     res.status(500).json({ error: 'Failed to update preference' });
   }
+});
+
+// PUT /api/user/profile-public — toggle public profile visibility
+app.put('/api/user/profile-public', authenticateToken, async (req, res) => {
+  try {
+    const { profilePublic } = req.body;
+    await pool.query('UPDATE users SET profile_public = $1 WHERE id = $2', [!!profilePublic, req.user.id]);
+    res.json({ success: true, profilePublic: !!profilePublic });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/users/:userId/profile — view another user's public profile
+app.get('/api/users/:userId/profile', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const r = await pool.query(
+      `SELECT u.name, u.grade, u.campus, u.profile_public, u.insignia_selected,
+              u.streak_shields_available,
+              (SELECT COUNT(*) FROM tasks_completed WHERE user_id = u.id) AS total_completions,
+              (SELECT COUNT(*) FROM user_badges WHERE user_id = u.id) AS badge_count,
+              COALESCE(wl.tasks_completed, 0) AS weekly_completions
+       FROM users u
+       LEFT JOIN weekly_leaderboard wl ON wl.user_id = u.id
+         AND wl.week_start = date_trunc('week', CURRENT_DATE)::date
+       WHERE u.id = $1`,
+      [userId]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const u = r.rows[0];
+    if (!u.profile_public) return res.status(403).json({ error: 'Profile is private' });
+
+    // Streak — reuse tasks_completed dates
+    const compR = await pool.query(
+      `SELECT completed_at FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 500`,
+      [userId]
+    );
+    // Badges
+    const badgeR = await pool.query(
+      `SELECT badge_key, awarded_at FROM user_badges WHERE user_id = $1 ORDER BY awarded_at DESC LIMIT 10`,
+      [userId]
+    );
+    res.json({
+      name: u.name,
+      grade: u.grade,
+      campus: u.campus,
+      insignia: u.insignia_selected || 'Default',
+      totalCompletions: parseInt(u.total_completions),
+      weeklyCompletions: parseInt(u.weekly_completions),
+      badgeCount: parseInt(u.badge_count),
+      badges: badgeR.rows,
+      completedAtDates: compR.rows.map(r => r.completed_at instanceof Date ? r.completed_at.toISOString() : String(r.completed_at)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Helper function to update leaderboard when task is completed
