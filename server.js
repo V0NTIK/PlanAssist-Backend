@@ -5537,7 +5537,7 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
        WHERE t.deleted = false AND t.completed = false AND t.url IS NOT NULL
          AND t.segment IS NULL AND t.manually_created = false
        GROUP BY u.name, t.url HAVING COUNT(*) > 1
-       ORDER BY count DESC LIMIT 20`
+       ORDER BY count DESC`
     );
 
     // e) Completion stats by grade
