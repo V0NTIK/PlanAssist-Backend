@@ -4229,43 +4229,100 @@ app.get('/api/hub/insights', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const now = new Date();
     const todayUTC = now.toISOString().slice(0, 10);
+
+    // Fetch user's campus so we can offset timestamps to their local time
+    const userRow = await pool.query(`SELECT campus, tz_periods, insignia_days, grade FROM users WHERE id=$1`, [userId]);
+    const campus = userRow.rows[0]?.campus || 'Ashland';
+
+    // Campus UTC offset map (standard time; DST handled approximately)
+    const CAMPUS_TZ_OFFSET = {
+      'Ashland': -5, 'Barbados': -4, 'Calgary': -7, 'Chesapeake': -5,
+      'Chicago': -6, 'Council Bluffs': -6, 'Des Moines': -6, 'Detroit': -5,
+      'Edmonton': -7, 'Gothenburg': 1, 'Johannesburg': 2, 'Kelowna': -8,
+      'Lagos': 1, 'London': 0, 'Mauritius': 4, 'Minneapolis': -6,
+      'Montreal': -5, 'New York': -5, 'Oslo': 1, 'Pretoria': 2,
+      'Regina': -6, 'Salt Lake City': -7, 'Stockholm': 1, 'Toronto': -5,
+      'Vancouver': -8, 'Winnipeg': -6, 'Zurich': 1,
+    };
+    const tzOffsetHrs = CAMPUS_TZ_OFFSET[campus] ?? -5;
+    const tzInterval = `${tzOffsetHrs >= 0 ? '+' : ''}${tzOffsetHrs} hours`;
+
     const globalTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]);
     const userTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at::date=$2::date`, [userId, todayUTC]);
     const dow = now.getDay();
     const weekStart = new Date(now); weekStart.setDate(now.getDate() - (dow===0?6:dow-1)); weekStart.setHours(0,0,0,0);
     const weekStartISO = weekStart.toISOString().slice(0,10);
     const globalWeekR = await pool.query(`SELECT AVG(cnt)::numeric(6,1) AS avg_tasks FROM (SELECT user_id, COUNT(*) AS cnt FROM tasks_completed WHERE completed_at>=$1 GROUP BY user_id HAVING COUNT(*)>0) sub`, [weekStartISO]);
-    const userStreakR = await pool.query(`SELECT insignia_days FROM users WHERE id=$1`, [userId]);
-    const userStreakDays = userStreakR.rows[0]?.insignia_days || 0;
-    const streakPercentileR = await pool.query(`SELECT COUNT(*)::float/NULLIF(COUNT(*),0)*100 AS percentile FROM users WHERE is_banned=false AND insignia_days>0 AND insignia_days<$1`, [userStreakDays]);
+    const userStreakDays = userRow.rows[0]?.insignia_days || 0;
+
+    // Fixed streakPercentile: what fraction of active users have FEWER streak days than this user
+    const streakPercentileR = await pool.query(
+      `SELECT ROUND(
+         COUNT(*) FILTER (WHERE insignia_days < $1)::numeric /
+         NULLIF(COUNT(*) FILTER (WHERE insignia_days > 0), 0) * 100
+       ) AS percentile
+       FROM users WHERE is_banned=false AND insignia_days > 0`,
+      [userStreakDays]
+    );
+
     const globalSessionR = await pool.query(`SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE actual_time>0 AND actual_time<300`);
     const userSessionR = await pool.query(`SELECT AVG(actual_time)::numeric(6,1) AS avg_mins FROM tasks_completed WHERE user_id=$1 AND actual_time>0 AND actual_time<300`, [userId]);
     const lastWeekStart = new Date(weekStart); lastWeekStart.setDate(lastWeekStart.getDate()-7);
     const userLastWeekR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2 AND completed_at<$3`, [userId, lastWeekStart.toISOString().slice(0,10), weekStartISO]);
     const userWeekR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 AND completed_at>=$2`, [userId, weekStartISO]);
-    const bestDayR = await pool.query(`SELECT TO_CHAR(completed_at,'Day') AS dow, COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 GROUP BY dow ORDER BY cnt DESC LIMIT 1`, [userId]);
-    const peakHourR = await pool.query(`SELECT EXTRACT(HOUR FROM completed_at)::int AS hr, COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1 GROUP BY hr ORDER BY cnt DESC LIMIT 1`, [userId]);
+
+    // bestDay and peakHour — converted to campus local time
+    const bestDayR = await pool.query(
+      `SELECT TO_CHAR(completed_at AT TIME ZONE 'UTC' + INTERVAL '${tzInterval}', 'Day') AS dow, COUNT(*) AS cnt
+       FROM tasks_completed WHERE user_id=$1
+       GROUP BY dow ORDER BY cnt DESC LIMIT 1`,
+      [userId]
+    );
+    const peakHourR = await pool.query(
+      `SELECT EXTRACT(HOUR FROM (completed_at AT TIME ZONE 'UTC' + INTERVAL '${tzInterval}'))::int AS hr,
+              COUNT(*) AS cnt
+       FROM tasks_completed WHERE user_id=$1
+       GROUP BY hr ORDER BY cnt DESC LIMIT 1`,
+      [userId]
+    );
+    // Only report bestDay / peakHour if there are enough completions to be meaningful
+    const totalCompletionsR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE user_id=$1`, [userId]);
+    const totalCompletions = parseInt(totalCompletionsR.rows[0].cnt) || 0;
+
     const fourWeeksAgo = new Date(weekStart); fourWeeksAgo.setDate(fourWeeksAgo.getDate()-28);
     const eightWeeksAgo = new Date(weekStart); eightWeeksAgo.setDate(eightWeeksAgo.getDate()-56);
     const accuracyR = await pool.query(`SELECT AVG(CASE WHEN completed_at>=$2 THEN ratio END) AS recent, AVG(CASE WHEN completed_at<$2 AND completed_at>=$3 THEN ratio END) AS prior FROM (SELECT completed_at, LEAST(estimated_time::float/NULLIF(actual_time,0),actual_time::float/NULLIF(estimated_time,0))*100 AS ratio FROM tasks_completed WHERE user_id=$1 AND estimated_time>0 AND actual_time>0 AND completed_at>=$3) sub`, [userId, fourWeeksAgo.toISOString(), eightWeeksAgo.toISOString()]);
     const recentAcc = Math.round(parseFloat(accuracyR.rows[0]?.recent)||0);
     const priorAcc  = Math.round(parseFloat(accuracyR.rows[0]?.prior)||0);
-    const gradeRankR = await pool.query(`WITH ranked AS (SELECT user_id, PERCENT_RANK() OVER (ORDER BY tasks_completed ASC)*100 AS pct FROM weekly_leaderboard WHERE grade=(SELECT grade FROM users WHERE id=$1) AND week_start=$2) SELECT ROUND(pct) AS pct FROM ranked WHERE user_id=$1`, [userId, weekStartISO]);
+
+    // gradePercentile: PERCENT_RANK gives fraction BELOW this user — that IS the percentile
+    const gradeRankR = await pool.query(
+      `WITH ranked AS (
+         SELECT user_id, PERCENT_RANK() OVER (ORDER BY tasks_completed ASC)*100 AS pct
+         FROM weekly_leaderboard
+         WHERE grade=(SELECT grade FROM users WHERE id=$1) AND week_start=$2
+       ) SELECT ROUND(pct) AS pct FROM ranked WHERE user_id=$1`,
+      [userId, weekStartISO]
+    );
+
     res.json({
-      globalCompletionsToday: parseInt(globalTodayR.rows[0].cnt),
-      userCompletionsToday:   parseInt(userTodayR.rows[0].cnt),
-      globalAvgWeek:          parseFloat(globalWeekR.rows[0].avg_tasks)||0,
+      globalCompletionsToday:  parseInt(globalTodayR.rows[0].cnt),
+      userCompletionsToday:    parseInt(userTodayR.rows[0].cnt),
+      globalAvgWeek:           parseFloat(globalWeekR.rows[0].avg_tasks)||0,
       userCompletionsThisWeek: parseInt(userWeekR.rows[0].cnt),
       userCompletionsLastWeek: parseInt(userLastWeekR.rows[0].cnt),
       streakPercentile:        Math.round(parseFloat(streakPercentileR.rows[0]?.percentile)||0),
       userStreakDays,
       globalAvgSessionMins:    parseFloat(globalSessionR.rows[0].avg_mins)||0,
       userAvgSessionMins:      parseFloat(userSessionR.rows[0].avg_mins)||0,
-      bestDay:                 bestDayR.rows[0]?.dow?.trim()||null,
-      peakHour:                peakHourR.rows[0]?.hr??null,
-      accuracyDelta:           (recentAcc && priorAcc) ? (recentAcc-priorAcc) : null,
+      // Only include bestDay / peakHour if user has enough history to be meaningful
+      bestDay:    totalCompletions >= 10 ? (bestDayR.rows[0]?.dow?.trim()||null) : null,
+      peakHour:   totalCompletions >= 10 ? (peakHourR.rows[0]?.hr??null) : null,
+      accuracyDelta: (recentAcc && priorAcc) ? (recentAcc-priorAcc) : null,
       recentAcc,
-      gradePercentile:         gradeRankR.rows[0]?.pct!=null ? Math.round(parseFloat(gradeRankR.rows[0].pct)) : null,
+      // gradePercentile: fraction of grade with FEWER completions — so higher = better
+      gradePercentile: gradeRankR.rows[0]?.pct!=null ? Math.round(parseFloat(gradeRankR.rows[0].pct)) : null,
+      totalCompletions,
     });
   } catch (err) {
     console.error('Hub insights error:', err);
