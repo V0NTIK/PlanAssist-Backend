@@ -27,8 +27,35 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json({ limit: '10mb' }));
+
+// Trust Render's reverse proxy so req.ip resolves to the client IP (not 127.0.0.1)
+app.set('trust proxy', 1);
+
+// ── Security headers ─────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  // Prevent clickjacking
+  res.setHeader('X-Frame-Options', 'DENY');
+  // Prevent MIME-sniffing
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Referrer policy
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // Permissions policy — disable features PlanAssist doesn't need
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  // Content Security Policy — allow our own resources + Canvas + Zoom + Anthropic
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'",  // unsafe-inline/eval for React/Vite bundles
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: https:",
+    "connect-src 'self' https://planassist-api.onrender.com https://canvas.oneschoolglobal.com https://api.anthropic.com",
+    "frame-ancestors 'none'",
+  ].join('; '));
+  next();
+});
+
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
 
 // ── IP Blacklist middleware ────────────────────────────────────────────────
 // Cache loaded once at startup and refreshed after any admin change.
@@ -765,7 +792,7 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     const user = result.rows[0];
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
 
     res.json({ 
       token, 
@@ -815,7 +842,13 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
+
+    // Record the client IP for admin use (IP blocking feature)
+    const loginIp = (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim().replace(/^::ffff:/, '');
+    if (loginIp) {
+      pool.query('UPDATE users SET last_login_ip = $1 WHERE id = $2', [loginIp, user.id]).catch(() => {});
+    }
 
     res.json({ 
       token, 
@@ -3613,6 +3646,19 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
 // HEALTH CHECK
 // ============================================================================
 
+// ── Security disclosure ───────────────────────────────────────────────────────
+app.get('/.well-known/security.txt', (req, res) => {
+  res.type('text/plain').send([
+    'Contact: mailto:admin@planassist.io',
+    'Preferred-Languages: en',
+    'Policy: https://planassist.onrender.com/security',
+    'Acknowledgments: https://planassist.onrender.com/security',
+    '',
+    '# PlanAssist is a student study planning tool built for OneSchool Global.',
+    '# If you find a security vulnerability, please report it responsibly.',
+  ].join('\n'));
+});
+
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -5315,7 +5361,8 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     const userRes = await pool.query(
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
               campus, tz_periods, schedule_enhanced, created_at,
-              streak_shields_available, insignia_days, insignia_selected, credits
+              streak_shields_available, insignia_days, insignia_selected, credits,
+              last_login_ip
        FROM users WHERE id = $1`,
       [req.params.id]
     );
@@ -5344,7 +5391,36 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
   }
 });
 
-// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin)
+// POST /api/admin/users/:id/block-ip — block the user's last known login IP
+app.post('/api/admin/users/:id/block-ip', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    const { reason } = req.body;
+
+    // Fetch the stored IP for this user
+    const userRes = await pool.query('SELECT name, last_login_ip FROM users WHERE id = $1', [targetId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const ip = userRes.rows[0].last_login_ip;
+    if (!ip) return res.status(400).json({ error: 'No login IP on record for this user. They must log in at least once for an IP to be recorded.' });
+
+    await pool.query(
+      'INSERT INTO ip_blacklist (ip_address, reason, blocked_by) VALUES ($1, $2, $3) ON CONFLICT (ip_address) DO UPDATE SET reason = $2, blocked_by = $3',
+      [ip, reason?.trim() || `Blocked via admin panel (user: ${userRes.rows[0].name})`, req.user.id]
+    );
+    await loadIpBlacklist(); // refresh cache immediately
+
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await auditLog(req.user.id, adminRes.rows[0]?.name, 'BLOCK_IP', targetId, userRes.rows[0].name, { ip, reason });
+
+    res.json({ success: true, ip });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin, email, password)
 app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { name, grade, campus, is_admin, email, password } = req.body;
