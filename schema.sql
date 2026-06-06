@@ -1093,19 +1093,19 @@ CREATE TABLE IF NOT EXISTS insignia_shop (
     sort_order  INTEGER NOT NULL DEFAULT 0
 );
 
--- Seed the shop (INSERT … ON CONFLICT DO NOTHING is safe to re-run)
+-- Seed the shop (ON CONFLICT DO UPDATE ensures price/description changes are applied on re-run)
 INSERT INTO insignia_shop (label, cost, description, sort_order) VALUES
   ('Meteorite',       1000, 'Dark brown with pulsing orange ember spots.',                      1),
   ('Dragonbone',      1000, 'Fades from white to pitch black and back, with a subtle jitter.',  2),
   ('Celestium',       1500, 'Shifts between red, purple, and blue with a pulsing ripple.',      3),
   ('Aether',          1500, 'Violent lightning-like purple lines flash across a purple base.',  4),
-  ('Soulstone',       1500, 'Tan and brown letters that each teeters uniquely.',                5),
-  ('Starlight',       1500, 'Letters blink and shake against pure black.',                      6),
-  ('Astral Crystal',  2000, 'Opaque white letters that randomly glitch and vanish.',            7),
-  ('Dark Matter',     2000, 'All-black letters that jitter violently and drift from side to side.', 8),
-  ('Neutronium',      2500, 'Glowing neon green with a violent shutter effect.',                9),
-  ('Singularity Core',2500, 'White and cyan letters with purple flames rising from each one.', 10)
-ON CONFLICT (label) DO NOTHING;
+  ('Soulstone',       2000, 'Tan and brown letters that each teeters uniquely.',                5),
+  ('Starlight',       2000, 'Letters blink and shake against pure black.',                      6),
+  ('Astral Crystal',  3000, 'Opaque white letters that rapidly blink out multiple times per second.', 7),
+  ('Dark Matter',     3000, 'All-black letters that jitter, drift, and shimmer with dark colour.', 8),
+  ('Neutronium',      5000, 'Neon green letters that light up left to right and fade out individually.', 9),
+  ('Singularity Core',5000, 'White and cyan letters hit by a blazing purple pulse that makes each letter violently expand and shake.', 10)
+ON CONFLICT (label) DO UPDATE SET cost = EXCLUDED.cost, description = EXCLUDED.description, sort_order = EXCLUDED.sort_order;
 
 CREATE INDEX IF NOT EXISTS idx_insignia_shop_sort ON insignia_shop(sort_order);
 
