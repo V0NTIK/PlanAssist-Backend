@@ -5419,7 +5419,8 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
       `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
               campus, tz_periods, schedule_enhanced, created_at,
               streak_shields_available, insignia_days, insignia_selected, credits,
-              last_login_ip
+              last_login_ip,
+              canvas_api_token IS NOT NULL AND canvas_api_token != '' AS has_canvas_token
        FROM users WHERE id = $1`,
       [req.params.id]
     );
