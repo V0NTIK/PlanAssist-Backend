@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS users (
     notif_discussions           BOOLEAN         NOT NULL DEFAULT TRUE,
     notif_messages              BOOLEAN         NOT NULL DEFAULT TRUE,
     notif_achievements          BOOLEAN         NOT NULL DEFAULT TRUE,
-    notif_studios               BOOLEAN         NOT NULL DEFAULT TRUE
+    notif_studios               BOOLEAN         NOT NULL DEFAULT TRUE,
+    -- Itinerary view toggles
+    itinerary_show_events       BOOLEAN         NOT NULL DEFAULT TRUE,
+    itinerary_show_organizer    BOOLEAN         NOT NULL DEFAULT TRUE
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
@@ -94,6 +97,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_discussions          BOOLEAN   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_messages             BOOLEAN      NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_achievements         BOOLEAN      NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_studios              BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS itinerary_show_events      BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS itinerary_show_organizer   BOOLEAN      NOT NULL DEFAULT TRUE;
 
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
 ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
@@ -404,28 +409,8 @@ CREATE INDEX IF NOT EXISTS idx_schedules_user_id ON schedules(user_id);
 -- Maps Study period slots on a specific date to an agenda.
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS itinerary_slots (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    date        DATE NOT NULL,
-    period      INTEGER NOT NULL,
-    agenda_id   INTEGER REFERENCES agendas(id) ON DELETE SET NULL,
-    UNIQUE(user_id, date, period)
-);
-
-ALTER TABLE itinerary_slots DROP COLUMN IF EXISTS day;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'itinerary_slots_user_date_period_unique'
-    ) THEN
-        ALTER TABLE itinerary_slots
-            ADD CONSTRAINT itinerary_slots_user_date_period_unique UNIQUE (user_id, date, period);
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_itinerary_slots_user ON itinerary_slots(user_id);
+-- itinerary_slots table removed: agenda linking is now stored via title-matching
+-- on the agendas table. Legacy data cleaned up by migration script.
 
 
 -- ============================================================================
@@ -433,30 +418,59 @@ CREATE INDEX IF NOT EXISTS idx_itinerary_slots_user ON itinerary_slots(user_id);
 -- Booked tutorial sessions per date/period slot.
 -- ============================================================================
 
+-- ============================================================================
+-- TUTORIALS (remodelled)
+-- Booked tutorial sessions. Title is derived from course name + "Tutorial".
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS tutorials (
     id          SERIAL PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     date        DATE NOT NULL,
     period      INTEGER NOT NULL,
-    zoom_number TEXT,
-    topic       TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, date, period)
+    title       TEXT NOT NULL,               -- e.g. "Physics Tutorial"
+    zoom_number TEXT,                        -- optional Zoom meeting ID
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS title       TEXT NOT NULL DEFAULT 'Tutorial';
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS zoom_number TEXT;
+ALTER TABLE tutorials DROP COLUMN IF EXISTS topic;
 ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
 
+-- Allow multiple tutorials on the same period (e.g. two bookings same slot)
+-- but keep a practical unique constraint on user+date+period
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'tutorials_user_date_period_unique'
     ) THEN
-        ALTER TABLE tutorials
-            ADD CONSTRAINT tutorials_user_date_period_unique UNIQUE (user_id, date, period);
+        ALTER TABLE tutorials DROP CONSTRAINT tutorials_user_date_period_unique;
     END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_tutorials_user ON tutorials(user_id);
+CREATE INDEX IF NOT EXISTS idx_tutorials_date ON tutorials(user_id, date);
+
+
+-- ============================================================================
+-- MEETINGS
+-- User-booked meetings (non-tutorial). Same structure as tutorials but with
+-- a free-form title and no Outlook embed. Own banner/ping behaviour.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS meetings (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date        DATE NOT NULL,
+    period      INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    zoom_number TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(user_id);
+CREATE INDEX IF NOT EXISTS idx_meetings_date ON meetings(user_id, date);
 
 
 -- ============================================================================
