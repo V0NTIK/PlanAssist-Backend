@@ -787,7 +787,9 @@ app.post('/api/auth/register', async (req, res) => {
     const name = extractNameFromEmail(email);
 
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, is_new_user) VALUES ($1, $2, $3, $4) RETURNING id, email, name, is_new_user',
+      `INSERT INTO users (email, password, name, is_new_user, insignia_selected)
+       VALUES ($1, $2, $3, $4, 'Default')
+       RETURNING id, email, name, is_new_user`,
       [email, hashedPassword, name, true]
     );
 
