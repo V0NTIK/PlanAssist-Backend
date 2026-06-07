@@ -4886,21 +4886,22 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
     if (!date) return res.status(400).json({ error: 'date is required' });
 
     const [tutResult, meetResult, agendaResult] = await Promise.all([
-      pool.query('SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY period ASC', [req.user.id, date]),
-      pool.query('SELECT * FROM meetings  WHERE user_id = $1 AND date = $2 ORDER BY period ASC', [req.user.id, date]),
+      pool.query('SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC', [req.user.id, date]),
+      pool.query('SELECT * FROM meetings  WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC', [req.user.id, date]),
       pool.query('SELECT id, name, rows, current_row, finished FROM agendas WHERE user_id = $1 AND finished = false', [req.user.id]),
     ]);
 
-    // Match agendas to date by title pattern "Period X Study - # Tasks - M/D/YYYY" or "Outside School - # Tasks - M/D/YYYY"
+    // Normalise scheduled_time to HH:MM string (postgres TIME comes back as "HH:MM:SS")
+    const normTime = t => t ? String(t).substring(0, 5) : null;
+    const tutorials = tutResult.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) }));
+    const meetings  = meetResult.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) }));
+
+    // Match agendas to date by title pattern "Period X Study - # Tasks - M/D/YYYY"
     const [y, mo, d] = date.split('-').map(Number);
     const dateLabel = `${mo}/${d}/${y}`;
     const matchedAgendas = agendaResult.rows.filter(a => a.name && a.name.endsWith(` - ${dateLabel}`));
 
-    res.json({
-      tutorials: tutResult.rows,
-      meetings: meetResult.rows,
-      agendas: matchedAgendas,
-    });
+    res.json({ tutorials, meetings, agendas: matchedAgendas });
   } catch (error) {
     console.error('Get itinerary error:', error);
     res.status(500).json({ error: 'Failed to get itinerary' });
@@ -4909,7 +4910,7 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
 
 
 // ============================================================================
-// TUTORIALS (remodelled)
+// TUTORIALS (time-based)
 // ============================================================================
 
 // GET /api/tutorials?date=YYYY-MM-DD  OR  /api/tutorials (all future)
@@ -4917,11 +4918,12 @@ app.get('/api/tutorials', authenticateToken, async (req, res) => {
   try {
     const { date } = req.query;
     const query = date
-      ? 'SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY period ASC'
-      : 'SELECT * FROM tutorials WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, period ASC';
+      ? 'SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC'
+      : 'SELECT * FROM tutorials WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, scheduled_time ASC';
     const params = date ? [req.user.id, date] : [req.user.id];
     const result = await pool.query(query, params);
-    res.json(result.rows);
+    const normTime = t => t ? String(t).substring(0, 5) : null;
+    res.json(result.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) })));
   } catch (error) {
     console.error('Get tutorials error:', error);
     res.status(500).json({ error: 'Failed to get tutorials' });
@@ -4929,12 +4931,16 @@ app.get('/api/tutorials', authenticateToken, async (req, res) => {
 });
 
 // POST /api/tutorials — create a tutorial
-// Body: { date, period, title (derived from course), zoomNumber? }
+// Body: { date, scheduledTimeUtc (HH:MM, UTC), title (from course name), zoomNumber? }
 app.post('/api/tutorials', authenticateToken, async (req, res) => {
   try {
-    let { date, period, title, zoomNumber } = req.body;
-    if (!date || !period || !title) {
-      return res.status(400).json({ error: 'date, period, and title are required' });
+    let { date, scheduledTimeUtc, title, zoomNumber } = req.body;
+    if (!date || !scheduledTimeUtc || !title) {
+      return res.status(400).json({ error: 'date, scheduledTimeUtc, and title are required' });
+    }
+    // Validate HH:MM format
+    if (!/^\d{2}:\d{2}$/.test(scheduledTimeUtc)) {
+      return res.status(400).json({ error: 'scheduledTimeUtc must be HH:MM format (UTC)' });
     }
     // Normalise title: trim + title-case each word + append " Tutorial"
     const toTitleCase = str => str.trim().replace(/\b\w/g, c => c.toUpperCase());
@@ -4942,12 +4948,13 @@ app.post('/api/tutorials', authenticateToken, async (req, res) => {
     const normalised = `${baseName} Tutorial`;
 
     const result = await pool.query(
-      `INSERT INTO tutorials (user_id, date, period, title, zoom_number)
+      `INSERT INTO tutorials (user_id, date, scheduled_time, title, zoom_number)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [req.user.id, date, parseInt(period), normalised, zoomNumber || null]
+      [req.user.id, date, scheduledTimeUtc, normalised, zoomNumber || null]
     );
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({ ...row, scheduled_time: String(row.scheduled_time).substring(0, 5) });
   } catch (error) {
     console.error('Create tutorial error:', error);
     res.status(500).json({ error: 'Failed to create tutorial' });
@@ -4958,19 +4965,21 @@ app.post('/api/tutorials', authenticateToken, async (req, res) => {
 app.patch('/api/tutorials/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    let { title, zoomNumber } = req.body;
+    let { title, scheduledTimeUtc, zoomNumber } = req.body;
     const toTitleCase = str => str.trim().replace(/\b\w/g, c => c.toUpperCase());
-    const normalised = title ? `${toTitleCase(title.replace(/\s+Tutorial\s*$/i, '').trim())} Tutorial` : undefined;
+    const normalised = title ? `${toTitleCase(title.replace(/\s+Tutorial\s*$/i, '').trim())} Tutorial` : null;
     const result = await pool.query(
       `UPDATE tutorials SET
-         title       = COALESCE($3, title),
-         zoom_number = COALESCE($4, zoom_number)
+         title          = COALESCE($3, title),
+         scheduled_time = COALESCE($4, scheduled_time),
+         zoom_number    = COALESCE($5, zoom_number)
        WHERE id = $1 AND user_id = $2
        RETURNING *`,
-      [id, req.user.id, normalised || null, zoomNumber !== undefined ? (zoomNumber || null) : null]
+      [id, req.user.id, normalised, scheduledTimeUtc || null, zoomNumber !== undefined ? (zoomNumber || null) : null]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tutorial not found' });
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({ ...row, scheduled_time: String(row.scheduled_time).substring(0, 5) });
   } catch (error) {
     console.error('Update tutorial error:', error);
     res.status(500).json({ error: 'Failed to update tutorial' });
@@ -4991,7 +5000,7 @@ app.delete('/api/tutorials/:id', authenticateToken, async (req, res) => {
 
 
 // ============================================================================
-// MEETINGS
+// MEETINGS (time-based)
 // ============================================================================
 
 // GET /api/meetings?date=YYYY-MM-DD  OR  /api/meetings (all future)
@@ -4999,11 +5008,12 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
   try {
     const { date } = req.query;
     const query = date
-      ? 'SELECT * FROM meetings WHERE user_id = $1 AND date = $2 ORDER BY period ASC'
-      : 'SELECT * FROM meetings WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, period ASC';
+      ? 'SELECT * FROM meetings WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC'
+      : 'SELECT * FROM meetings WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, scheduled_time ASC';
     const params = date ? [req.user.id, date] : [req.user.id];
     const result = await pool.query(query, params);
-    res.json(result.rows);
+    const normTime = t => t ? String(t).substring(0, 5) : null;
+    res.json(result.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) })));
   } catch (error) {
     console.error('Get meetings error:', error);
     res.status(500).json({ error: 'Failed to get meetings' });
@@ -5011,20 +5021,24 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
 });
 
 // POST /api/meetings — create a meeting
-// Body: { date, period, title, zoomNumber? }
+// Body: { date, scheduledTimeUtc (HH:MM, UTC), title, zoomNumber? }
 app.post('/api/meetings', authenticateToken, async (req, res) => {
   try {
-    const { date, period, title, zoomNumber } = req.body;
-    if (!date || !period || !title) {
-      return res.status(400).json({ error: 'date, period, and title are required' });
+    const { date, scheduledTimeUtc, title, zoomNumber } = req.body;
+    if (!date || !scheduledTimeUtc || !title) {
+      return res.status(400).json({ error: 'date, scheduledTimeUtc, and title are required' });
+    }
+    if (!/^\d{2}:\d{2}$/.test(scheduledTimeUtc)) {
+      return res.status(400).json({ error: 'scheduledTimeUtc must be HH:MM format (UTC)' });
     }
     const result = await pool.query(
-      `INSERT INTO meetings (user_id, date, period, title, zoom_number)
+      `INSERT INTO meetings (user_id, date, scheduled_time, title, zoom_number)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [req.user.id, date, parseInt(period), title.trim(), zoomNumber || null]
+      [req.user.id, date, scheduledTimeUtc, title.trim(), zoomNumber || null]
     );
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({ ...row, scheduled_time: String(row.scheduled_time).substring(0, 5) });
   } catch (error) {
     console.error('Create meeting error:', error);
     res.status(500).json({ error: 'Failed to create meeting' });
@@ -5035,17 +5049,19 @@ app.post('/api/meetings', authenticateToken, async (req, res) => {
 app.patch('/api/meetings/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, zoomNumber } = req.body;
+    const { title, scheduledTimeUtc, zoomNumber } = req.body;
     const result = await pool.query(
       `UPDATE meetings SET
-         title       = COALESCE($3, title),
-         zoom_number = COALESCE($4, zoom_number)
+         title          = COALESCE($3, title),
+         scheduled_time = COALESCE($4, scheduled_time),
+         zoom_number    = COALESCE($5, zoom_number)
        WHERE id = $1 AND user_id = $2
        RETURNING *`,
-      [id, req.user.id, title ? title.trim() : null, zoomNumber !== undefined ? (zoomNumber || null) : null]
+      [id, req.user.id, title ? title.trim() : null, scheduledTimeUtc || null, zoomNumber !== undefined ? (zoomNumber || null) : null]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Meeting not found' });
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({ ...row, scheduled_time: String(row.scheduled_time).substring(0, 5) });
   } catch (error) {
     console.error('Update meeting error:', error);
     res.status(500).json({ error: 'Failed to update meeting' });
