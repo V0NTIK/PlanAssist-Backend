@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS users (
     notif_studios               BOOLEAN         NOT NULL DEFAULT TRUE,
     -- Itinerary view toggles
     itinerary_show_events       BOOLEAN         NOT NULL DEFAULT TRUE,
-    itinerary_show_organizer    BOOLEAN         NOT NULL DEFAULT TRUE
+    itinerary_show_organizer    BOOLEAN         NOT NULL DEFAULT TRUE,
+    itinerary_show_agenda       BOOLEAN         NOT NULL DEFAULT TRUE
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
@@ -99,6 +100,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_achievements         BOOLEAN   
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notif_studios              BOOLEAN      NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS itinerary_show_events      BOOLEAN      NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS itinerary_show_organizer   BOOLEAN      NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS itinerary_show_agenda       BOOLEAN      NOT NULL DEFAULT TRUE;
 
 ALTER TABLE users DROP COLUMN IF EXISTS canvas_url;
 ALTER TABLE users DROP COLUMN IF EXISTS present_periods;
@@ -369,6 +371,8 @@ CREATE TABLE IF NOT EXISTS agendas (
     current_row_elapsed     INTEGER NOT NULL DEFAULT 0,     -- Seconds spent on current row's timer this session
     current_row_countdown   INTEGER,                        -- Seconds remaining on countdown (NULL = full timeMins)
     finished                BOOLEAN NOT NULL DEFAULT FALSE,
+    agenda_date             DATE,                                   -- optional: user-local date the agenda is scheduled for
+    agenda_period           TEXT,                                   -- optional: period number or 'outside' 
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -377,6 +381,8 @@ ALTER TABLE agendas ADD COLUMN IF NOT EXISTS rows                  JSONB   NOT N
 ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row           INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row_elapsed   INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agendas ADD COLUMN IF NOT EXISTS current_row_countdown INTEGER;
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS agenda_date   DATE;
+ALTER TABLE agendas ADD COLUMN IF NOT EXISTS agenda_period TEXT;
 ALTER TABLE agendas DROP COLUMN IF EXISTS task_ids;
 
 CREATE INDEX IF NOT EXISTS idx_agendas_user_id ON agendas(user_id);
