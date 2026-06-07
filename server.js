@@ -4357,7 +4357,7 @@ app.get('/api/users/:userId/profile', authenticateToken, async (req, res) => {
     const { userId } = req.params;
     const r = await pool.query(
       `SELECT u.name, u.grade, u.campus, u.profile_public, u.insignia_selected,
-              u.streak_shields_available,
+              u.streak_shields_available, u.insignia_days, u.credits,
               (SELECT COUNT(*) FROM tasks_completed WHERE user_id = u.id) AS total_completions,
               (SELECT COUNT(*) FROM user_badges WHERE user_id = u.id) AS badge_count,
               COALESCE(wl.tasks_completed, 0) AS weekly_completions
@@ -4391,6 +4391,8 @@ app.get('/api/users/:userId/profile', authenticateToken, async (req, res) => {
       badgeCount: parseInt(u.badge_count),
       badges: badgeR.rows,
       completedAtDates: compR.rows.map(r => r.completed_at instanceof Date ? r.completed_at.toISOString() : String(r.completed_at)),
+      streakDays: u.insignia_days || 0,
+      credits: u.credits || 0,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
