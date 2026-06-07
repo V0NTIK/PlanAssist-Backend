@@ -424,22 +424,22 @@ CREATE INDEX IF NOT EXISTS idx_schedules_user_id ON schedules(user_id);
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS tutorials (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    date        DATE NOT NULL,
-    period      INTEGER NOT NULL,
-    title       TEXT NOT NULL,               -- e.g. "Physics Tutorial"
-    zoom_number TEXT,                        -- optional Zoom meeting ID
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id             SERIAL PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date           DATE NOT NULL,
+    scheduled_time TIME NOT NULL,   -- UTC time of the booking
+    title          TEXT NOT NULL,   -- e.g. "Physics Tutorial"
+    zoom_number    TEXT,            -- optional Zoom meeting ID
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS title       TEXT NOT NULL DEFAULT 'Tutorial';
-ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS zoom_number TEXT;
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS title          TEXT NOT NULL DEFAULT 'Tutorial';
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS zoom_number    TEXT;
+ALTER TABLE tutorials ADD COLUMN IF NOT EXISTS scheduled_time TIME;
 ALTER TABLE tutorials DROP COLUMN IF EXISTS topic;
 ALTER TABLE tutorials DROP COLUMN IF EXISTS day;
+ALTER TABLE tutorials DROP COLUMN IF EXISTS period;
 
--- Allow multiple tutorials on the same period (e.g. two bookings same slot)
--- but keep a practical unique constraint on user+date+period
 DO $$
 BEGIN
     IF EXISTS (
@@ -460,13 +460,13 @@ CREATE INDEX IF NOT EXISTS idx_tutorials_date ON tutorials(user_id, date);
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS meetings (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    date        DATE NOT NULL,
-    period      INTEGER NOT NULL,
-    title       TEXT NOT NULL,
-    zoom_number TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id             SERIAL PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date           DATE NOT NULL,
+    scheduled_time TIME NOT NULL,   -- UTC time of the booking
+    title          TEXT NOT NULL,
+    zoom_number    TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(user_id);
