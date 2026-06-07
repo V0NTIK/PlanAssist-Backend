@@ -986,7 +986,7 @@ function getEffectivePeriods(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -4561,7 +4561,7 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
   try {
     const agendasResult = await pool.query(
       `SELECT id, name, rows, current_row, current_row_elapsed, current_row_countdown,
-              finished, created_at
+              finished, agenda_date, agenda_period, created_at
        FROM agendas
        WHERE user_id = $1 AND finished = false
        ORDER BY created_at ASC`,
@@ -4617,7 +4617,12 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
         task: taskMap[r.taskId] || null
       }));
 
-      return { ...agenda, rows: hydratedRows, current_row: newCurrentRow };
+      // Normalise agenda_date to YYYY-MM-DD string
+      const dateStr = agenda.agenda_date
+        ? (typeof agenda.agenda_date === 'string' ? agenda.agenda_date.split('T')[0] : new Date(agenda.agenda_date).toISOString().split('T')[0])
+        : null;
+
+      return { ...agenda, rows: hydratedRows, current_row: newCurrentRow, agenda_date: dateStr };
     }));
 
     res.json(agendas.filter(a => a !== null));
@@ -4627,12 +4632,48 @@ app.get('/api/agendas', authenticateToken, async (req, res) => {
   }
 });
 
+// PATCH /api/agendas/:agendaId/meta — update name, agenda_date, agenda_period
+app.patch('/api/agendas/:agendaId/meta', authenticateToken, async (req, res) => {
+  try {
+    const { agendaId } = req.params;
+    const { name, agendaDate, agendaPeriod } = req.body;
+
+    if ((agendaDate && !agendaPeriod) || (!agendaDate && agendaPeriod)) {
+      return res.status(400).json({ error: 'Both agendaDate and agendaPeriod must be set together, or both left empty' });
+    }
+
+    const result = await pool.query(
+      `UPDATE agendas SET
+         name         = COALESCE($3, name),
+         agenda_date  = $4,
+         agenda_period = $5,
+         updated_at   = NOW()
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, name, agenda_date, agenda_period`,
+      [agendaId, req.user.id, name ? name.trim() : null, agendaDate || null, agendaPeriod || null]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Agenda not found' });
+    const row = result.rows[0];
+    const dateStr = row.agenda_date
+      ? (typeof row.agenda_date === 'string' ? row.agenda_date.split('T')[0] : new Date(row.agenda_date).toISOString().split('T')[0])
+      : null;
+    res.json({ ...row, agenda_date: dateStr });
+  } catch (error) {
+    console.error('Update agenda meta error:', error);
+    res.status(500).json({ error: 'Failed to update agenda' });
+  }
+});
+
 // POST /api/agendas — create a new agenda
 app.post('/api/agendas', authenticateToken, async (req, res) => {
   try {
-    const { name, rows } = req.body;
+    const { name, rows, agendaDate, agendaPeriod } = req.body;
     if (!name || !Array.isArray(rows) || rows.length === 0 || rows.length > 10) {
       return res.status(400).json({ error: 'Name and 1–10 rows are required' });
+    }
+    // Validate: if one of date/period is set, both must be set
+    if ((agendaDate && !agendaPeriod) || (!agendaDate && agendaPeriod)) {
+      return res.status(400).json({ error: 'Both agendaDate and agendaPeriod must be set together, or both left empty' });
     }
 
     // Normalise rows: enforce schema, default action, clamp timeMins
@@ -4645,11 +4686,18 @@ app.post('/api/agendas', authenticateToken, async (req, res) => {
       zone: VALID_ZONES.includes(r.zone) ? r.zone : null,
     }));
 
+    // Enforce 60-min cap for period-assigned agendas (not Outside School)
+    const totalMins = cleanRows.reduce((s, r) => s + r.timeMins, 0);
+    const isOutsideSchool = agendaPeriod === 'outside';
+    if (agendaPeriod && !isOutsideSchool && totalMins > 60) {
+      return res.status(400).json({ error: 'Agendas assigned to a study period cannot exceed 60 minutes total. Use Outside School for longer agendas.' });
+    }
+
     const result = await pool.query(
-      `INSERT INTO agendas (user_id, name, rows)
-       VALUES ($1, $2, $3)
-       RETURNING id, name, rows, current_row, current_row_elapsed, current_row_countdown, finished, created_at`,
-      [req.user.id, name.trim(), JSON.stringify(cleanRows)]
+      `INSERT INTO agendas (user_id, name, rows, agenda_date, agenda_period)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, rows, current_row, current_row_elapsed, current_row_countdown, finished, agenda_date, agenda_period, created_at`,
+      [req.user.id, name.trim(), JSON.stringify(cleanRows), agendaDate || null, agendaPeriod || null]
     );
     res.json(result.rows[0]);
   } catch (error) {
@@ -7663,10 +7711,10 @@ app.put('/api/user/notification-prefs', authenticateToken, async (req, res) => {
 // PUT /api/user/itinerary-prefs — save itinerary panel toggle preferences
 app.put('/api/user/itinerary-prefs', authenticateToken, async (req, res) => {
   try {
-    const { itinerary_show_events, itinerary_show_organizer } = req.body;
+    const { itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda } = req.body;
     await pool.query(
-      `UPDATE users SET itinerary_show_events=$1, itinerary_show_organizer=$2 WHERE id=$3`,
-      [itinerary_show_events ?? true, itinerary_show_organizer ?? true, req.user.id]
+      `UPDATE users SET itinerary_show_events=$1, itinerary_show_organizer=$2, itinerary_show_agenda=$3 WHERE id=$4`,
+      [itinerary_show_events ?? true, itinerary_show_organizer ?? true, itinerary_show_agenda ?? true, req.user.id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed to update itinerary prefs' }); }
