@@ -986,7 +986,7 @@ function getEffectivePeriods(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -2000,6 +2000,42 @@ app.get('/api/courses/:courseId/average', authenticateToken, async (req, res) =>
   } catch (error) {
     console.error('Get course average error:', error);
     res.status(500).json({ error: 'Failed to get course average' });
+  }
+});
+
+// GET /api/tasks/global-estimate/:title — returns an estimated time (minutes) for a task
+// based on the global average of completed tasks with similar titles across all users.
+// Falls back to null if no similar tasks found or sample too small.
+app.get('/api/tasks/global-estimate/:title', authenticateToken, async (req, res) => {
+  try {
+    const title = decodeURIComponent(req.params.title || '').toLowerCase().trim();
+    if (!title) return res.json({ estimate: null });
+
+    // Extract first 3 meaningful words (skip articles/prepositions) for fuzzy matching
+    const stopwords = new Set(['a','an','the','of','in','on','at','to','for','with','and','or','is','are','be','was']);
+    const keywords = title.split(/\s+/).filter(w => w.length > 2 && !stopwords.has(w)).slice(0, 3);
+    if (keywords.length === 0) return res.json({ estimate: null });
+
+    // Look for completed tasks with similar titles and a recorded actual time
+    const likeClause = keywords.map(k => `LOWER(tc.task_title) LIKE '%${k.replace(/'/g,"''")}%'`).join(' AND ');
+    const result = await pool.query(
+      `SELECT tc.actual_time
+       FROM tasks_completed tc
+       WHERE ${likeClause}
+         AND tc.actual_time > 0
+         AND tc.actual_time <= 180
+       LIMIT 50`
+    );
+
+    if (result.rows.length < 3) return res.json({ estimate: null }); // too few samples
+
+    const avg = Math.round(result.rows.reduce((s, r) => s + r.actual_time, 0) / result.rows.length);
+    // Round to nearest 5 minutes
+    const rounded = Math.round(avg / 5) * 5;
+    res.json({ estimate: rounded });
+  } catch (error) {
+    console.error('Global estimate error:', error);
+    res.json({ estimate: null }); // silent fallback — client handles null
   }
 });
 
@@ -4839,65 +4875,50 @@ app.get('/api/schedule/lessons', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // GET /api/itinerary — get today's itinerary slots (day param from client)
+// ============================================================================
+// ITINERARY — returns tutorials, meetings, and matched agendas for a date
+// ============================================================================
+
+// GET /api/itinerary?date=2026-06-07 — combined events for a date
 app.get('/api/itinerary', authenticateToken, async (req, res) => {
   try {
-    const { date } = req.query; // e.g. '2026-03-17' (local date string)
-    const result = await pool.query(
-      `SELECT is2.period, is2.agenda_id, a.name AS agenda_name, a.rows, a.current_row, a.finished
-       FROM itinerary_slots is2
-       LEFT JOIN agendas a ON a.id = is2.agenda_id
-       WHERE is2.user_id = $1 AND is2.date = $2`,
-      [req.user.id, date]
-    );
-    res.json(result.rows);
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'date is required' });
+
+    const [tutResult, meetResult, agendaResult] = await Promise.all([
+      pool.query('SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY period ASC', [req.user.id, date]),
+      pool.query('SELECT * FROM meetings  WHERE user_id = $1 AND date = $2 ORDER BY period ASC', [req.user.id, date]),
+      pool.query('SELECT id, name, rows, current_row, finished FROM agendas WHERE user_id = $1 AND finished = false', [req.user.id]),
+    ]);
+
+    // Match agendas to date by title pattern "Period X Study - # Tasks - M/D/YYYY" or "Outside School - # Tasks - M/D/YYYY"
+    const [y, mo, d] = date.split('-').map(Number);
+    const dateLabel = `${mo}/${d}/${y}`;
+    const matchedAgendas = agendaResult.rows.filter(a => a.name && a.name.endsWith(` - ${dateLabel}`));
+
+    res.json({
+      tutorials: tutResult.rows,
+      meetings: meetResult.rows,
+      agendas: matchedAgendas,
+    });
   } catch (error) {
     console.error('Get itinerary error:', error);
     res.status(500).json({ error: 'Failed to get itinerary' });
   }
 });
 
-// PUT /api/itinerary — assign (or clear) an agenda to a period/date slot
-// Body: { date, period, agendaId } — agendaId: null to clear
-app.put('/api/itinerary', authenticateToken, async (req, res) => {
-  try {
-    const { date, period, agendaId } = req.body;
-    if (!date || !period) {
-      return res.status(400).json({ error: 'date and period are required' });
-    }
-
-    if (agendaId === null || agendaId === undefined) {
-      await pool.query(
-        `DELETE FROM itinerary_slots WHERE user_id = $1 AND date = $2 AND period = $3`,
-        [req.user.id, date, period]
-      );
-    } else {
-      await pool.query(
-        `INSERT INTO itinerary_slots (user_id, date, period, agenda_id)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, date, period)
-         DO UPDATE SET agenda_id = $4`,
-        [req.user.id, date, period, agendaId]
-      );
-    }
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Update itinerary error:', error);
-    res.status(500).json({ error: 'Failed to update itinerary' });
-  }
-});
-
 
 // ============================================================================
-// TUTORIALS
+// TUTORIALS (remodelled)
 // ============================================================================
 
-// GET /api/tutorials?date=2026-03-17 — get tutorials for a specific date
+// GET /api/tutorials?date=YYYY-MM-DD  OR  /api/tutorials (all future)
 app.get('/api/tutorials', authenticateToken, async (req, res) => {
   try {
     const { date } = req.query;
     const query = date
       ? 'SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY period ASC'
-      : 'SELECT * FROM tutorials WHERE user_id = $1 ORDER BY date, period ASC';
+      : 'SELECT * FROM tutorials WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, period ASC';
     const params = date ? [req.user.id, date] : [req.user.id];
     const result = await pool.query(query, params);
     res.json(result.rows);
@@ -4907,40 +4928,139 @@ app.get('/api/tutorials', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /api/tutorials — upsert a tutorial for a date/period
-app.put('/api/tutorials', authenticateToken, async (req, res) => {
+// POST /api/tutorials — create a tutorial
+// Body: { date, period, title (derived from course), zoomNumber? }
+app.post('/api/tutorials', authenticateToken, async (req, res) => {
   try {
-    const { date, period, zoomNumber, topic } = req.body;
-    if (!date || !period) {
-      return res.status(400).json({ error: 'Date and period are required' });
+    let { date, period, title, zoomNumber } = req.body;
+    if (!date || !period || !title) {
+      return res.status(400).json({ error: 'date, period, and title are required' });
     }
+    // Normalise title: trim + title-case each word + append " Tutorial"
+    const toTitleCase = str => str.trim().replace(/\b\w/g, c => c.toUpperCase());
+    const baseName = toTitleCase(title.replace(/\s+Tutorial\s*$/i, '').trim());
+    const normalised = `${baseName} Tutorial`;
+
     const result = await pool.query(
-      `INSERT INTO tutorials (user_id, date, period, zoom_number, topic)
+      `INSERT INTO tutorials (user_id, date, period, title, zoom_number)
        VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (user_id, date, period)
-       DO UPDATE SET zoom_number = $4, topic = $5
        RETURNING *`,
-      [req.user.id, date, period, zoomNumber || null, topic || null]
+      [req.user.id, date, parseInt(period), normalised, zoomNumber || null]
     );
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Upsert tutorial error:', error);
-    res.status(500).json({ error: 'Failed to save tutorial' });
+    console.error('Create tutorial error:', error);
+    res.status(500).json({ error: 'Failed to create tutorial' });
   }
 });
 
-// DELETE /api/tutorials — remove a tutorial for a date/period
-app.delete('/api/tutorials', authenticateToken, async (req, res) => {
+// PATCH /api/tutorials/:id — update a tutorial
+app.patch('/api/tutorials/:id', authenticateToken, async (req, res) => {
   try {
-    const { date, period } = req.body;
-    await pool.query(
-      'DELETE FROM tutorials WHERE user_id = $1 AND date = $2 AND period = $3',
-      [req.user.id, date, period]
+    const { id } = req.params;
+    let { title, zoomNumber } = req.body;
+    const toTitleCase = str => str.trim().replace(/\b\w/g, c => c.toUpperCase());
+    const normalised = title ? `${toTitleCase(title.replace(/\s+Tutorial\s*$/i, '').trim())} Tutorial` : undefined;
+    const result = await pool.query(
+      `UPDATE tutorials SET
+         title       = COALESCE($3, title),
+         zoom_number = COALESCE($4, zoom_number)
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [id, req.user.id, normalised || null, zoomNumber !== undefined ? (zoomNumber || null) : null]
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tutorial not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Update tutorial error:', error);
+    res.status(500).json({ error: 'Failed to update tutorial' });
+  }
+});
+
+// DELETE /api/tutorials/:id — remove a tutorial by ID
+app.delete('/api/tutorials/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM tutorials WHERE id = $1 AND user_id = $2', [id, req.user.id]);
     res.json({ success: true });
   } catch (error) {
     console.error('Delete tutorial error:', error);
     res.status(500).json({ error: 'Failed to delete tutorial' });
+  }
+});
+
+
+// ============================================================================
+// MEETINGS
+// ============================================================================
+
+// GET /api/meetings?date=YYYY-MM-DD  OR  /api/meetings (all future)
+app.get('/api/meetings', authenticateToken, async (req, res) => {
+  try {
+    const { date } = req.query;
+    const query = date
+      ? 'SELECT * FROM meetings WHERE user_id = $1 AND date = $2 ORDER BY period ASC'
+      : 'SELECT * FROM meetings WHERE user_id = $1 AND date >= CURRENT_DATE ORDER BY date, period ASC';
+    const params = date ? [req.user.id, date] : [req.user.id];
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get meetings error:', error);
+    res.status(500).json({ error: 'Failed to get meetings' });
+  }
+});
+
+// POST /api/meetings — create a meeting
+// Body: { date, period, title, zoomNumber? }
+app.post('/api/meetings', authenticateToken, async (req, res) => {
+  try {
+    const { date, period, title, zoomNumber } = req.body;
+    if (!date || !period || !title) {
+      return res.status(400).json({ error: 'date, period, and title are required' });
+    }
+    const result = await pool.query(
+      `INSERT INTO meetings (user_id, date, period, title, zoom_number)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [req.user.id, date, parseInt(period), title.trim(), zoomNumber || null]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Create meeting error:', error);
+    res.status(500).json({ error: 'Failed to create meeting' });
+  }
+});
+
+// PATCH /api/meetings/:id — update a meeting
+app.patch('/api/meetings/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, zoomNumber } = req.body;
+    const result = await pool.query(
+      `UPDATE meetings SET
+         title       = COALESCE($3, title),
+         zoom_number = COALESCE($4, zoom_number)
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [id, req.user.id, title ? title.trim() : null, zoomNumber !== undefined ? (zoomNumber || null) : null]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Meeting not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Update meeting error:', error);
+    res.status(500).json({ error: 'Failed to update meeting' });
+  }
+});
+
+// DELETE /api/meetings/:id — remove a meeting by ID
+app.delete('/api/meetings/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM meetings WHERE id = $1 AND user_id = $2', [id, req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete meeting error:', error);
+    res.status(500).json({ error: 'Failed to delete meeting' });
   }
 });
 
@@ -7522,6 +7642,18 @@ app.put('/api/user/notification-prefs', authenticateToken, async (req, res) => {
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed to update prefs' }); }
+});
+
+// PUT /api/user/itinerary-prefs — save itinerary panel toggle preferences
+app.put('/api/user/itinerary-prefs', authenticateToken, async (req, res) => {
+  try {
+    const { itinerary_show_events, itinerary_show_organizer } = req.body;
+    await pool.query(
+      `UPDATE users SET itinerary_show_events=$1, itinerary_show_organizer=$2 WHERE id=$3`,
+      [itinerary_show_events ?? true, itinerary_show_organizer ?? true, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to update itinerary prefs' }); }
 });
 
 // ============================================================================
