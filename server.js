@@ -4205,15 +4205,14 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Get top 10 for this grade this week, join with users for insignia
+    // Get all entries for this grade this week, join with users for insignia
     const result = await pool.query(
       `SELECT wl.user_id, wl.user_name, wl.grade, wl.tasks_completed, wl.updated_at,
               COALESCE(u.insignia_selected, 'Default') AS insignia
        FROM weekly_leaderboard wl
        LEFT JOIN users u ON u.id = wl.user_id
        WHERE wl.grade = $1 AND wl.week_start = $2
-       ORDER BY wl.tasks_completed DESC, wl.updated_at ASC
-       LIMIT 10`,
+       ORDER BY wl.tasks_completed DESC, wl.updated_at ASC`,
       [grade, currentWeekStart]
     );
     
