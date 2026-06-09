@@ -305,12 +305,14 @@ CREATE TABLE IF NOT EXISTS tasks_completed (
     deadline_time   TIME,
     estimated_time  INTEGER NOT NULL,           -- user_estimated_time if set, otherwise estimated_time
     actual_time     INTEGER NOT NULL,           -- Total minutes logged (sum across all segments for splits)
-    completed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    completed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    canvas_confirmed BOOLEAN NOT NULL DEFAULT FALSE  -- TRUE if Canvas had registered the submission at completion time
 );
 
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS description   TEXT;
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_date DATE;
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_time TIME;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS description      TEXT;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_date    DATE;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_time    TIME;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS canvas_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id      ON tasks_completed(user_id);
