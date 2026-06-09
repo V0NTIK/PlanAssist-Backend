@@ -3335,7 +3335,7 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
 
     // Write to tasks_completed so checkbox completions count toward streaks and weekly stats.
     // canvas_confirmed reflects whether Canvas had already registered the submission.
-    // The leaderboard query filters to canvas_confirmed = true, so only Canvas-verified
+    // canvas_confirmed is recorded for historical tracking only.
     // completions count there.
     await pool.query(
       `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
@@ -4307,7 +4307,7 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Rank based on canvas-confirmed tasks_completed count only
+    // Rank based on all tasks_completed rows for this week
     const result = await pool.query(
       `WITH live_counts AS (
         SELECT u.id AS user_id, u.name AS user_name,
@@ -4316,7 +4316,6 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
         FROM users u
         INNER JOIN tasks_completed tc ON tc.user_id = u.id
           AND tc.completed_at >= $2
-          AND tc.canvas_confirmed = TRUE
         WHERE u.grade = $1
         GROUP BY u.id, u.name
       ),
@@ -4352,7 +4351,7 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Compute leaderboard from canvas-confirmed tasks_completed rows only
+    // Compute leaderboard from all tasks_completed rows for this week
     const result = await pool.query(
       `SELECT u.id AS user_id, u.name AS user_name, u.grade,
               COALESCE(u.insignia_selected, 'Default') AS insignia,
@@ -4361,7 +4360,6 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
        FROM users u
        INNER JOIN tasks_completed tc ON tc.user_id = u.id
          AND tc.completed_at >= $2
-         AND tc.canvas_confirmed = TRUE
        WHERE u.grade = $1
        GROUP BY u.id, u.name, u.grade, u.insignia_selected
        ORDER BY tasks_completed DESC, updated_at ASC`,
@@ -4567,10 +4565,10 @@ async function incrementLeaderboardForUser(userId) {
       `SELECT DATE_TRUNC('week', CURRENT_DATE)::date AS week_start`
     );
     const weekStart = weekStartRes.rows[0].week_start;
-    // Count only canvas-confirmed tasks_completed rows for this user this week
+    // Count all tasks_completed rows for this user this week
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS cnt FROM tasks_completed
-       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
+       WHERE user_id = $1 AND completed_at >= $2`,
       [userId, weekStart]
     );
     const trueCount = countRes.rows[0].cnt;
@@ -4607,7 +4605,7 @@ async function updateLeaderboardOnCompletion(userId) {
     // Count only canvas-confirmed tasks_completed rows for this user this week
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS cnt FROM tasks_completed
-       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
+       WHERE user_id = $1 AND completed_at >= $2`,
       [userId, currentWeekStart]
     );
     const trueCount = countRes.rows[0].cnt;
