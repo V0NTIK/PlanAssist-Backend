@@ -4073,7 +4073,7 @@ app.get('/api/insignia', authenticateToken, async (req, res) => {
     // Compute distinct completion days dynamically from tasks_completed so the counter
     // is always accurate even if insignia_days was never incremented for historical entries.
     const daysR = await pool.query(
-      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
+      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1 AND canvas_confirmed = TRUE',
       [req.user.id]
     );
     const computedDays = parseInt(daysR.rows[0]?.days ?? 0);
@@ -4130,7 +4130,7 @@ app.post('/api/insignia/check-unlock', authenticateToken, async (req, res) => {
       [60,'Obsidian'],[80,'Diamond'],[100,'Antimatter']
     ];
     const daysR = await pool.query(
-      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1',
+      'SELECT COUNT(DISTINCT completed_at::date) AS days FROM tasks_completed WHERE user_id = $1 AND canvas_confirmed = TRUE',
       [req.user.id]
     );
     const days = parseInt(daysR.rows[0]?.days ?? 0);
@@ -4307,7 +4307,7 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Rank based on all tasks_completed rows for this week
+    // Rank based on canvas-confirmed tasks_completed rows only
     const result = await pool.query(
       `WITH live_counts AS (
         SELECT u.id AS user_id, u.name AS user_name,
@@ -4316,6 +4316,7 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
         FROM users u
         INNER JOIN tasks_completed tc ON tc.user_id = u.id
           AND tc.completed_at >= $2
+          AND tc.canvas_confirmed = TRUE
         WHERE u.grade = $1
         GROUP BY u.id, u.name
       ),
@@ -4351,7 +4352,7 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Compute leaderboard from all tasks_completed rows for this week
+    // Compute leaderboard from canvas-confirmed tasks_completed rows only
     const result = await pool.query(
       `SELECT u.id AS user_id, u.name AS user_name, u.grade,
               COALESCE(u.insignia_selected, 'Default') AS insignia,
@@ -4360,6 +4361,7 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
        FROM users u
        INNER JOIN tasks_completed tc ON tc.user_id = u.id
          AND tc.completed_at >= $2
+         AND tc.canvas_confirmed = TRUE
        WHERE u.grade = $1
        GROUP BY u.id, u.name, u.grade, u.insignia_selected
        ORDER BY tasks_completed DESC, updated_at ASC`,
@@ -4565,10 +4567,10 @@ async function incrementLeaderboardForUser(userId) {
       `SELECT DATE_TRUNC('week', CURRENT_DATE)::date AS week_start`
     );
     const weekStart = weekStartRes.rows[0].week_start;
-    // Count all tasks_completed rows for this user this week
+    // Count only canvas-confirmed tasks_completed rows for this user this week
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS cnt FROM tasks_completed
-       WHERE user_id = $1 AND completed_at >= $2`,
+       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
       [userId, weekStart]
     );
     const trueCount = countRes.rows[0].cnt;
@@ -4605,7 +4607,7 @@ async function updateLeaderboardOnCompletion(userId) {
     // Count only canvas-confirmed tasks_completed rows for this user this week
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS cnt FROM tasks_completed
-       WHERE user_id = $1 AND completed_at >= $2`,
+       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
       [userId, currentWeekStart]
     );
     const trueCount = countRes.rows[0].cnt;
@@ -4633,7 +4635,7 @@ async function addToCompletionFeed(userId, taskTitle, taskClass, { manuallyCreat
     const todayUtc = new Date().toISOString().slice(0, 10);
     const alreadyTodayRes = await pool.query(
       `SELECT 1 FROM tasks_completed
-       WHERE user_id = $1 AND completed_at::date = $2::date LIMIT 1`,
+       WHERE user_id = $1 AND completed_at::date = $2::date AND canvas_confirmed = TRUE LIMIT 1`,
       [userId, todayUtc]
     );
     if (alreadyTodayRes.rowCount === 0) {
