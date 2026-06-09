@@ -89,6 +89,18 @@ app.use((req, res, next) => {
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.json({ limit: '10mb' }));
 
+// Database connection — declared here so all middleware below can reference pool safely
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Force UTC timezone for all DB sessions so DATE columns are never shifted
+// by the Supabase server timezone (which may be EST/America_New_York)
+pool.on('connect', client => {
+  client.query("SET TIME ZONE 'UTC'");
+});
+
 // ── IP Blacklist middleware ────────────────────────────────────────────────
 // Cache loaded once at startup and refreshed after any admin change.
 let ipBlacklistCache = new Set();
@@ -111,19 +123,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
-// Database connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
-
-// Force UTC timezone for all DB sessions so DATE columns are never shifted
-// by the Supabase server timezone (which may be EST/America_New_York)
-pool.on('connect', client => {
-  client.query("SET TIME ZONE 'UTC'");
-});
-
 
 // Canvas API base URL
 const CANVAS_API_BASE = 'https://canvas.oneschoolglobal.com/api/v1';
@@ -3842,6 +3841,23 @@ app.post('/api/tasks/:taskId/notes', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Save notes error:', error);
     res.status(500).json({ error: 'Failed to save notes' });
+  }
+});
+
+
+// GET /api/tasks/notes-index — returns all task IDs that have non-empty notes for this user
+// Replaces N individual GET /tasks/:id/notes calls on page load.
+app.get('/api/tasks/notes-index', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT task_id FROM notes
+       WHERE user_id = $1 AND notes IS NOT NULL AND TRIM(notes) != ''`,
+      [req.user.id]
+    );
+    res.json({ taskIds: result.rows.map(r => r.task_id) });
+  } catch (error) {
+    console.error('Notes index error:', error);
+    res.status(500).json({ error: 'Failed to load notes index' });
   }
 });
 
