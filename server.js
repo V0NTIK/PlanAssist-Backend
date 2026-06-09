@@ -4277,40 +4277,9 @@ app.get('/api/completion-feed', authenticateToken, async (req, res) => {
 });
 
 // Get weekly leaderboard by grade
-app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
-  try {
-    const { grade } = req.params;
-    
-    // Get current week start (Monday)
-    const weekStart = await pool.query(
-      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
-    );
-    const currentWeekStart = weekStart.rows[0].week_start;
-    
-    // Compute leaderboard from canvas-confirmed tasks_completed rows only
-    const result = await pool.query(
-      `SELECT u.id AS user_id, u.name AS user_name, u.grade,
-              COALESCE(u.insignia_selected, 'Default') AS insignia,
-              COUNT(tc.id)::int AS tasks_completed,
-              MAX(tc.completed_at) AS updated_at
-       FROM users u
-       INNER JOIN tasks_completed tc ON tc.user_id = u.id
-         AND tc.completed_at >= $2
-         AND tc.canvas_confirmed = TRUE
-       WHERE u.grade = $1
-       GROUP BY u.id, u.name, u.grade, u.insignia_selected
-       ORDER BY tasks_completed DESC, updated_at ASC`,
-      [grade, currentWeekStart]
-    );
-    
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Get leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to get leaderboard' });
-  }
-});
-
 // Get user's current position in leaderboard
+// IMPORTANT: this route must be defined BEFORE /leaderboard/:grade or Express will
+// match 'position' as the :grade param and never reach this handler.
 app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) => {
   try {
     const { grade } = req.params;
@@ -4354,6 +4323,39 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
   } catch (error) {
     console.error('Get leaderboard position error:', error);
     res.status(500).json({ error: 'Failed to get position' });
+  }
+});
+
+app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
+  try {
+    const { grade } = req.params;
+    
+    // Get current week start (Monday)
+    const weekStart = await pool.query(
+      `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
+    );
+    const currentWeekStart = weekStart.rows[0].week_start;
+    
+    // Compute leaderboard from canvas-confirmed tasks_completed rows only
+    const result = await pool.query(
+      `SELECT u.id AS user_id, u.name AS user_name, u.grade,
+              COALESCE(u.insignia_selected, 'Default') AS insignia,
+              COUNT(tc.id)::int AS tasks_completed,
+              MAX(tc.completed_at) AS updated_at
+       FROM users u
+       INNER JOIN tasks_completed tc ON tc.user_id = u.id
+         AND tc.completed_at >= $2
+         AND tc.canvas_confirmed = TRUE
+       WHERE u.grade = $1
+       GROUP BY u.id, u.name, u.grade, u.insignia_selected
+       ORDER BY tasks_completed DESC, updated_at ASC`,
+      [grade, currentWeekStart]
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get leaderboard error:', error);
+    res.status(500).json({ error: 'Failed to get leaderboard' });
   }
 });
 
