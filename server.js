@@ -12,6 +12,38 @@ const axios = require('axios');
 const ICAL = require('ical.js');
 const crypto = require('crypto');
 
+// ── HTML sanitizer for Canvas task descriptions ───────────────────────────────
+// Strips all event handlers, javascript: URLs, data: URIs, and dangerous tags
+// from HTML strings. Uses an allowlist of safe tags and attributes.
+function sanitizeHtml(html) {
+  if (!html || typeof html !== 'string') return html;
+
+  // Remove entire dangerous tag blocks (script, style, iframe, object, embed, etc.)
+  let out = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<object\b[^>]*>[\s\S]*?<\/object>/gi, '')
+    .replace(/<embed\b[^>]*(\/)?>/gi, '')
+    .replace(/<form\b[^>]*>[\s\S]*?<\/form>/gi, '')
+    .replace(/<base\b[^>]*(\/)?>/gi, '')
+    .replace(/<meta\b[^>]*(\/)?>/gi, '')
+    .replace(/<link\b[^>]*(\/)?>/gi, '');
+
+  // Strip ALL event handler attributes (on*, formaction, etc.)
+  // This regex targets attribute names that begin with "on" or are known injection points
+  out = out.replace(/\s(?:on\w+|formaction|srcdoc|xmlns|xlink:[a-z]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+
+  // Strip javascript:, vbscript:, data: from href/src/action/xlink:href attributes
+  out = out.replace(/(href|src|action|poster|background)\s*=\s*["']?\s*(?:javascript|vbscript|data)\s*:[^"'>\s]*/gi, '$1="#"');
+
+  // Strip base64 data URIs entirely
+  out = out.replace(/\s(?:src|href|action)\s*=\s*["']?\s*data:[^"'>\s]*/gi, '');
+
+  return out;
+}
+
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -2467,7 +2499,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                is_missing=$18, is_late=$19,
                completed=$20, deleted=CASE WHEN $20 THEN true ELSE deleted END
              WHERE id=$21 AND user_id=$22`,
-            [t.title, t.class, t.description || '', t.url,
+            [t.title, t.class, sanitizeHtml(t.description || ''), t.url,
              t.deadlineDate, t.deadlineTime, t.courseId ?? null, t.assignmentId ?? null,
              t.quizId ?? null, t.pointsPossible ?? null, t.assignmentGroupId ?? null,
              t.currentScore ?? null, t.currentGrade ?? null, t.gradingType || 'points',
@@ -2480,32 +2512,46 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
         if (completionFlip) {
           completionFlips++;
           console.log(`  ★ Completion flip detected for "${existing.title}" → checking tasks_completed…`);
-          // Guard 1: task must not already be in tasks_completed (prevents double-counting
-          //          on re-syncs of tasks that were completed outside PlanAssist).
-          // Guard 2: the completion must be within this calendar week — tasks submitted
-          //          weeks ago and now entering the sync window for the first time should
-          //          not retroactively count toward this week's leaderboard.
-          const alreadyRecordedFlip = await pool.query(
-            'SELECT 1 FROM tasks_completed WHERE id = $1', [existing.id]
-          );
-          if (alreadyRecordedFlip.rowCount === 0) {
-            const weekStart = new Date();
-            weekStart.setHours(0, 0, 0, 0);
-            weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
-            const completionDate = t.submittedAt ? new Date(t.submittedAt)
-              : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
-            const isThisWeek = completionDate && completionDate >= weekStart;
-            if (isThisWeek) {
-              console.log(`  ★ → confirmed new this-week completion, firing leaderboard + feed`);
-              incrementLeaderboardForUser(userId).catch(err =>
-                console.error('[LEADERBOARD] sync flip error:', err.message));
-              addToCompletionFeed(userId, existing.title, existing.class).catch(err =>
-                console.error('[FEED] sync flip error:', err.message));
-            } else {
-              console.log(`  ★ → completion date outside this week, skipping leaderboard`);
-            }
+          // Restorative tasks are intentionally restored for re-study — their Canvas
+          // submission pre-dates the restore action and must never count again.
+          if (existing.restorative) {
+            console.log(`  ★ → restorative task, skipping leaderboard`);
           } else {
-            console.log(`  ★ → already in tasks_completed, skipping leaderboard`);
+            const alreadyRecordedFlip = await pool.query(
+              'SELECT 1 FROM tasks_completed WHERE id = $1', [existing.id]
+            );
+            if (alreadyRecordedFlip.rowCount === 0) {
+              const weekStart = new Date();
+              weekStart.setHours(0, 0, 0, 0);
+              weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+              const completionDate = t.submittedAt ? new Date(t.submittedAt)
+                : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
+              const isThisWeek = completionDate && completionDate >= weekStart;
+              if (isThisWeek) {
+                // Write tasks_completed row so leaderboard count is accurate
+                await pool.query(
+                  `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, TRUE)
+                   ON CONFLICT (id) DO NOTHING`,
+                  [
+                    existing.id, userId, existing.title, existing.class,
+                    existing.description || '', existing.url,
+                    existing.deadline_date, existing.deadline_time,
+                    existing.user_estimated_time || existing.estimated_time,
+                    existing.accumulated_time || 0
+                  ]
+                );
+                console.log(`  ★ → confirmed new this-week completion, firing leaderboard + feed`);
+                incrementLeaderboardForUser(userId).catch(err =>
+                  console.error('[LEADERBOARD] sync flip error:', err.message));
+                addToCompletionFeed(userId, existing.title, existing.class).catch(err =>
+                  console.error('[FEED] sync flip error:', err.message));
+              } else {
+                console.log(`  ★ → completion date outside this week, skipping leaderboard`);
+              }
+            } else {
+              console.log(`  ★ → already in tasks_completed, skipping leaderboard`);
+            }
           }
         }
         if (gradeFlipped) {
@@ -2526,7 +2572,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               completed, deleted, manually_created)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
            RETURNING id`,
-          [userId, t.title, t.segment ?? null, t.class, t.description || '', t.url,
+          [userId, t.title, t.segment ?? null, t.class, sanitizeHtml(t.description || ''), t.url,
            t.deadlineDate, t.deadlineTime, t.estimatedTime, t.userEstimate ?? null,
            t.courseId ?? null, t.assignmentId ?? null, t.quizId ?? null,
            t.pointsPossible ?? null, t.assignmentGroupId ?? null,
@@ -2555,12 +2601,26 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
           const isThisWeek = completionDate && completionDate >= weekStart;
           if (isThisWeek) {
-            // Guard: only fire if not already recorded in tasks_completed — prevents
-            // re-inserted tasks (e.g. restored after inactive/deleted) from duplicating
+            // Guard: only fire if not already recorded in tasks_completed
             const alreadyRecorded = await pool.query(
               'SELECT 1 FROM tasks_completed WHERE id = $1', [newId]
             );
             if (alreadyRecorded.rowCount === 0) {
+              // Write tasks_completed row so leaderboard count is accurate
+              await pool.query(
+                `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, TRUE)
+                 ON CONFLICT (id) DO NOTHING`,
+                [
+                  newId, userId, t.title, t.class,
+                  sanitizeHtml(t.description || ''), t.url,
+                  t.deadlineDate, t.deadlineTime,
+                  t.estimatedTime, 0
+                ]
+              );
+              // New tasks inserted by sync are never restorative (restorative=TRUE is only
+              // set on tasks the user explicitly restored — those tasks already exist in DB
+              // and are handled by the UPDATE path above, not this INSERT path).
               console.log(`  ★ New task already completed this week: "${t.title}" → leaderboard + feed`);
               incrementLeaderboardForUser(userId).catch(err =>
                 console.error('[LEADERBOARD] new-complete error:', err.message));
@@ -2817,7 +2877,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                    WHERE id = $21 AND user_id = $22`,
                   [
                     incomingTask.title,
-                    incomingTask.description || '',
+                    sanitizeHtml(incomingTask.description || ''),
                     incomingTask.estimatedTime,
                     incomingTask.completed ?? false,
                     incomingTask.class,
@@ -2857,7 +2917,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                WHERE id = $9 AND user_id = $10`,
               [
                 incomingTask.title,
-                incomingTask.description || '',
+                sanitizeHtml(incomingTask.description || ''),
                 incomingTask.estimatedTime,
                 incomingTask.completed ?? false,
                 incomingTask.class,
@@ -2878,40 +2938,49 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.currentGrade !== existingTask.current_grade;
           // If Canvas now marks the task completed and it wasn't before:
           if (!existingTask.segment && incomingTask.completed && !existingTask.completed) {
-            // Only write tasks_completed if user hasn't manually resolved it already
-            if (!existingTask.deleted) {
-              await pool.query(
-                `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
-                 ON CONFLICT (id) DO NOTHING`,
-                [
-                  existingTask.id, req.user.id, existingTask.title, existingTask.class,
-                  existingTask.description || '', existingTask.url,
-                  existingTask.deadline_date, existingTask.deadline_time,
-                  existingTask.user_estimated_time || existingTask.estimated_time,
-                  existingTask.accumulated_time || 0
-                ]
-              );
-              console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
-            }
-            // Guard: only increment leaderboard if this completion is genuinely new this week.
-            const alreadyCounted = await pool.query(
-              'SELECT 1 FROM tasks_completed WHERE id = $1', [existingTask.id]
-            );
-            if (alreadyCounted.rowCount > 0) {
-              console.log(`  ★ Task ${existingTask.id} already in tasks_completed — skipping leaderboard`);
+            // Restorative tasks must never re-count on the leaderboard — the student
+            // deliberately restored them for re-study, Canvas still shows submitted.
+            if (existingTask.restorative) {
+              console.log(`  ★ Task ${existingTask.id} is restorative — skipping leaderboard`);
             } else {
-              const weekStart = new Date();
-              weekStart.setHours(0,0,0,0);
-              weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
-              const completionDate = incomingTask.submittedAt ? new Date(incomingTask.submittedAt)
-                : (incomingTask.deadlineDate ? new Date(incomingTask.deadlineDate + 'T00:00:00') : null);
-              const isThisWeek = completionDate && completionDate >= weekStart;
-              if (isThisWeek) {
-                updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
-                console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip, this week)`);
+              // Check if already in tasks_completed BEFORE writing, so we can tell if this is new
+              const alreadyCounted = await pool.query(
+                'SELECT 1 FROM tasks_completed WHERE id = $1', [existingTask.id]
+              );
+              const isNewCompletion = alreadyCounted.rowCount === 0;
+
+              // Only write tasks_completed if user hasn't manually resolved it already
+              if (!existingTask.deleted) {
+                await pool.query(
+                  `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, TRUE)
+                   ON CONFLICT (id) DO NOTHING`,
+                  [
+                    existingTask.id, req.user.id, existingTask.title, existingTask.class,
+                    existingTask.description || '', existingTask.url,
+                    existingTask.deadline_date, existingTask.deadline_time,
+                    existingTask.user_estimated_time || existingTask.estimated_time,
+                    existingTask.accumulated_time || 0
+                  ]
+                );
+                console.log(`  ★ Canvas-completed task ${existingTask.id}: wrote tasks_completed row`);
+              }
+              // Only fire leaderboard recalc if this is a genuinely new completion this week
+              if (isNewCompletion) {
+                const weekStart = new Date();
+                weekStart.setHours(0,0,0,0);
+                weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+                const completionDate = incomingTask.submittedAt ? new Date(incomingTask.submittedAt)
+                  : (incomingTask.deadlineDate ? new Date(incomingTask.deadlineDate + 'T00:00:00') : null);
+                const isThisWeek = completionDate && completionDate >= weekStart;
+                if (isThisWeek) {
+                  updateLeaderboardOnCompletion(req.user.id).catch(err => console.error('Sync leaderboard update failed:', err));
+                  console.log(`  ★ Leaderboard updated for task ${existingTask.id} (Canvas completed flip, this week)`);
+                } else {
+                  console.log(`  ★ Task ${existingTask.id} completed outside this week — skipping leaderboard`);
+                }
               } else {
-                console.log(`  ★ Task ${existingTask.id} completed outside this week — skipping leaderboard`);
+                console.log(`  ★ Task ${existingTask.id} already in tasks_completed — skipping leaderboard`);
               }
             }
           }
@@ -2997,26 +3066,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
             incomingTask.title,
             null, // New tasks start with no segment
             incomingTask.class,
-            incomingTask.description || '',
-            incomingTask.url,
-            incomingTask.deadlineDate,
-            incomingTask.deadlineTime,
-            incomingTask.estimatedTime,
-            null, // No user override yet
-            0, // No accumulated time yet
-            incomingTask.completed ?? false,
-            false, // Not deleted
-            incomingTask.courseId ?? null,
-            incomingTask.assignmentId ?? null,
-            incomingTask.quizId ?? null,
-            incomingTask.pointsPossible ?? null,
-            incomingTask.assignmentGroupId ?? null,
-            incomingTask.currentScore ?? null,
-            incomingTask.currentGrade ?? null,
-            incomingTask.gradingType || 'points',
-            incomingTask.unlockAt ?? null,
-            incomingTask.lockAt ?? null,
-            incomingTask.submittedAt ?? null,
+            sanitizeHtml(incomingTask.description || ''),
             incomingTask.isMissing ?? false,
             incomingTask.isLate ?? false
           ]
@@ -3259,7 +3309,7 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
   try {
     const taskId = req.params.id;
 
-    // Verify task exists
+    // Verify task exists and isn't already completed
     const taskResult = await pool.query(
       'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
@@ -3269,13 +3319,53 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
+    const task = taskResult.rows[0];
+
+    // Idempotent: already done
+    if (task.completed || task.deleted) {
+      return res.json({ success: true });
+    }
+
+    // tasks.completed = true means Canvas already confirmed this submission during sync.
+    // Capture it before overwriting below.
+    const canvasConfirmed = task.completed === true;
+
     // Mark task completed and deleted.
-    // completed=true must be set so sync-save's wasCompleted check sees it
-    // and does not re-fire the leaderboard increment on the next sync.
     await pool.query(
       'UPDATE tasks SET completed = true, deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
+
+    // Write to tasks_completed so checkbox completions count toward streaks and weekly stats.
+    // canvas_confirmed reflects whether Canvas had already registered the submission.
+    // The leaderboard query filters to canvas_confirmed = true, so only Canvas-verified
+    // completions count there.
+    await pool.query(
+      `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, $11)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        task.id, req.user.id, task.title, task.class,
+        task.description || '', task.url,
+        task.deadline_date, task.deadline_time,
+        task.user_estimated_time || task.estimated_time,
+        task.accumulated_time || 0,
+        canvasConfirmed
+      ]
+    );
+
+    // Leaderboard: only if Canvas had already confirmed this submission
+    if (canvasConfirmed) {
+      incrementLeaderboardForUser(req.user.id).catch(err =>
+        console.error('[LEADERBOARD] Checkbox complete error:', err.message));
+    }
+
+    // Insignia / feed
+    addToCompletionFeed(req.user.id, task.title, task.class, {
+      manuallyCreated: task.manually_created || false,
+      timeSpent: task.accumulated_time || 0,
+      restorative: task.restorative || false
+    }).catch(err => console.error('[FEED] Checkbox complete error:', err.message));
 
     res.json({ success: true });
   } catch (error) {
@@ -3299,8 +3389,12 @@ app.patch('/api/tasks/:id/uncomplete', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
+    // Reset both deleted and completed so the task fully re-enters the active pool.
+    // Previously only deleted was reset, leaving completed=true, which meant sync
+    // would never re-fire leaderboard (correct) but the task was in an inconsistent
+    // state (active in UI but completed=true in DB).
     await pool.query(
-      'UPDATE tasks SET deleted = false WHERE id = $1 AND user_id = $2',
+      'UPDATE tasks SET deleted = false, completed = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
 
@@ -3466,93 +3560,85 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
     );
     
     if (taskResult.rows.length === 0) {
-      // Task may have already been completed/deleted — treat as success
       return res.json({ success: true, alreadyCompleted: true });
     }
     
     const task = taskResult.rows[0];
 
-    // If already completed, just return success (idempotent)
     if (task.completed || task.deleted) {
       return res.json({ success: true, alreadyCompleted: true });
     }
 
-    // Only write to tasks_completed if actual time was logged (timeSpent > 0)
-    // If timeSpent is 0 or absent, skip the tasks_completed entry — task is
-    // marked done but no time record is created (avoids polluting analytics)
+    // tasks.completed = true means Canvas already confirmed this submission during sync.
+    // We capture it now before we overwrite it below with our own UPDATE.
+    // This is the authoritative Canvas confirmation — no separate API call needed.
+    const canvasConfirmed = task.completed === true;
+
     const hasTimeToLog = timeSpent && timeSpent > 0;
     
     // For segment tasks: check if another segment of the same task already exists
     // in tasks_completed. If so, merge by accumulating estimated_time + actual_time.
-    // Always fire leaderboard + feed regardless (each segment is real work done).
     if (hasTimeToLog && task.segment && task.url) {
       const existingCompletion = await pool.query(
-        'SELECT id, estimated_time, actual_time FROM tasks_completed WHERE user_id = $1 AND url = $2',
+        'SELECT id, estimated_time, actual_time, canvas_confirmed FROM tasks_completed WHERE user_id = $1 AND url = $2',
         [req.user.id, task.url]
       );
 
       if (existingCompletion.rows.length > 0) {
-        // Merge: add this segment's time onto the existing entry
         const existing = existingCompletion.rows[0];
         const newEstimated = (existing.estimated_time || 0) + (task.user_estimated_time || task.estimated_time || 0);
         const newActual = (existing.actual_time || 0) + (timeSpent || 0);
+        // Once canvas_confirmed is true on a merged row, it stays true
+        const mergedConfirmed = existing.canvas_confirmed || canvasConfirmed;
         await pool.query(
           `UPDATE tasks_completed
-           SET estimated_time = $1, actual_time = $2, completed_at = CURRENT_TIMESTAMP
+           SET estimated_time = $1, actual_time = $2, completed_at = CURRENT_TIMESTAMP,
+               canvas_confirmed = $4
            WHERE id = $3`,
-          [newEstimated, newActual, existing.id]
+          [newEstimated, newActual, existing.id, mergedConfirmed]
         );
-        console.log(`[SEGMENT MERGE] Updated tasks_completed for "${task.title}" (+${timeSpent}min actual, +${task.user_estimated_time || task.estimated_time}min est)`);
+        console.log(`[SEGMENT MERGE] Updated tasks_completed for "${task.title}" (+${timeSpent}min actual, canvas_confirmed=${mergedConfirmed})`);
       } else {
-        // First segment to complete — insert normally
         await pool.query(
-          `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+          `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, $11)
            ON CONFLICT (id) DO UPDATE SET
              actual_time = COALESCE(EXCLUDED.actual_time, tasks_completed.actual_time),
+             canvas_confirmed = tasks_completed.canvas_confirmed OR EXCLUDED.canvas_confirmed,
              completed_at = CURRENT_TIMESTAMP`,
           [
             task.id, req.user.id, task.title, task.class, task.description, task.url,
             task.deadline_date, task.deadline_time,
             task.user_estimated_time || task.estimated_time,
-            timeSpent
+            timeSpent, canvasConfirmed
           ]
         );
       }
     } else if (hasTimeToLog) {
-      // Non-segment task: upsert — safe if already completed via another path
       await pool.query(
-        `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+        `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, $11)
          ON CONFLICT (id) DO UPDATE SET
            actual_time = COALESCE(EXCLUDED.actual_time, tasks_completed.actual_time),
+           canvas_confirmed = tasks_completed.canvas_confirmed OR EXCLUDED.canvas_confirmed,
            completed_at = CURRENT_TIMESTAMP`,
         [
           task.id, req.user.id, task.title, task.class, task.description, task.url,
           task.deadline_date, task.deadline_time,
           task.user_estimated_time || task.estimated_time,
-          timeSpent
+          timeSpent, canvasConfirmed
         ]
       );
     }
     
-    // Mark task as completed AND deleted.
-    // Setting completed=true is critical: sync-save checks existing.completed before
-    // firing the leaderboard increment. If completed stays false, every subsequent sync
-    // that sees Canvas has it submitted will re-fire the leaderboard (double-count).
     await pool.query(
       'UPDATE tasks SET completed = true, deleted = true, session_active = false WHERE id = $1 AND user_id = $2',
       [taskId, req.user.id]
     );
     
-    // Update leaderboard and completion feed only when appropriate:
-    // - Non-segment tasks: always fire
-    // - Segment tasks with canonical URL: only fire when this is the LAST remaining segment
-    // - Tasks with planassist URL (manual tasks): always fire (they don't share URL meaningfully)
     const PLANASSIST_URL = 'https://planassist.onrender.com/';
     let shouldFireFeed = true;
     if (task.segment && task.url && task.url !== PLANASSIST_URL) {
-      // Check if any other non-completed, non-deleted segment siblings remain
       const remainingSegments = await pool.query(
         `SELECT id FROM tasks
          WHERE user_id = $1 AND url = $2 AND segment IS NOT NULL
@@ -3560,25 +3646,24 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
         [req.user.id, task.url, taskId]
       );
       if (remainingSegments.rows.length > 0) {
-        shouldFireFeed = false; // more segments still to go
+        shouldFireFeed = false;
       }
     }
     if (shouldFireFeed) {
-      // Feed: only Canvas tasks done in Session/Agenda with time > 0
       addToCompletionFeed(req.user.id, task.title, task.class, {
         manuallyCreated: task.manually_created || false,
         timeSpent: timeSpent || 0,
         restorative: task.restorative || false
       }).catch(err => console.error('Feed update failed:', err));
 
-      // Leaderboard: only if Canvas has confirmed the submission (canvasCompleted=true)
-      // and the task was NOT already completed before this action (task.completed was FALSE)
-      // This matches the spec: check completed=FALSE in DB first, then Canvas confirms.
-      const { canvasCompleted } = req.body;
-      if (canvasCompleted === true) {
-        console.log(`[MARK COMPLETE] Canvas confirmed submission for task ${taskId} — updating leaderboard`);
+      // Leaderboard: only if Canvas had already confirmed this submission
+      // (task.completed was TRUE before this request — set by sync when Canvas registered it).
+      if (canvasConfirmed) {
+        console.log(`[MARK COMPLETE] Canvas had confirmed task ${taskId} — recalculating leaderboard`);
         incrementLeaderboardForUser(req.user.id).catch(err =>
           console.error('[LEADERBOARD] Mark complete error:', err.message));
+      } else {
+        console.log(`[MARK COMPLETE] Canvas has not yet confirmed task ${taskId} — leaderboard not updated`);
       }
     }
     
@@ -4205,14 +4290,19 @@ app.get('/api/leaderboard/:grade', authenticateToken, async (req, res) => {
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Get all entries for this grade this week, join with users for insignia
+    // Compute leaderboard from canvas-confirmed tasks_completed rows only
     const result = await pool.query(
-      `SELECT wl.user_id, wl.user_name, wl.grade, wl.tasks_completed, wl.updated_at,
-              COALESCE(u.insignia_selected, 'Default') AS insignia
-       FROM weekly_leaderboard wl
-       LEFT JOIN users u ON u.id = wl.user_id
-       WHERE wl.grade = $1 AND wl.week_start = $2
-       ORDER BY wl.tasks_completed DESC, wl.updated_at ASC`,
+      `SELECT u.id AS user_id, u.name AS user_name, u.grade,
+              COALESCE(u.insignia_selected, 'Default') AS insignia,
+              COUNT(tc.id)::int AS tasks_completed,
+              MAX(tc.completed_at) AS updated_at
+       FROM users u
+       INNER JOIN tasks_completed tc ON tc.user_id = u.id
+         AND tc.completed_at >= $2
+         AND tc.canvas_confirmed = TRUE
+       WHERE u.grade = $1
+       GROUP BY u.id, u.name, u.grade, u.insignia_selected
+       ORDER BY tasks_completed DESC, updated_at ASC`,
       [grade, currentWeekStart]
     );
     
@@ -4235,13 +4325,23 @@ app.get('/api/leaderboard/position/:grade', authenticateToken, async (req, res) 
     );
     const currentWeekStart = weekStart.rows[0].week_start;
     
-    // Get user's position
+    // Rank based on canvas-confirmed tasks_completed count only
     const result = await pool.query(
-      `WITH ranked_users AS (
+      `WITH live_counts AS (
+        SELECT u.id AS user_id, u.name AS user_name,
+               COUNT(tc.id)::int AS tasks_completed,
+               MAX(tc.completed_at) AS updated_at
+        FROM users u
+        INNER JOIN tasks_completed tc ON tc.user_id = u.id
+          AND tc.completed_at >= $2
+          AND tc.canvas_confirmed = TRUE
+        WHERE u.grade = $1
+        GROUP BY u.id, u.name
+      ),
+      ranked_users AS (
         SELECT user_id, user_name, tasks_completed,
                ROW_NUMBER() OVER (ORDER BY tasks_completed DESC, updated_at ASC) as position
-        FROM weekly_leaderboard
-        WHERE grade = $1 AND week_start = $2
+        FROM live_counts
       )
       SELECT position, user_name, tasks_completed
       FROM ranked_users
@@ -4438,6 +4538,8 @@ app.get('/api/users/:userId/profile', authenticateToken, async (req, res) => {
 // ── Shared: update leaderboard when sync detects a Canvas submission flip ──────
 // Called by Main Sync, Background Sync, and the Mark Complete endpoint.
 // Only increments weekly_leaderboard.tasks_completed — no tasks_completed write.
+// Uses a COUNT from tasks_completed for the current week to prevent farming
+// (previously used a blind +1 increment which could be exploited by replaying completions).
 async function incrementLeaderboardForUser(userId) {
   try {
     const userResult = await pool.query(
@@ -4450,15 +4552,22 @@ async function incrementLeaderboardForUser(userId) {
       `SELECT DATE_TRUNC('week', CURRENT_DATE)::date AS week_start`
     );
     const weekStart = weekStartRes.rows[0].week_start;
+    // Count only canvas-confirmed tasks_completed rows for this user this week
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM tasks_completed
+       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
+      [userId, weekStart]
+    );
+    const trueCount = countRes.rows[0].cnt;
     await pool.query(
       `INSERT INTO weekly_leaderboard (user_id, user_name, grade, tasks_completed, week_start, updated_at)
-       VALUES ($1, $2, $3, 1, $4, CURRENT_TIMESTAMP)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
        ON CONFLICT (user_id, week_start)
-       DO UPDATE SET tasks_completed = weekly_leaderboard.tasks_completed + 1,
+       DO UPDATE SET tasks_completed = $4,
                      updated_at = CURRENT_TIMESTAMP`,
-      [userId, user.name, user.grade, weekStart]
+      [userId, user.name, user.grade, trueCount, weekStart]
     );
-    console.log(`[LEADERBOARD] Incremented tasks_completed for user ${userId} (week ${weekStart})`);
+    console.log(`[LEADERBOARD] Set tasks_completed=${trueCount} for user ${userId} (week ${weekStart})`);
   } catch (err) {
     console.error('[LEADERBOARD] incrementLeaderboardForUser error:', err.message);
   }
@@ -4466,7 +4575,6 @@ async function incrementLeaderboardForUser(userId) {
 
 async function updateLeaderboardOnCompletion(userId) {
   try {
-    // Get user info
     const userResult = await pool.query(
       'SELECT name, grade, show_in_feed, insignia_selected FROM users WHERE id = $1',
       [userId]
@@ -4476,21 +4584,27 @@ async function updateLeaderboardOnCompletion(userId) {
     
     const user = userResult.rows[0];
     
-    // Get current week start
     const weekStart = await pool.query(
       `SELECT DATE_TRUNC('week', CURRENT_DATE)::date as week_start`
     );
     const currentWeekStart = weekStart.rows[0].week_start;
+
+    // Count only canvas-confirmed tasks_completed rows for this user this week
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM tasks_completed
+       WHERE user_id = $1 AND completed_at >= $2 AND canvas_confirmed = TRUE`,
+      [userId, currentWeekStart]
+    );
+    const trueCount = countRes.rows[0].cnt;
     
-    // Update or insert weekly leaderboard entry
     await pool.query(
       `INSERT INTO weekly_leaderboard (user_id, user_name, grade, tasks_completed, week_start, updated_at)
-       VALUES ($1, $2, $3, 1, $4, CURRENT_TIMESTAMP)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
        ON CONFLICT (user_id, week_start)
        DO UPDATE SET 
-         tasks_completed = weekly_leaderboard.tasks_completed + 1,
+         tasks_completed = $4,
          updated_at = CURRENT_TIMESTAMP`,
-      [userId, user.name, user.grade, currentWeekStart]
+      [userId, user.name, user.grade, trueCount, currentWeekStart]
     );
   } catch (error) {
     console.error('Update leaderboard error:', error);
