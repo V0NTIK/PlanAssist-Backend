@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS users (
     grade                       VARCHAR(50),
     canvas_api_token            TEXT,                           -- AES-256-GCM encrypted Canvas personal access token
     canvas_api_token_iv         TEXT,                           -- GCM initialisation vector
-    present_periods             VARCHAR(20)     DEFAULT '2-6',  -- OSG periods the student attends (e.g. '2-6')
     is_new_user                 BOOLEAN         DEFAULT TRUE,   -- Cleared on first account setup save
     is_admin                    BOOLEAN         DEFAULT FALSE,
     is_banned                   BOOLEAN         DEFAULT FALSE,
