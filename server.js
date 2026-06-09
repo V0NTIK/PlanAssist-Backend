@@ -2452,9 +2452,7 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                      (t.url && (byUrlMap.get(t.url) || []).find(r => !r.segment)) ||
                      null;
 
-      const isSubmitted = t.completed === true ||
-        t.submittedAt != null ||
-        t.isMissing === false; // Canvas submission present
+      const isSubmitted = t.completed === true;
 
       if (existing) {
         if (existing.manually_created) {
@@ -2536,8 +2534,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                   [
                     existing.id, userId, existing.title, existing.class,
                     existing.description || '', existing.url,
-                    existing.deadline_date, existing.deadline_time,
-                    existing.user_estimated_time || existing.estimated_time,
+                    existing.deadline_date ?? null, existing.deadline_time ?? null,
+                    existing.user_estimated_time || existing.estimated_time || 20,
                     existing.accumulated_time || 0
                   ]
                 );
@@ -2614,8 +2612,8 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
                 [
                   newId, userId, t.title, t.class,
                   sanitizeHtml(t.description || ''), t.url,
-                  t.deadlineDate, t.deadlineTime,
-                  t.estimatedTime, 0
+                  t.deadlineDate ?? null, t.deadlineTime ?? null,
+                  t.estimatedTime || 20, 0
                 ]
               );
               // New tasks inserted by sync are never restorative (restorative=TRUE is only
@@ -2958,8 +2956,8 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
                   [
                     existingTask.id, req.user.id, existingTask.title, existingTask.class,
                     existingTask.description || '', existingTask.url,
-                    existingTask.deadline_date, existingTask.deadline_time,
-                    existingTask.user_estimated_time || existingTask.estimated_time,
+                    existingTask.deadline_date ?? null, existingTask.deadline_time ?? null,
+                    existingTask.user_estimated_time || existingTask.estimated_time || 20,
                     existingTask.accumulated_time || 0
                   ]
                 );
@@ -3326,9 +3324,9 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       return res.json({ success: true });
     }
 
-    // tasks.completed = true means Canvas already confirmed this submission during sync.
-    // Capture it before overwriting below.
-    const canvasConfirmed = task.completed === true;
+    // canvas_confirmed: task was Canvas-submitted if sync recorded submitted_at or a score.
+    // task.completed is always false here (checked above), so use these fields instead.
+    const canvasConfirmed = !!(task.submitted_at || task.current_score != null);
 
     // Mark task completed and deleted.
     await pool.query(
@@ -3347,8 +3345,8 @@ app.patch('/api/tasks/:id/complete', authenticateToken, async (req, res) => {
       [
         task.id, req.user.id, task.title, task.class,
         task.description || '', task.url,
-        task.deadline_date, task.deadline_time,
-        task.user_estimated_time || task.estimated_time,
+        task.deadline_date ?? null, task.deadline_time ?? null,
+        task.user_estimated_time || task.estimated_time || 20,
         task.accumulated_time || 0,
         canvasConfirmed
       ]
@@ -3569,10 +3567,9 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
       return res.json({ success: true, alreadyCompleted: true });
     }
 
-    // tasks.completed = true means Canvas already confirmed this submission during sync.
-    // We capture it now before we overwrite it below with our own UPDATE.
-    // This is the authoritative Canvas confirmation — no separate API call needed.
-    const canvasConfirmed = task.completed === true;
+    // canvas_confirmed: task was Canvas-submitted if sync recorded submitted_at or a score.
+    // task.completed is always false at this point (checked above), so we cannot use it.
+    const canvasConfirmed = !!(task.submitted_at || task.current_score != null);
 
     const hasTimeToLog = timeSpent && timeSpent > 0;
     
@@ -3607,10 +3604,10 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
              canvas_confirmed = tasks_completed.canvas_confirmed OR EXCLUDED.canvas_confirmed,
              completed_at = CURRENT_TIMESTAMP`,
           [
-            task.id, req.user.id, task.title, task.class, task.description, task.url,
-            task.deadline_date, task.deadline_time,
-            task.user_estimated_time || task.estimated_time,
-            timeSpent, canvasConfirmed
+            task.id, req.user.id, task.title, task.class, task.description || '', task.url,
+            task.deadline_date ?? null, task.deadline_time ?? null,
+            task.user_estimated_time || task.estimated_time || 20,
+            timeSpent || 0, canvasConfirmed
           ]
         );
       }
@@ -3623,10 +3620,10 @@ app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
            canvas_confirmed = tasks_completed.canvas_confirmed OR EXCLUDED.canvas_confirmed,
            completed_at = CURRENT_TIMESTAMP`,
         [
-          task.id, req.user.id, task.title, task.class, task.description, task.url,
-          task.deadline_date, task.deadline_time,
-          task.user_estimated_time || task.estimated_time,
-          timeSpent, canvasConfirmed
+          task.id, req.user.id, task.title, task.class, task.description || '', task.url,
+          task.deadline_date ?? null, task.deadline_time ?? null,
+          task.user_estimated_time || task.estimated_time || 20,
+          timeSpent || 0, canvasConfirmed
         ]
       );
     }
