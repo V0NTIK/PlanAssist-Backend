@@ -2519,17 +2519,18 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
             console.log(`  ★ → restorative task, skipping leaderboard`);
           } else {
             const alreadyRecordedFlip = await pool.query(
-              'SELECT 1 FROM tasks_completed WHERE id = $1', [existing.id]
+              'SELECT id, canvas_confirmed FROM tasks_completed WHERE id = $1', [existing.id]
             );
+            const weekStart = new Date();
+            weekStart.setHours(0, 0, 0, 0);
+            weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
+            const completionDate = t.submittedAt ? new Date(t.submittedAt)
+              : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
+            const isThisWeek = completionDate && completionDate >= weekStart;
+
             if (alreadyRecordedFlip.rowCount === 0) {
-              const weekStart = new Date();
-              weekStart.setHours(0, 0, 0, 0);
-              weekStart.setDate(weekStart.getDate() - (weekStart.getDay() === 0 ? 6 : weekStart.getDay() - 1));
-              const completionDate = t.submittedAt ? new Date(t.submittedAt)
-                : (t.deadlineDate ? new Date(t.deadlineDate + 'T00:00:00') : null);
-              const isThisWeek = completionDate && completionDate >= weekStart;
+              // Row doesn't exist yet — insert with canvas_confirmed = TRUE
               if (isThisWeek) {
-                // Write tasks_completed row so leaderboard count is accurate
                 await pool.query(
                   `INSERT INTO tasks_completed (id, user_id, title, class, description, url, deadline_date, deadline_time, estimated_time, actual_time, completed_at, canvas_confirmed)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, TRUE)
@@ -2550,8 +2551,20 @@ app.post('/api/tasks/sync-save', authenticateToken, async (req, res) => {
               } else {
                 console.log(`  ★ → completion date outside this week, skipping leaderboard`);
               }
+            } else if (!alreadyRecordedFlip.rows[0].canvas_confirmed && (t.submittedAt || t.currentScore != null)) {
+              // Row exists but canvas_confirmed = FALSE — student completed before syncing.
+              // Canvas has now confirmed the submission, so upgrade the row and count it.
+              await pool.query(
+                'UPDATE tasks_completed SET canvas_confirmed = TRUE WHERE id = $1',
+                [existing.id]
+              );
+              console.log(`  ★ → upgraded canvas_confirmed on existing row for "\${existing.title}"`);
+              if (isThisWeek) {
+                incrementLeaderboardForUser(userId).catch(err =>
+                  console.error('[LEADERBOARD] canvas_confirmed upgrade error:', err.message));
+              }
             } else {
-              console.log(`  ★ → already in tasks_completed, skipping leaderboard`);
+              console.log(`  ★ → already in tasks_completed with canvas_confirmed=\${alreadyRecordedFlip.rows[0].canvas_confirmed}, skipping`);
             }
           }
         }
