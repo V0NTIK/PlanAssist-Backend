@@ -305,14 +305,12 @@ CREATE TABLE IF NOT EXISTS tasks_completed (
     deadline_time   TIME,
     estimated_time  INTEGER NOT NULL,           -- user_estimated_time if set, otherwise estimated_time
     actual_time     INTEGER NOT NULL,           -- Total minutes logged (sum across all segments for splits)
-    completed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    canvas_confirmed BOOLEAN NOT NULL DEFAULT FALSE  -- TRUE if Canvas had registered the submission at completion time
+    completed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS description      TEXT;
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_date    DATE;
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_time    TIME;
-ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS canvas_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS description   TEXT;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_date DATE;
+ALTER TABLE tasks_completed ADD COLUMN IF NOT EXISTS deadline_time TIME;
 ALTER TABLE tasks_completed DROP COLUMN IF EXISTS deadline;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_completed_user_id      ON tasks_completed(user_id);
@@ -346,18 +344,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
 -- Ordered task list for a user's focus session on a given date.
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS session_priorities (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    date        DATE NOT NULL,
-    task_ids    JSONB NOT NULL DEFAULT '[]',
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, date)
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_priorities_user_date ON session_priorities(user_id, date);
-
-
+-- session_priorities table removed — feature deprecated.
 -- ============================================================================
 -- AGENDAS
 -- Structured work blocks with ordered rows of task + action + time budget.
@@ -1083,6 +1070,9 @@ DROP TABLE IF EXISTS notifications CASCADE;
 -- ============================================================================
 -- CREDITS SYSTEM
 -- ============================================================================
+
+-- Drop deprecated session_priorities table (feature removed)
+DROP TABLE IF EXISTS session_priorities;
 
 -- ALTER TABLE migrations for live DB (no-ops if columns already exist)
 ALTER TABLE users             ADD COLUMN IF NOT EXISTS credits          INTEGER  NOT NULL DEFAULT 0;
