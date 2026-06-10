@@ -891,8 +891,7 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         isNewUser: user.is_new_user,
         showInFeed: user.show_in_feed !== false,
-      profilePublic: user.profile_public !== false,
-        profilePublic: user.profile_public !== false
+      profilePublic: user.profile_public !== false
       } 
     });
   } catch (error) {
@@ -1957,13 +1956,6 @@ app.post('/api/canvas/grade-sync', authenticateToken, async (req, res) => {
 // priority_order column has been removed; tasks are always sorted by deadline.
 // ============================================================================
 
-async function reprioritizeTasks(userId, pool) {
-  // priority_order removed — tasks are ordered by deadline_date / deadline_time.
-  // This stub is intentionally empty; all callers remain unchanged.
-}
-
-
-
 // ============================================================================
 // COURSES & GRADES ROUTES (for Marks tab)
 // ============================================================================
@@ -2175,16 +2167,25 @@ app.post('/api/goals', authenticateToken, async (req, res) => {
       const n = parseFloat(score);
       if (isNaN(n) || n < 45 || n > 100) return res.status(400).json({ error: `Invalid score ${score} for course ${courseId}` });
     }
-    for (const [courseId, score] of Object.entries(goals)) {
-      await pool.query(
-        `INSERT INTO user_goals (user_id, course_id, target_score, updated_at)
-         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-         ON CONFLICT (user_id, course_id)
-         DO UPDATE SET target_score = $3, updated_at = CURRENT_TIMESTAMP`,
-        [req.user.id, courseId, parseFloat(score)]
-      );
-    }
-    res.json({ success: true });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const [courseId, score] of Object.entries(goals)) {
+        await client.query(
+          `INSERT INTO user_goals (user_id, course_id, target_score, updated_at)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+           ON CONFLICT (user_id, course_id)
+           DO UPDATE SET target_score = $3, updated_at = CURRENT_TIMESTAMP`,
+          [req.user.id, courseId, parseFloat(score)]
+        );
+      }
+      await client.query('COMMIT');
+      res.json({ success: true });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('Save goals error:', error);
+      res.status(500).json({ error: 'Failed to save goals' });
+    } finally { client.release(); }
   } catch (error) {
     console.error('Save goals error:', error);
     res.status(500).json({ error: 'Failed to save goals' });
@@ -2353,6 +2354,9 @@ app.post('/api/tasks/save-plan', authenticateToken, async (req, res) => {
     const { tasks } = req.body;
     if (!Array.isArray(tasks)) {
       return res.status(400).json({ error: 'Tasks must be an array' });
+    }
+    if (tasks.length > 500) {
+      return res.status(400).json({ error: 'Too many tasks in a single save-plan request' });
     }
 
     console.log(`\n=== SAVE PLAN: Updating ${tasks.length} tasks for user ${req.user.id} ===`);
@@ -3173,7 +3177,6 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     console.log(`Total returned: ${insertedTasks.length} tasks\n`);
 
     // Reprioritize: null completed/deleted, renumber active tasks cleanly
-    await reprioritizeTasks(req.user.id, pool);
 
     res.json({ 
       success: true, 
@@ -3198,6 +3201,9 @@ app.post('/api/tasks/:id/split', authenticateToken, async (req, res) => {
 
     if (!Array.isArray(segments) || segments.length < 2) {
       return res.status(400).json({ error: 'Must provide at least 2 segments' });
+    }
+    if (segments.length > 10) {
+      return res.status(400).json({ error: 'Cannot split a task into more than 10 segments' });
     }
 
     // Get the original task
@@ -3458,7 +3464,9 @@ app.post('/api/sessions/start/:taskId', authenticateToken, async (req, res) => {
 app.post('/api/sessions/pause/:taskId', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { accumulatedTime } = req.body;
+    // accumulated_time is a running total across multiple sessions — no upper cap.
+    // The 60-min cap applies per individual session (timeSpent at completion), not the total.
+    const accumulatedTime = Math.max(0, Math.round(Number(req.body.accumulatedTime) || 0));
     await pool.query(
       'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
       [accumulatedTime, taskId, req.user.id]
@@ -3474,11 +3482,12 @@ app.post('/api/sessions/pause/:taskId', authenticateToken, async (req, res) => {
 app.post('/api/sessions/end/:taskId', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { accumulatedTime } = req.body;
+    // accumulated_time is a running total across multiple sessions — no upper cap.
+    const accumulatedTime = Math.max(0, Math.round(Number(req.body.accumulatedTime) || 0));
     // Update accumulated time for the specific task
     await pool.query(
       'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
-      [accumulatedTime ?? 0, taskId, req.user.id]
+      [accumulatedTime, taskId, req.user.id]
     );
     // Clear session_active for ALL tasks belonging to this user (belt-and-suspenders)
     await pool.query(
@@ -3549,7 +3558,11 @@ app.post('/api/sessions/heartbeat', authenticateToken, async (req, res) => {
 app.post('/api/tasks/:taskId/complete', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { timeSpent } = req.body;
+    const rawTimeSpent = req.body.timeSpent;
+    // Hard cap: 60 minutes per session, server-side enforcement
+    const timeSpent = (typeof rawTimeSpent === 'number' && rawTimeSpent > 0)
+      ? Math.min(60, Math.round(rawTimeSpent))
+      : (rawTimeSpent ? Math.min(60, Math.round(Number(rawTimeSpent) || 0)) : null);
     
     const taskResult = await pool.query(
       'SELECT * FROM tasks WHERE id = $1 AND user_id = $2',
@@ -3702,7 +3715,8 @@ app.post('/api/tasks/:taskId/ignore', authenticateToken, async (req, res) => {
 app.patch('/api/tasks/:taskId/partial', authenticateToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { accumulatedTime } = req.body;
+    // accumulated_time is a running total across multiple sessions — no upper cap.
+    const accumulatedTime = Math.max(0, Math.round(Number(req.body.accumulatedTime) || 0));
     
     await pool.query(
       'UPDATE tasks SET accumulated_time = $1 WHERE id = $2 AND user_id = $3',
@@ -3727,7 +3741,8 @@ app.get('/api/learning', authenticateToken, async (req, res) => {
       `SELECT title as task_title, class as task_type, estimated_time, actual_time, completed_at
        FROM tasks_completed
        WHERE user_id = $1
-       ORDER BY completed_at DESC`,
+       ORDER BY completed_at DESC
+       LIMIT 500`,
       [req.user.id]
     );
     res.json(result.rows || []);
@@ -3745,13 +3760,17 @@ app.post('/api/feedback', authenticateToken, async (req, res) => {
   try {
     const { feedback, userEmail, userName } = req.body;
 
-    if (!feedback || feedback.trim().length === 0) {
+    const cleanFeedback = typeof feedback === 'string' ? feedback.trim() : '';
+    if (!cleanFeedback) {
       return res.status(400).json({ error: 'Feedback cannot be empty' });
+    }
+    if (cleanFeedback.length > 2000) {
+      return res.status(400).json({ error: 'Feedback must be 2000 characters or fewer' });
     }
 
     await pool.query(
       'INSERT INTO feedback (user_id, user_email, user_name, feedback_text) VALUES ($1, $2, $3, $4)',
-      [req.user.id, userEmail, userName, feedback]
+      [req.user.id, userEmail, userName, cleanFeedback]
     );
 
     res.json({ success: true, message: 'Feedback submitted successfully' });
@@ -3956,12 +3975,18 @@ app.post('/api/streak/shields/auto-consume', authenticateToken, async (req, res)
   try {
     const { gapDates } = req.body; // array of YYYY-MM-DD campus-tz strings
     if (!Array.isArray(gapDates) || gapDates.length === 0) return res.json({ consumed: 0 });
+    // Cap array to 30 dates max (no legitimate streak gap exceeds 30 school days)
+    // and validate each entry is a YYYY-MM-DD date string
+    const validGapDates = gapDates
+      .slice(0, 30)
+      .filter(d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d));
+    if (validGapDates.length === 0) return res.json({ consumed: 0 });
     const user = await pool.query('SELECT streak_shields_available, campus FROM users WHERE id = $1', [req.user.id]);
     let available = user.rows[0]?.streak_shields_available ?? 0;
     const campus = user.rows[0]?.campus || 'Ashland';
     let consumed = 0;
     await pool.query('BEGIN');
-    for (const date of gapDates) {
+    for (const date of validGapDates) {
       if (available <= 0) break;
       // Set consumed_at to noon on the campus-tz gap date, converted to UTC,
       // so that toCampusDate(consumed_at) always yields the correct campus date.
@@ -4042,6 +4067,12 @@ app.post('/api/feed-reactions/:entryId', authenticateToken, async (req, res) => 
     const { emoji } = req.body;
     const ALLOWED_EMOJIS = ['👏','⚡','🔥','💯','🎯'];
     if (!emoji || !ALLOWED_EMOJIS.includes(emoji)) return res.status(400).json({ error: 'Invalid emoji' });
+    // Banned users cannot react
+    const banCheck = await pool.query('SELECT is_banned FROM users WHERE id=$1', [req.user.id]);
+    if (banCheck.rows[0]?.is_banned) return res.status(403).json({ error: 'Account blocked' });
+    // Verify the feed entry exists
+    const entryCheck = await pool.query('SELECT 1 FROM completion_feed WHERE id=$1', [req.params.entryId]);
+    if (entryCheck.rowCount === 0) return res.status(404).json({ error: 'Feed entry not found' });
     await pool.query(
       `INSERT INTO feed_reactions (feed_entry_id, user_id, emoji)
        VALUES ($1, $2, $3)
@@ -4226,10 +4257,37 @@ app.post('/api/badges/check', authenticateToken, async (req, res) => {
       }
     }
 
-    // Streak badges — use the highest of current streak and personal record so badges
-    // earned during a past streak are never lost when the current streak is lower.
-    const { currentStreak, personalRecord } = req.body;
-    const bestStreak = Math.max(parseInt(currentStreak) || 0, parseInt(personalRecord) || 0);
+    // Streak badges — compute server-side from the DB; never trust client-supplied values.
+    // Use the higher of current streak (consecutive days ending today) and
+    // the historical personal record stored on the user row.
+    const streakRecordR = await pool.query(
+      'SELECT streak_personal_record FROM users WHERE id=$1', [userId]
+    );
+    const dbPersonalRecord = parseInt(streakRecordR.rows[0]?.streak_personal_record ?? 0);
+
+    // Recompute current streak from tasks_completed (canvas_confirmed only)
+    const streakDatesR = await pool.query(
+      `SELECT DISTINCT completed_at::date AS day
+       FROM tasks_completed
+       WHERE user_id = $1 AND canvas_confirmed = TRUE
+       ORDER BY day DESC
+       LIMIT 200`,
+      [userId]
+    );
+    const days = streakDatesR.rows.map(r => r.day?.toISOString?.()?.slice(0,10) || String(r.day).slice(0,10));
+    let computedStreak = 0;
+    const today = new Date().toISOString().slice(0,10);
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0,10);
+    if (days.length > 0 && (days[0] === today || days[0] === yesterday)) {
+      computedStreak = 1;
+      for (let i = 1; i < days.length; i++) {
+        const prev = new Date(days[i-1]);
+        const curr = new Date(days[i]);
+        const diff = (prev - curr) / 86400000;
+        if (diff === 1) { computedStreak++; } else { break; }
+      }
+    }
+    const bestStreak = Math.max(computedStreak, dbPersonalRecord);
     if (bestStreak > 0) {
       for (const t of [7,14,30,60,100]) {
         if (bestStreak >= t) await award('streak_' + t);
@@ -4386,17 +4444,9 @@ app.get('/api/hub/insights', authenticateToken, async (req, res) => {
     const userRow = await pool.query(`SELECT campus, tz_periods, insignia_days, grade FROM users WHERE id=$1`, [userId]);
     const campus = userRow.rows[0]?.campus || 'Ashland';
 
-    // Campus UTC offset map (standard time; DST handled approximately)
-    const CAMPUS_TZ_OFFSET = {
-      'Ashland': -5, 'Barbados': -4, 'Calgary': -7, 'Chesapeake': -5,
-      'Chicago': -6, 'Council Bluffs': -6, 'Des Moines': -6, 'Detroit': -5,
-      'Edmonton': -7, 'Gothenburg': 1, 'Johannesburg': 2, 'Kelowna': -8,
-      'Lagos': 1, 'London': 0, 'Mauritius': 4, 'Minneapolis': -6,
-      'Montreal': -5, 'New York': -5, 'Oslo': 1, 'Pretoria': 2,
-      'Regina': -6, 'Salt Lake City': -7, 'Stockholm': 1, 'Toronto': -5,
-      'Vancouver': -8, 'Winnipeg': -6, 'Zurich': 1,
-    };
-    const tzOffsetHrs = CAMPUS_TZ_OFFSET[campus] ?? -5;
+    // Use the authoritative CAMPUS_UTC_OFFSETS table with proper DST handling
+    const campusEntry = CAMPUS_UTC_OFFSETS[campus] || CAMPUS_UTC_OFFSETS['Ashland'];
+    const tzOffsetHrs = isDSTOnDate(todayUTC) ? campusEntry.dst : campusEntry.standard;
     const tzInterval = `${tzOffsetHrs >= 0 ? '+' : ''}${tzOffsetHrs} hours`;
 
     const globalTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]);
@@ -5271,77 +5321,6 @@ app.post('/api/tasks/normalize', authenticateToken, async (req, res) => {
 // SESSION PRIORITIES — daily "today's focus" list
 // ============================================================================
 
-// GET /api/session-priorities/today — fetch today's priority list for current user
-app.get('/api/session-priorities/today', authenticateToken, async (req, res) => {
-  try {
-    // Use client-supplied local date (avoids UTC vs local timezone mismatch for late-evening users)
-    const clientDate = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
-      ? req.query.date
-      : null;
-    const utcDate = new Date().toISOString().split('T')[0];
-
-    // Try client local date first, then UTC date as fallback (handles records saved before fix
-    // or when client/server are on different calendar days due to timezone offset)
-    const datesToTry = clientDate
-      ? [clientDate, ...(clientDate !== utcDate ? [utcDate] : [])]
-      : [utcDate];
-
-    let foundRow = null;
-    for (const dateStr of datesToTry) {
-      const result = await pool.query(
-        `SELECT task_ids, date FROM session_priorities WHERE user_id = $1 AND date = $2`,
-        [req.user.id, dateStr]
-      );
-      if (result.rows.length > 0) { foundRow = result.rows[0]; break; }
-    }
-
-    if (!foundRow) return res.json({ taskIds: null });
-    res.json({ taskIds: foundRow.task_ids });
-  } catch (err) {
-    console.error('Get session priorities error:', err);
-    res.status(500).json({ error: 'Failed to get priorities' });
-  }
-});
-
-// POST /api/session-priorities/today — save today's priority list
-app.post('/api/session-priorities/today', authenticateToken, async (req, res) => {
-  try {
-    const { taskIds, date } = req.body;
-    if (!Array.isArray(taskIds)) return res.status(400).json({ error: 'taskIds must be an array' });
-    // Use client-supplied local date to avoid UTC vs local timezone mismatch
-    const todayStr = (date && /^\d{4}-\d{2}-\d{2}$/.test(date))
-      ? date
-      : new Date().toISOString().split('T')[0];
-    await pool.query(
-      `INSERT INTO session_priorities (user_id, date, task_ids)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, date) DO UPDATE SET task_ids = EXCLUDED.task_ids, updated_at = CURRENT_TIMESTAMP`,
-      [req.user.id, todayStr, JSON.stringify(taskIds)]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Save session priorities error:', err);
-    res.status(500).json({ error: 'Failed to save priorities' });
-  }
-});
-
-// DELETE /api/session-priorities/today — clear today's list (start fresh)
-app.delete('/api/session-priorities/today', authenticateToken, async (req, res) => {
-  try {
-    // Use client-supplied local date to avoid UTC vs local timezone mismatch
-    const todayStr = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
-      ? req.query.date
-      : new Date().toISOString().split('T')[0];
-    await pool.query(
-      `DELETE FROM session_priorities WHERE user_id = $1 AND date = $2`,
-      [req.user.id, todayStr]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to clear priorities' });
-  }
-});
-
 // PATCH /api/tasks/:id/segment-deadline — set a per-segment deadline override
 app.patch('/api/tasks/:id/segment-deadline', authenticateToken, async (req, res) => {
   try {
@@ -5372,6 +5351,13 @@ app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
     const { title, deadlineDate, deadlineTime, estimatedTime, description, url, course } = req.body;
     if (!title || !deadlineDate || !deadlineTime || !estimatedTime) {
       return res.status(400).json({ error: 'title, deadlineDate, deadlineTime, and estimatedTime are required' });
+    }
+    const parsedEstimate = parseInt(estimatedTime);
+    if (isNaN(parsedEstimate) || parsedEstimate < 1 || parsedEstimate > 300) {
+      return res.status(400).json({ error: 'estimatedTime must be between 1 and 300 minutes' });
+    }
+    if (typeof title !== 'string' || title.trim().length === 0 || title.length > 500) {
+      return res.status(400).json({ error: 'title must be a non-empty string under 500 characters' });
     }
     // course defaults to 'Personal' which keeps existing behaviour unchanged
     const taskClass = course && course.trim() ? course.trim() : 'Personal';
@@ -5540,16 +5526,17 @@ app.get('/api/announcements', authenticateToken, async (req, res) => {
          EXISTS(
            SELECT 1 FROM announcement_dismissals d
            WHERE d.announcement_id = a.id AND d.user_id = $1
-         ) as dismissed
+         ) AS dismissed
        FROM announcements a
+       JOIN users u ON u.id = $1
        WHERE a.is_active = true
          AND (
            COALESCE(a.target_audience, 'all') = 'all'
-           OR (a.target_audience = 'existing' AND $2 <= a.created_at)
-           OR (a.target_audience = 'new' AND $2 > a.created_at)
+           OR (a.target_audience = 'existing' AND u.created_at <= a.created_at)
+           OR (a.target_audience = 'new'      AND u.created_at >  a.created_at)
          )
        ORDER BY a.created_at DESC`,
-      [req.user.id, (await pool.query('SELECT created_at FROM users WHERE id = $1', [req.user.id])).rows[0]?.created_at]
+      [req.user.id]
     );
     res.json(result.rows);
   } catch (err) {
@@ -5561,13 +5548,17 @@ app.get('/api/announcements', authenticateToken, async (req, res) => {
 app.post('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { message, type } = req.body;
-    if (!message || !type) return res.status(400).json({ error: 'message and type required' });
+    const cleanMessage = typeof message === 'string' ? message.trim() : '';
+    if (!cleanMessage || !type) return res.status(400).json({ error: 'message and type required' });
+    if (cleanMessage.length > 500) return res.status(400).json({ error: 'Announcement message must be 500 characters or fewer' });
+    const VALID_TYPES = ['info', 'urgent'];
+    if (!VALID_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid announcement type (must be info or urgent)' });
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const adminName = adminRes.rows[0]?.name || 'Admin';
     const audience = ['all', 'existing', 'new'].includes(req.body.target_audience) ? req.body.target_audience : 'all';
     const result = await pool.query(
       `INSERT INTO announcements (author_id, author_name, message, type, target_audience) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.user.id, adminName, message, type, audience]
+      [req.user.id, adminName, cleanMessage, type, audience]
     );
     await auditLog(req.user.id, adminName, 'CREATE_ANNOUNCEMENT', null, null, { message, type });
     res.json(result.rows[0]);
@@ -6106,8 +6097,8 @@ app.patch('/api/tasks/:taskId/actual-time', authenticateToken, async (req, res) 
   try {
     const { taskId } = req.params;
     const { actualTime } = req.body;
-    if (typeof actualTime !== 'number' || actualTime < 0) {
-      return res.status(400).json({ error: 'actualTime must be a non-negative number' });
+    if (typeof actualTime !== 'number' || actualTime < 0 || actualTime > 720) {
+      return res.status(400).json({ error: 'actualTime must be between 0 and 720 minutes' });
     }
     await pool.query(
       'UPDATE tasks_completed SET actual_time = $1 WHERE id = $2 AND user_id = $3',
@@ -6458,11 +6449,23 @@ async function hptHasStudioAccess(hptUserId, studioId) {
 // POST /api/hpt/auth/login
 app.post('/api/hpt/auth/login', async (req, res) => {
   try {
-    const { passcode } = req.body;
+    const { passcode, name } = req.body;
     if (!passcode) return res.status(400).json({ error: 'Passcode required' });
-    const result = await pool.query('SELECT * FROM hpt_users WHERE id > 0 LIMIT 100');
+
+    // If a name is supplied, narrow to that user first (O(1) lookup + 1 bcrypt compare).
+    // Fall back to full scan only if no name given — this keeps backwards compatibility
+    // but the HPT login UI should always send name to avoid the O(n) scan.
+    let candidates;
+    if (name && typeof name === 'string' && name.trim()) {
+      const r = await pool.query('SELECT * FROM hpt_users WHERE name = $1 LIMIT 1', [name.trim()]);
+      candidates = r.rows;
+    } else {
+      const r = await pool.query('SELECT * FROM hpt_users ORDER BY id LIMIT 50');
+      candidates = r.rows;
+    }
+
     let matchedUser = null;
-    for (const user of result.rows) {
+    for (const user of candidates) {
       const valid = await bcrypt.compare(passcode, user.passcode_hash);
       if (valid) { matchedUser = user; break; }
     }
@@ -7019,27 +7022,6 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
       );
       const activeTask = activeRes.rows[0] || null;
 
-      // Today's session priorities (ordered task list)
-      const priRes = await pool.query(
-        `SELECT sp.task_ids FROM session_priorities sp WHERE sp.user_id=$1 AND sp.date=$2`,
-        [userId, todayDate]
-      );
-      let priorities = [];
-      if (priRes.rows[0]) {
-        const taskIds = priRes.rows[0].task_ids;
-        if (taskIds && taskIds.length > 0) {
-          const tRes = await pool.query(
-            `SELECT id, title, class, estimated_time, user_estimated_time,
-                    accumulated_time, deadline_date, completed
-             FROM tasks WHERE id=ANY($1) AND user_id=$2`,
-            [taskIds, userId]
-          );
-          const tMap = {};
-          tRes.rows.forEach(t => { tMap[t.id] = t; });
-          priorities = taskIds.map(id => tMap[id]).filter(Boolean);
-        }
-      }
-
       // Today's completions count + total time
       const compRes = await pool.query(
         `SELECT COUNT(*) AS cnt, COALESCE(SUM(actual_time),0) AS total_mins
@@ -7127,7 +7109,6 @@ app.get('/api/hpt/studios/:id/monitor', authenticateHPT, async (req, res) => {
         user: { id: user.id, name: user.name, grade: user.grade, lastSync: user.last_sync },
         isActive: !!activeTask,
         activeTask,
-        priorities,
         todayCompletions,
         urgentTasks: urgentRes.rows,
         activeAgenda,
@@ -7520,10 +7501,13 @@ app.get('/api/rewards/status', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     // Last week's leaderboard entry (previous Monday → last Sunday)
-    const lastMonday = new Date();
-    lastMonday.setHours(0,0,0,0);
-    const dow = lastMonday.getDay();
-    lastMonday.setDate(lastMonday.getDate() - (dow === 0 ? 6 : dow - 1) - 7);
+    // Compute last week's Monday: first find this week's Monday, then subtract 7 days.
+    const thisMonday = new Date();
+    thisMonday.setHours(0,0,0,0);
+    const dow = thisMonday.getDay();
+    thisMonday.setDate(thisMonday.getDate() - (dow === 0 ? 6 : dow - 1));
+    const lastMonday = new Date(thisMonday);
+    lastMonday.setDate(thisMonday.getDate() - 7);
     const lastMondayStr = lastMonday.toISOString().slice(0,10);
 
     const [lbR, balR] = await Promise.all([
@@ -7567,10 +7551,13 @@ app.post('/api/rewards/spin', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const lastMonday = new Date();
-    lastMonday.setHours(0,0,0,0);
-    const dow = lastMonday.getDay();
-    lastMonday.setDate(lastMonday.getDate() - (dow === 0 ? 6 : dow - 1) - 7);
+    // Compute last week's Monday: first find this week's Monday, then subtract 7 days.
+    const thisMonday = new Date();
+    thisMonday.setHours(0,0,0,0);
+    const dow = thisMonday.getDay();
+    thisMonday.setDate(thisMonday.getDate() - (dow === 0 ? 6 : dow - 1));
+    const lastMonday = new Date(thisMonday);
+    lastMonday.setDate(thisMonday.getDate() - 7);
     const lastMondayStr = lastMonday.toISOString().slice(0,10);
 
     const lbR = await client.query(
@@ -8291,7 +8278,7 @@ app.listen(PORT, () => {
 
     -- Credits & rewards
     ALTER TABLE users              ADD COLUMN IF NOT EXISTS credits           INTEGER  NOT NULL DEFAULT 0;
-    ALTER TABLE users              ADD COLUMN IF NOT EXISTS last_daily_chest  DATE;
+    ALTER TABLE users              ADD COLUMN IF NOT EXISTS last_daily_chest  TIMESTAMPTZ;
     ALTER TABLE weekly_leaderboard ADD COLUMN IF NOT EXISTS spins_taken       INTEGER  NOT NULL DEFAULT 0;
     ALTER TABLE feed_reactions     ADD COLUMN IF NOT EXISTS credits_claimed   BOOLEAN  NOT NULL DEFAULT FALSE;
 
