@@ -5129,7 +5129,10 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
     const [tutResult, meetResult, agendaResult] = await Promise.all([
       pool.query('SELECT * FROM tutorials WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC', [req.user.id, date]),
       pool.query('SELECT * FROM meetings  WHERE user_id = $1 AND date = $2 ORDER BY scheduled_time ASC', [req.user.id, date]),
-      pool.query('SELECT id, name, rows, current_row, finished FROM agendas WHERE user_id = $1 AND finished = false', [req.user.id]),
+      pool.query(
+        'SELECT id, name, rows, current_row, finished, agenda_date, agenda_period FROM agendas WHERE user_id = $1 AND finished = false',
+        [req.user.id]
+      ),
     ]);
 
     // Normalise scheduled_time to HH:MM string (postgres TIME comes back as "HH:MM:SS")
@@ -5137,10 +5140,22 @@ app.get('/api/itinerary', authenticateToken, async (req, res) => {
     const tutorials = tutResult.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) }));
     const meetings  = meetResult.rows.map(r => ({ ...r, scheduled_time: normTime(r.scheduled_time) }));
 
-    // Match agendas to date by title pattern "Period X Study - # Tasks - M/D/YYYY"
+    // Match agendas to this date by:
+    // 1. agenda_date column (most reliable — set when exported from Organizer)
+    // 2. title pattern fallback "Period X Study - # Tasks - M/D/YYYY" (legacy)
     const [y, mo, d] = date.split('-').map(Number);
     const dateLabel = `${mo}/${d}/${y}`;
-    const matchedAgendas = agendaResult.rows.filter(a => a.name && a.name.endsWith(` - ${dateLabel}`));
+    const matchedAgendas = agendaResult.rows.filter(a => {
+      // Primary: agenda_date column match
+      if (a.agenda_date) {
+        const agDate = typeof a.agenda_date === 'string'
+          ? a.agenda_date.slice(0, 10)
+          : new Date(a.agenda_date).toISOString().slice(0, 10);
+        return agDate === date;
+      }
+      // Fallback: title ends with the date label
+      return a.name && a.name.endsWith(` - ${dateLabel}`);
+    });
 
     res.json({ tutorials, meetings, agendas: matchedAgendas });
   } catch (error) {
