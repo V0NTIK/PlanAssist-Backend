@@ -1,7 +1,3 @@
-// Copyright © 2026 Orlando Wyman. All rights reserved.
-// This source code is proprietary and confidential.
-// Unauthorized copying, distribution, or use of this file, via any medium, is strictly prohibited.
-
 // PlanAssist - COMPLETELY REDESIGNED Backend API
 // server.js - New title/segment system with advanced AI estimation
 
@@ -215,6 +211,38 @@ const CAMPUS_UTC_OFFSETS = {
   'Stonewall':      { standard: -6, dst: -5 },
   'Trinidad':       { standard: -4, dst: -4 },
   'Vancouver':      { standard: -8, dst: -7 },
+  // ── Australian campuses (AEDT/AEST = UTC+11/+10, ACDT/ACST = UTC+10:30/+9:30, AWST = UTC+8)
+  'Adelaide':       { standard: 9.5, dst: 10.5 },
+  'Albany':         { standard: 8,   dst: 8    },
+  'Albury':         { standard: 10,  dst: 11   },
+  'Armidale':       { standard: 10,  dst: 11   },
+  'Bairnsdale':     { standard: 10,  dst: 11   },
+  'Bendigo':        { standard: 10,  dst: 11   },
+  'Berwick':        { standard: 10,  dst: 11   },
+  'Brisbane':       { standard: 10,  dst: 10   },
+  'Condobolin':     { standard: 10,  dst: 11   },
+  'Cowra':          { standard: 10,  dst: 11   },
+  'Dalwallinu':     { standard: 8,   dst: 8    },
+  'Gnowangerup':    { standard: 8,   dst: 8    },
+  'Goulburn':       { standard: 10,  dst: 11   },
+  'Hamilton':       { standard: 10,  dst: 11   },
+  'Hobart':         { standard: 10,  dst: 11   },
+  'Illawara':       { standard: 10,  dst: 11   },
+  'Launceston':     { standard: 10,  dst: 11   },
+  'Leeton':         { standard: 10,  dst: 11   },
+  'Maitland':       { standard: 10,  dst: 11   },
+  'Maryborough':    { standard: 10,  dst: 10   },
+  'Melton':         { standard: 10,  dst: 11   },
+  'Mt Victoria':    { standard: 10,  dst: 11   },
+  'Nambour':        { standard: 10,  dst: 10   },
+  'Nathalia':       { standard: 10,  dst: 11   },
+  'Northam':        { standard: 8,   dst: 8    },
+  'Orange':         { standard: 10,  dst: 11   },
+  'Perth':          { standard: 8,   dst: 8    },
+  'Swan Hill':      { standard: 10,  dst: 11   },
+  'Sydney':         { standard: 10,  dst: 11   },
+  'Toowoomba':      { standard: 10,  dst: 10   },
+  'Wagga Wagga':    { standard: 10,  dst: 11   },
 };
 
 // Returns true if the given date is in US/Canada DST (2nd Sun March → 1st Sun November).
@@ -350,7 +378,7 @@ const extractNameFromEmail = (email) => {
 
 // Validate OneSchool email
 const isValidOneSchoolEmail = (email) => {
-  return email.endsWith('@na.oneschoolglobal.com');
+  return email.endsWith('@na.oneschoolglobal.com') || email.endsWith('@au.oneschoolglobal.com');
 };
 
 // Validate grade (must be 7-12)
@@ -810,7 +838,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     if (!isValidOneSchoolEmail(email)) {
-      return res.status(400).json({ error: 'Email must be in format: first.last##@na.oneschoolglobal.com' });
+      return res.status(400).json({ error: 'Email must be a valid OneSchool Global email (@na.oneschoolglobal.com or @au.oneschoolglobal.com)' });
     }
 
     const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
@@ -943,6 +971,38 @@ const CAMPUS_PERIODS = {
   'Stonewall':      '3-7',
   'Trinidad':       '1-5',
   'Vancouver':      '4-8',
+  // ── Australian campuses — always 1-6, no DST shift
+  'Adelaide':       '1-6',
+  'Albany':         '1-6',
+  'Albury':         '1-6',
+  'Armidale':       '1-6',
+  'Bairnsdale':     '1-6',
+  'Bendigo':        '1-6',
+  'Berwick':        '1-6',
+  'Brisbane':       '1-6',
+  'Condobolin':     '1-6',
+  'Cowra':          '1-6',
+  'Dalwallinu':     '1-6',
+  'Gnowangerup':    '1-6',
+  'Goulburn':       '1-6',
+  'Hamilton':       '1-6',
+  'Hobart':         '1-6',
+  'Illawara':       '1-6',
+  'Launceston':     '1-6',
+  'Leeton':         '1-6',
+  'Maitland':       '1-6',
+  'Maryborough':    '1-6',
+  'Melton':         '1-6',
+  'Mt Victoria':    '1-6',
+  'Nambour':        '1-6',
+  'Nathalia':       '1-6',
+  'Northam':        '1-6',
+  'Orange':         '1-6',
+  'Perth':          '1-6',
+  'Swan Hill':      '1-6',
+  'Sydney':         '1-6',
+  'Toowoomba':      '1-6',
+  'Wagga Wagga':    '1-6',
 };
 const CAMPUS_PERIODS_DST = {
   'Ashland':        '2-6',
@@ -981,7 +1041,48 @@ const CAMPUS_PERIODS_DST = {
   'Stonewall':      '3-7',
   'Trinidad':       '2-6',
   'Vancouver':      '4-8',
+  // ── Australian campuses — always 1-6 regardless of DST
+  'Adelaide':       '1-6',
+  'Albany':         '1-6',
+  'Albury':         '1-6',
+  'Armidale':       '1-6',
+  'Bairnsdale':     '1-6',
+  'Bendigo':        '1-6',
+  'Berwick':        '1-6',
+  'Brisbane':       '1-6',
+  'Condobolin':     '1-6',
+  'Cowra':          '1-6',
+  'Dalwallinu':     '1-6',
+  'Gnowangerup':    '1-6',
+  'Goulburn':       '1-6',
+  'Hamilton':       '1-6',
+  'Hobart':         '1-6',
+  'Illawara':       '1-6',
+  'Launceston':     '1-6',
+  'Leeton':         '1-6',
+  'Maitland':       '1-6',
+  'Maryborough':    '1-6',
+  'Melton':         '1-6',
+  'Mt Victoria':    '1-6',
+  'Nambour':        '1-6',
+  'Nathalia':       '1-6',
+  'Northam':        '1-6',
+  'Orange':         '1-6',
+  'Perth':          '1-6',
+  'Swan Hill':      '1-6',
+  'Sydney':         '1-6',
+  'Toowoomba':      '1-6',
+  'Wagga Wagga':    '1-6',
 };
+
+// Australian campus list (for region checks)
+const AUSTRALIAN_CAMPUSES = new Set([
+  'Adelaide','Albany','Albury','Armidale','Bairnsdale','Bendigo','Berwick',
+  'Brisbane','Condobolin','Cowra','Dalwallinu','Gnowangerup','Goulburn','Hamilton',
+  'Hobart','Illawara','Launceston','Leeton','Maitland','Maryborough','Melton',
+  'Mt Victoria','Nambour','Nathalia','Northam','Orange','Perth','Swan Hill',
+  'Sydney','Toowoomba','Wagga Wagga',
+]);
 
 const VALID_CAMPUSES = Object.keys(CAMPUS_PERIODS);
 
@@ -1022,7 +1123,7 @@ function getEffectivePeriods(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, region, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -1061,6 +1162,7 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       grade: user.grade || '',
       canvasApiToken: canvasApiToken,
       campus: user.campus || 'Ashland',
+      region: user.region || 'North America',
       schedule,
       calendarShowHomeroom: user.calendar_show_homeroom ?? true,
       calendarShowCompleted: user.calendar_show_completed ?? true,
@@ -1073,6 +1175,9 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       is_admin: user.is_admin || false,
       showInFeed: user.show_in_feed !== false,
       lastSync: user.last_sync || null,
+      itinerary_show_events: user.itinerary_show_events !== false,
+      itinerary_show_organizer: user.itinerary_show_organizer !== false,
+      itinerary_show_agenda: user.itinerary_show_agenda !== false,
       // Return the DST-aware period range so the frontend can use it directly.
       // Recomputed at request time so it stays current across DST transitions
       // without requiring the user to re-save their settings.
@@ -1087,12 +1192,15 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
 // Save account setup
 app.post('/api/account/setup', authenticateToken, async (req, res) => {
   try {
-    const { grade, canvasApiToken, campus, schedule, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
+    const { grade, canvasApiToken, campus, schedule, region, calendarTodayCentered, calendarShowHomeroom, calendarShowCompleted,
             calendarShowPrevWeek, calendarShowCurrentWeek, calendarShowNextWeek1, calendarShowNextWeek2, calendarShowWeekends } = req.body;
 
     // Derive DST-aware period ranges from campus
     const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
     const tzPeriods = getEffectivePeriods(resolvedCampus);
+
+    // Resolve region — default to 'North America' for existing users if not provided
+    const resolvedRegion = (region === 'Australia' || region === 'North America') ? region : 'North America';
 
     // Validate grade before saving
     if (!isValidGrade(grade)) {
@@ -1119,13 +1227,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
     if (canvasApiToken && canvasApiToken.trim()) {
       await pool.query(
         `UPDATE users SET grade = $1, canvas_api_token = $2, canvas_api_token_iv = $3,
-          campus = $4, tz_periods = $5, is_new_user = false,
-          calendar_show_homeroom = $6, calendar_show_completed = $7,
-          calendar_show_prev_week = $8, calendar_show_current_week = $9,
-          calendar_show_next_week1 = $10, calendar_show_next_week2 = $11,
-          calendar_show_weekends = $12
-         WHERE id = $13`,
-        [grade, encryptedToken, iv, resolvedCampus, tzPeriods,
+          campus = $4, tz_periods = $5, region = $6, is_new_user = false,
+          calendar_show_homeroom = $7, calendar_show_completed = $8,
+          calendar_show_prev_week = $9, calendar_show_current_week = $10,
+          calendar_show_next_week1 = $11, calendar_show_next_week2 = $12,
+          calendar_show_weekends = $13
+         WHERE id = $14`,
+        [grade, encryptedToken, iv, resolvedCampus, tzPeriods, resolvedRegion,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
@@ -1139,13 +1247,13 @@ app.post('/api/account/setup', authenticateToken, async (req, res) => {
       // No token provided — update everything except the token columns
       await pool.query(
         `UPDATE users SET grade = $1,
-          campus = $2, tz_periods = $3, is_new_user = false,
-          calendar_show_homeroom = $4, calendar_show_completed = $5,
-          calendar_show_prev_week = $6, calendar_show_current_week = $7,
-          calendar_show_next_week1 = $8, calendar_show_next_week2 = $9,
-          calendar_show_weekends = $10
-         WHERE id = $11`,
-        [grade, resolvedCampus, tzPeriods,
+          campus = $2, tz_periods = $3, region = $4, is_new_user = false,
+          calendar_show_homeroom = $5, calendar_show_completed = $6,
+          calendar_show_prev_week = $7, calendar_show_current_week = $8,
+          calendar_show_next_week1 = $9, calendar_show_next_week2 = $10,
+          calendar_show_weekends = $11
+         WHERE id = $12`,
+        [grade, resolvedCampus, tzPeriods, resolvedRegion,
          calendarShowHomeroom ?? false,
          calendarShowCompleted ?? true,
          calendarShowPrevWeek ?? false,
