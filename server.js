@@ -1,3 +1,7 @@
+// Copyright © 2026 Orlando Ng. All rights reserved.
+// This source code is proprietary and confidential.
+// Unauthorized copying, distribution, or use of this file, via any medium, is strictly prohibited.
+
 // PlanAssist - COMPLETELY REDESIGNED Backend API
 // server.js - New title/segment system with advanced AI estimation
 
