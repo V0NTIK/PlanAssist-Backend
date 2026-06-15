@@ -8,8 +8,8 @@
     "dev": "nodemon server.js"
   },
   "keywords": ["oneschool", "study", "planner", "education"],
-  "author": "",
-  "license": "MIT",
+  "author": "Orlando Wyman",
+  "license": "UNLICENSED",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
