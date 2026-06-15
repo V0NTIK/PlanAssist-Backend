@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS users (
     -- Credits currency
     credits                     INTEGER         NOT NULL DEFAULT 0,
     last_daily_chest            TIMESTAMPTZ,    -- Timestamp of last chest claim; 24-hour cooldown enforced server-side
-    -- Campus & period offsets (replaces present_periods)
+    -- Region & Campus & period offsets (replaces present_periods)
+    region                      VARCHAR(20)     DEFAULT 'North America', -- 'North America' | 'Australia'
     campus                      VARCHAR(50)     DEFAULT 'Ashland',
     tz_periods                  VARCHAR(10)     DEFAULT '2-6',      -- Present periods
     -- Calendar preferences
@@ -84,6 +85,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_chest           TIMESTAMPT
 ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_public             BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS campus                      VARCHAR(50)  DEFAULT 'Ashland';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_periods                  VARCHAR(10)  DEFAULT '2-6';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS region                      VARCHAR(20)  DEFAULT 'North America';
+
+-- Backfill: all existing non-new users who have no region default it to North America
+UPDATE users SET region = 'North America' WHERE region IS NULL AND (is_new_user = FALSE OR is_new_user IS NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_homeroom     BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_completed    BOOLEAN      DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_show_prev_week    BOOLEAN      DEFAULT FALSE;
