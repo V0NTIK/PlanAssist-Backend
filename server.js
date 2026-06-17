@@ -404,10 +404,21 @@ const extractNameFromEmail = (email) => {
   return `${first} ${lastName}`.trim();
 };
 
-// Validate OneSchool email
+// Validate OneSchool email — loose check (domain suffix only).
+// Used for LOGIN, where existing real accounts predating the stricter format
+// must not be locked out.
 const isValidOneSchoolEmail = (email) => {
   return email.endsWith('@na.oneschoolglobal.com') || email.endsWith('@au.oneschoolglobal.com');
 };
+
+// Validate OneSchool email — strict format check.
+// Required shape: first.last##@xx.oneschoolglobal.com
+//   - local part: letters, a literal dot, then letters immediately followed
+//     by exactly two digits (e.g. "jane.doe12")
+//   - domain: exactly two letters (region code) + ".oneschoolglobal.com"
+// Used for REGISTRATION only — new signups must match this exactly.
+const ONESCHOOL_EMAIL_REGEX = /^[a-z]+\.[a-z]+\d{2}@[a-z]{2}\.oneschoolglobal\.com$/;
+const isValidOneSchoolEmailStrict = (email) => ONESCHOOL_EMAIL_REGEX.test(email);
 
 // Validate grade (must be 7-12)
 const isValidGrade = (grade) => {
@@ -865,8 +876,8 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    if (!isValidOneSchoolEmail(email)) {
-      return res.status(400).json({ error: 'Email must be a valid OneSchool Global email (@na.oneschoolglobal.com or @au.oneschoolglobal.com)' });
+    if (!isValidOneSchoolEmailStrict(email)) {
+      return res.status(400).json({ error: 'Email must be in this exact format: first.last##@xx.oneschoolglobal.com (e.g. jane.doe12@na.oneschoolglobal.com)' });
     }
 
     const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
