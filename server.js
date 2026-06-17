@@ -258,12 +258,40 @@ function isDSTOnDate(dateStr) {
   return check >= dstStart && check < dstEnd;
 }
 
+// Southern Hemisphere DST (used by Australian campuses that observe it, e.g.
+// NSW, VIC, SA, TAS): DST runs roughly early October through early April —
+// the OPPOSITE months from Northern Hemisphere DST. Queensland and WA never
+// observe DST, but for those campuses standard === dst in CAMPUS_UTC_OFFSETS
+// so this function's result is irrelevant for them either way.
+function isSouthernDSTOnDate(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  // DST starts: 1st Sunday of October
+  const dstStart = new Date(y, 9, 1); // October 1
+  dstStart.setDate(1 + (7 - dstStart.getDay()) % 7);
+  // DST ends: 1st Sunday of April (following year)
+  const dstEnd = new Date(y + 1, 3, 1); // April 1 of next year
+  dstEnd.setDate(1 + (7 - dstEnd.getDay()) % 7);
+  const dstStartPrevYear = new Date(y - 1, 9, 1);
+  dstStartPrevYear.setDate(1 + (7 - dstStartPrevYear.getDay()) % 7);
+  const dstEndThisYear = new Date(y, 3, 1);
+  dstEndThisYear.setDate(1 + (7 - dstEndThisYear.getDay()) % 7);
+  const check = new Date(y, m - 1, d);
+  // Either: after this year's Oct start through year-end, OR before this year's April end
+  return check >= dstStart || check < dstEndThisYear;
+}
+
+// Determines which DST rule applies to a given campus, then resolves whether
+// DST is active on the given date using the correct hemisphere's rule.
+function isDSTActiveForCampus(dateStr, campus) {
+  return AUSTRALIAN_CAMPUSES.has(campus) ? isSouthernDSTOnDate(dateStr) : isDSTOnDate(dateStr);
+}
+
 // Given a campus-tz YYYY-MM-DD date string and a campus name, returns a UTC
 // timestamp (Date object) representing noon on that campus date.
 // Noon campus-time is safely within the day regardless of DST transitions.
 function campusDateToUTC(dateStr, campus) {
   const entry = CAMPUS_UTC_OFFSETS[campus] || CAMPUS_UTC_OFFSETS['Ashland'];
-  const offsetHours = isDSTOnDate(dateStr) ? entry.dst : entry.standard;
+  const offsetHours = isDSTActiveForCampus(dateStr, campus) ? entry.dst : entry.standard;
   // noon campus-time = 12:00:00 campus = (12 - offsetHours) UTC
   const [y, m, d] = dateStr.split('-').map(Number);
   const utcHour = 12 - offsetHours; // e.g. UTC-4: noon EDT = 16:00 UTC
@@ -866,7 +894,8 @@ app.post('/api/auth/register', async (req, res) => {
         email: user.email, 
         name: user.name,
         isNewUser: user.is_new_user,
-        isAdmin: user.is_admin || false
+        isAdmin: isStaff(user.position),
+        position: user.position || 'user'
       } 
     });
   } catch (error) {
@@ -923,7 +952,9 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         isNewUser: user.is_new_user,
         showInFeed: user.show_in_feed !== false,
-      profilePublic: user.profile_public !== false
+        profilePublic: user.profile_public !== false,
+        isAdmin: isStaff(user.position),
+        position: user.position || 'user'
       } 
     });
   } catch (error) {
@@ -1123,7 +1154,7 @@ function getEffectivePeriods(campus) {
 app.get('/api/account/setup', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, region, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, is_admin, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda FROM users WHERE id = $1',
+      'SELECT name, grade, canvas_api_token, canvas_api_token_iv, campus, tz_periods, region, calendar_show_homeroom, calendar_show_completed, calendar_show_prev_week, calendar_show_current_week, calendar_show_next_week1, calendar_show_next_week2, calendar_show_weekends, schedule_enhanced, position, show_in_feed, profile_public, last_sync, itinerary_show_events, itinerary_show_organizer, itinerary_show_agenda FROM users WHERE id = $1',
       [req.user.id]
     );
 
@@ -1172,7 +1203,8 @@ app.get('/api/account/setup', authenticateToken, async (req, res) => {
       calendarShowNextWeek2: user.calendar_show_next_week2 ?? false,
       calendarShowWeekends: user.calendar_show_weekends ?? true,
       schedule_enhanced: user.schedule_enhanced || false,
-      is_admin: user.is_admin || false,
+      isAdmin: isStaff(user.position),
+      position: user.position || 'user',
       showInFeed: user.show_in_feed !== false,
       lastSync: user.last_sync || null,
       itinerary_show_events: user.itinerary_show_events !== false,
@@ -4571,7 +4603,7 @@ app.get('/api/hub/insights', authenticateToken, async (req, res) => {
 
     // Use the authoritative CAMPUS_UTC_OFFSETS table with proper DST handling
     const campusEntry = CAMPUS_UTC_OFFSETS[campus] || CAMPUS_UTC_OFFSETS['Ashland'];
-    const tzOffsetHrs = isDSTOnDate(todayUTC) ? campusEntry.dst : campusEntry.standard;
+    const tzOffsetHrs = isDSTActiveForCampus(todayUTC, campus) ? campusEntry.dst : campusEntry.standard;
     const tzInterval = `${tzOffsetHrs >= 0 ? '+' : ''}${tzOffsetHrs} hours`;
 
     const globalTodayR = await pool.query(`SELECT COUNT(*) AS cnt FROM tasks_completed WHERE completed_at::date = $1::date`, [todayUTC]);
@@ -5528,11 +5560,61 @@ app.post('/api/tasks/manual', authenticateToken, async (req, res) => {
 // ADMIN MIDDLEWARE + AUDIT HELPER
 // ============================================================================
 
-const requireAdmin = async (req, res, next) => {
+// ============================================================================
+// STAFF POSITION HIERARCHY + MIDDLEWARE
+// ============================================================================
+
+// Ordered hierarchy — index = rank (higher = more authority)
+const STAFF_POSITIONS = ['Moderator','Support','Editor','Broadcaster','Spectator','Manager','Director','Supervisor','Owner'];
+const STAFF_HIERARCHY = ['Spectator','Broadcaster','Editor','Support','Moderator','Manager','Director','Owner'];
+// Supervisor is a special view-only peer beside Owner — not in the edit hierarchy
+const PEER_POSITIONS  = new Set(['Support','Editor','Broadcaster','Spectator']);
+
+const isStaff = (position) => position && position !== 'user';
+
+// Returns numeric rank for hierarchy comparisons (higher = more authority)
+// Supervisor is treated as just-below Owner for view purposes
+const positionRank = (pos) => {
+  const ranks = {
+    'user':        0,
+    'Spectator':   1,
+    'Broadcaster': 2,
+    'Editor':      3,
+    'Support':     4,
+    'Moderator':   5,
+    'Manager':     6,
+    'Director':    7,
+    'Supervisor':  8,  // view-only, beside Owner
+    'Owner':       9,
+  };
+  return ranks[pos] ?? 0;
+};
+
+// Fetch acting staff member's position from DB
+const getActorPosition = async (userId) => {
+  const r = await pool.query('SELECT position FROM users WHERE id = $1', [userId]);
+  return r.rows[0]?.position || 'user';
+};
+
+// Middleware: requires any staff position
+const requireStaff = async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
-    if (!result.rows[0]?.is_admin) {
-      return res.status(403).json({ error: 'Admin access required' });
+    const pos = await getActorPosition(req.user.id);
+    if (!isStaff(pos)) return res.status(403).json({ error: 'Staff access required' });
+    req.actorPosition = pos;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+};
+
+// Middleware: requires minimum position rank
+const requirePosition = (minPosition) => async (req, res, next) => {
+  try {
+    const pos = await getActorPosition(req.user.id);
+    req.actorPosition = pos;
+    if (positionRank(pos) < positionRank(minPosition)) {
+      return res.status(403).json({ error: `Requires ${minPosition} or above` });
     }
     next();
   } catch (err) {
@@ -5540,30 +5622,350 @@ const requireAdmin = async (req, res, next) => {
   }
 };
 
-const auditLog = async (adminId, adminName, action, targetUserId, targetUserName, details = {}) => {
+// Keep requireAdmin as alias for backward-compat on any missed endpoints
+const requireAdmin = requirePosition('Manager');
+
+// Boolean rank-check helper (server-side equivalent of App.jsx's hasRank)
+const hasRankFn = (actorPos, minPos) => positionRank(actorPos) >= positionRank(minPos);
+
+// Staff log helper (replaces auditLog / admin_audit_log)
+const staffLog = async (actorId, actorName, actorPosition, action, targetUserId, targetUserName, details = {}) => {
   try {
     await pool.query(
-      `INSERT INTO admin_audit_log (admin_id, admin_name, action, target_user_id, target_user_name, details)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [adminId, adminName, action, targetUserId || null, targetUserName || null, JSON.stringify(details)]
+      `INSERT INTO staff_log (actor_id, actor_name, actor_position, action, target_user_id, target_user_name, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [actorId, actorName, actorPosition || 'user', action, targetUserId || null, targetUserName || null, JSON.stringify(details)]
     );
   } catch (err) {
-    console.error('[AUDIT] Failed to write audit log:', err.message);
+    console.error('[STAFF_LOG] Failed to write staff log:', err.message);
   }
 };
+
+// Legacy alias so existing auditLog() calls still work during transition
+const auditLog = async (adminId, adminName, action, targetUserId, targetUserName, details = {}) => {
+  const pos = await getActorPosition(adminId).catch(() => 'user');
+  return staffLog(adminId, adminName, pos, action, targetUserId, targetUserName, details);
+};
+
+// ============================================================================
+// ADMIN: SELF + STAFF ENDPOINTS
+// ============================================================================
+
+// GET /api/admin/me — returns acting staff member's position
+app.get('/api/admin/me', authenticateToken, requireStaff, async (req, res) => {
+  res.json({ position: req.actorPosition });
+});
+
+// GET /api/admin/staff — all staff users (position != 'user')
+app.get('/api/admin/staff', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const actorRank = positionRank(req.actorPosition);
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.email, u.grade, u.campus, u.region, u.position,
+              u.created_at, u.updated_at, u.last_sync, u.is_banned,
+              u.insignia_selected,
+              EXISTS(
+                SELECT 1 FROM tasks st
+                WHERE st.user_id = u.id
+                  AND st.session_active = true
+                  AND st.session_heartbeat > NOW() - INTERVAL '90 seconds'
+              ) AS in_session
+       FROM users u
+       WHERE u.position != 'user'
+       ORDER BY u.created_at ASC`
+    );
+    // Moderators can only see users below them on the Staff tab
+    // (Supervisors can see all including Owners — handled client-side flag)
+    const rows = result.rows.filter(u => {
+      if (req.actorPosition === 'Supervisor') return true; // sees all
+      return positionRank(u.position) < actorRank;
+    });
+    res.json(rows);
+  } catch (err) {
+    console.error('Get staff error:', err);
+    res.status(500).json({ error: 'Failed to fetch staff' });
+  }
+});
+
+// GET /api/admin/staff/:id/log — log entries for a specific staff user
+app.get('/api/admin/staff/:id/log', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    const actorRank = positionRank(req.actorPosition);
+    // Get target's position for visibility check
+    const targetPosR = await pool.query('SELECT position FROM users WHERE id=$1', [targetId]);
+    const targetPos = targetPosR.rows[0]?.position || 'user';
+    // Visibility: can see logs of users with lower rank
+    // Exception: Supervisor can see Owner logs
+    const canView = req.actorPosition === 'Supervisor'
+      ? true
+      : positionRank(targetPos) < actorRank;
+    if (!canView) return res.status(403).json({ error: 'Cannot view this user\'s log' });
+    const result = await pool.query(
+      `SELECT id, actor_name, actor_position, action, target_user_name, details, created_at
+       FROM staff_log WHERE actor_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [targetId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch staff log' });
+  }
+});
+
+// PATCH /api/admin/staff/:id/position — change a staff member's position
+app.patch('/api/admin/staff/:id/position', authenticateToken, requirePosition('Manager'), async (req, res) => {
+  try {
+    const targetId = parseInt(req.params.id);
+    const { position: newPosition } = req.body;
+    const actorPos = req.actorPosition;
+    const actorRank = positionRank(actorPos);
+
+    const VALID_POSITIONS = ['user','Spectator','Broadcaster','Editor','Support','Moderator','Manager','Director','Supervisor','Owner'];
+    if (!VALID_POSITIONS.includes(newPosition)) return res.status(400).json({ error: 'Invalid position' });
+
+    // Self-promotion not allowed
+    if (targetId === req.user.id) return res.status(400).json({ error: 'Cannot change your own position' });
+
+    const targetR = await pool.query('SELECT name, position FROM users WHERE id=$1', [targetId]);
+    if (!targetR.rows[0]) return res.status(404).json({ error: 'User not found' });
+    const targetPos = targetR.rows[0].position;
+    const targetRank = positionRank(targetPos);
+    const newRank = positionRank(newPosition);
+    const actorR = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const actorName = actorR.rows[0]?.name;
+
+    // Owners can change anyone directly — no approval needed
+    if (actorPos === 'Owner') {
+      await pool.query('UPDATE users SET position=$1 WHERE id=$2', [newPosition, targetId]);
+      await staffLog(req.user.id, actorName, actorPos, 'CHANGE_POSITION', targetId, targetR.rows[0].name, { from: targetPos, to: newPosition });
+      return res.json({ success: true });
+    }
+
+    // Directors: can't touch Owner or other Directors directly; can't promote to Owner ever
+    if (actorPos === 'Director') {
+      if (targetRank >= positionRank('Director')) return res.status(403).json({ error: 'Cannot modify users at Director level or above' });
+      if (newRank >= positionRank('Owner')) return res.status(403).json({ error: 'Cannot promote to Owner' });
+      // Promoting someone TO Director requires Owner approval
+      if (newPosition === 'Director') {
+        const request = await createStaffRequest({
+          requestorId: req.user.id, requestorName: actorName, requestorPosition: actorPos,
+          requestType: 'PROMOTE_POSITION', targetUserId: targetId, targetUserName: targetR.rows[0].name,
+          minApproverPosition: 'Owner', payload: { newPosition, from: targetPos }
+        });
+        return res.json({ success: true, queued: true, request });
+      }
+      await pool.query('UPDATE users SET position=$1 WHERE id=$2', [newPosition, targetId]);
+      await staffLog(req.user.id, actorName, actorPos, 'CHANGE_POSITION', targetId, targetR.rows[0].name, { from: targetPos, to: newPosition });
+      return res.json({ success: true });
+    }
+
+    // Managers: can't touch their level or above directly
+    if (actorPos === 'Manager') {
+      if (targetRank >= actorRank) return res.status(403).json({ error: 'Cannot modify users at your level or above' });
+      if (newRank > actorRank) return res.status(403).json({ error: 'Cannot promote above your own level' });
+      // Promoting someone TO Manager requires Director/Owner approval
+      if (newPosition === 'Manager') {
+        const request = await createStaffRequest({
+          requestorId: req.user.id, requestorName: actorName, requestorPosition: actorPos,
+          requestType: 'PROMOTE_POSITION', targetUserId: targetId, targetUserName: targetR.rows[0].name,
+          minApproverPosition: 'Director', payload: { newPosition, from: targetPos }
+        });
+        return res.json({ success: true, queued: true, request });
+      }
+      await pool.query('UPDATE users SET position=$1 WHERE id=$2', [newPosition, targetId]);
+      await staffLog(req.user.id, actorName, actorPos, 'CHANGE_POSITION', targetId, targetR.rows[0].name, { from: targetPos, to: newPosition });
+      return res.json({ success: true });
+    }
+
+    return res.status(403).json({ error: 'Insufficient permissions to change positions' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// ADMIN: STAFF REQUESTS
+// Approval-workflow queue. createStaffRequest() is called by other admin
+// endpoints when the acting position lacks rank to perform the action
+// directly — it queues the action instead of executing it.
+// ============================================================================
+
+// Helper: create a pending request row. Returns the inserted row.
+const createStaffRequest = async ({ requestorId, requestorName, requestorPosition, requestType, targetUserId, targetUserName, minApproverPosition, payload }) => {
+  const r = await pool.query(
+    `INSERT INTO staff_requests (requestor_id, requestor_name, requestor_position, request_type, target_user_id, target_user_name, min_approver_position, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [requestorId, requestorName, requestorPosition, requestType, targetUserId || null, targetUserName || null, minApproverPosition, JSON.stringify(payload || {})]
+  );
+  return r.rows[0];
+};
+
+// GET /api/admin/requests — list requests visible to the acting staff member
+// Visibility: position rank determines what's visible. Peer positions (Support,
+// Editor, Broadcaster, Spectator) can see each other's requests but cannot approve
+// them (handled at the PATCH /approve level). Spectators see nothing here since
+// they "can't make requests" per spec, but they ARE allowed to view per their
+// "Viewable Only" Requests tab — so Spectators CAN view, just not act.
+app.get('/api/admin/requests', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const pos = req.actorPosition;
+    const rank = positionRank(pos);
+    // Owner sees everything.
+    // Director sees all except other Director-promotion requests (those need Owner).
+    // Manager sees all except Director-level and Manager-promotion requests reserved for Director+/Owner.
+    // Moderator sees all except Director/Manager/Moderator-reserved requests above their authority.
+    // Peer roles (Support/Editor/Broadcaster) see requests addressed to Moderator+ (i.e. everything routed up),
+    // since the spec allows "sideways" visibility among peers, but cannot approve.
+    // Spectators can view all but never act.
+    let rows;
+    if (pos === 'Owner') {
+      rows = await pool.query(`SELECT * FROM staff_requests ORDER BY created_at DESC LIMIT 300`);
+    } else {
+      // Visible if this actor's rank >= the request's min_approver_position rank,
+      // OR if this actor is a peer-tier role (always allowed to view, never to approve)
+      const isPeerTier = PEER_POSITIONS.has(pos) || pos === 'Spectator';
+      if (isPeerTier) {
+        rows = await pool.query(`SELECT * FROM staff_requests ORDER BY created_at DESC LIMIT 300`);
+      } else {
+        rows = await pool.query(`SELECT * FROM staff_requests ORDER BY created_at DESC LIMIT 300`);
+        rows.rows = rows.rows.filter(r => rank >= positionRank(r.min_approver_position));
+      }
+    }
+    res.json(rows.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch requests' });
+  }
+});
+
+// PATCH /api/admin/requests/:id/approve
+app.patch('/api/admin/requests/:id/approve', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const pos = req.actorPosition;
+    if (PEER_POSITIONS.has(pos) || pos === 'Spectator') {
+      return res.status(403).json({ error: 'Your position can view requests but cannot approve them.' });
+    }
+    const reqRow = await pool.query('SELECT * FROM staff_requests WHERE id=$1', [req.params.id]);
+    if (!reqRow.rows[0]) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRow.rows[0];
+    if (request.status !== 'pending') return res.status(400).json({ error: 'Request already resolved' });
+    if (positionRank(pos) < positionRank(request.min_approver_position)) {
+      return res.status(403).json({ error: `Requires ${request.min_approver_position} or above to approve` });
+    }
+    // Requestor cannot approve their own request
+    if (request.requestor_id === req.user.id) return res.status(400).json({ error: 'Cannot approve your own request' });
+
+    // Execute the underlying action based on request_type
+    const payload = request.payload || {};
+    switch (request.request_type) {
+      case 'BAN_USER':
+        await pool.query('UPDATE users SET is_banned=true, ban_reason=$1 WHERE id=$2', [payload.reason || 'Account blocked.', request.target_user_id]);
+        break;
+      case 'EDIT_USER': {
+        const fields = []; const vals = []; let idx = 1;
+        if (payload.name !== undefined)   { fields.push(`name=$${idx++}`); vals.push(payload.name); }
+        if (payload.grade !== undefined)  { fields.push(`grade=$${idx++}`); vals.push(payload.grade); }
+        if (payload.region !== undefined) { fields.push(`region=$${idx++}`); vals.push(payload.region); }
+        if (payload.campus !== undefined) {
+          const resolvedCampus = VALID_CAMPUSES.includes(payload.campus) ? payload.campus : 'Ashland';
+          fields.push(`campus=$${idx++}`); vals.push(resolvedCampus);
+          fields.push(`tz_periods=$${idx++}`); vals.push(getEffectivePeriods(resolvedCampus));
+        }
+        if (payload.email !== undefined && payload.email.trim()) {
+          const cleanEmail = payload.email.trim().toLowerCase();
+          const existing = await pool.query('SELECT id FROM users WHERE email=$1 AND id!=$2', [cleanEmail, request.target_user_id]);
+          if (existing.rows.length > 0) {
+            return res.status(400).json({ error: 'Cannot approve: email is now in use by another account.' });
+          }
+          fields.push(`email=$${idx++}`); vals.push(cleanEmail);
+        }
+        if (fields.length > 0) {
+          vals.push(request.target_user_id);
+          await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id=$${idx}`, vals);
+        }
+        break;
+      }
+      case 'PROMOTE_POSITION':
+        await pool.query('UPDATE users SET position=$1 WHERE id=$2', [payload.newPosition, request.target_user_id]);
+        break;
+      case 'POST_BANNER':
+        await pool.query(
+          `INSERT INTO announcements (author_id, author_name, message, type, target_audience) VALUES ($1,$2,$3,$4,$5)`,
+          [request.requestor_id, request.requestor_name, payload.message, payload.type || 'info', payload.target_audience || 'all']
+        );
+        break;
+      case 'EDIT_RESOURCE':
+        await pool.query('UPDATE help_content SET content=$1, updated_at=CURRENT_TIMESTAMP, updated_by=$2 WHERE id=1', [payload.content, request.requestor_id]);
+        break;
+      case 'ADD_HPT_USER': {
+        const hash = await bcrypt.hash(payload.passcode, 10);
+        await pool.query('INSERT INTO hpt_users (name, passcode_hash) VALUES ($1,$2)', [payload.name, hash]);
+        break;
+      }
+      case 'EDIT_HPT_USER': {
+        if (payload.name !== undefined) await pool.query('UPDATE hpt_users SET name=$1 WHERE id=$2', [payload.name, request.target_user_id]);
+        if (payload.passcode !== undefined) {
+          const hash = await bcrypt.hash(payload.passcode, 10);
+          await pool.query('UPDATE hpt_users SET passcode_hash=$1 WHERE id=$2', [hash, request.target_user_id]);
+        }
+        break;
+      }
+      default:
+        return res.status(400).json({ error: `Unknown request type: ${request.request_type}` });
+    }
+
+    const actorR = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    await pool.query(
+      `UPDATE staff_requests SET status='approved', resolved_by=$1, resolved_by_name=$2, resolved_at=NOW() WHERE id=$3`,
+      [req.user.id, actorR.rows[0]?.name, request.id]
+    );
+    await staffLog(req.user.id, actorR.rows[0]?.name, pos, `APPROVE_REQUEST:${request.request_type}`, request.target_user_id, request.target_user_name, payload);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Approve request error:', err);
+    res.status(500).json({ error: err.message || 'Failed to approve request' });
+  }
+});
+
+// PATCH /api/admin/requests/:id/reject
+app.patch('/api/admin/requests/:id/reject', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const pos = req.actorPosition;
+    if (PEER_POSITIONS.has(pos) || pos === 'Spectator') {
+      return res.status(403).json({ error: 'Your position can view requests but cannot act on them.' });
+    }
+    const reqRow = await pool.query('SELECT * FROM staff_requests WHERE id=$1', [req.params.id]);
+    if (!reqRow.rows[0]) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRow.rows[0];
+    if (request.status !== 'pending') return res.status(400).json({ error: 'Request already resolved' });
+    if (positionRank(pos) < positionRank(request.min_approver_position)) {
+      return res.status(403).json({ error: `Requires ${request.min_approver_position} or above to reject` });
+    }
+    const actorR = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    await pool.query(
+      `UPDATE staff_requests SET status='rejected', resolved_by=$1, resolved_by_name=$2, resolved_at=NOW() WHERE id=$3`,
+      [req.user.id, actorR.rows[0]?.name, request.id]
+    );
+    await staffLog(req.user.id, actorR.rows[0]?.name, pos, `REJECT_REQUEST:${request.request_type}`, request.target_user_id, request.target_user_name, request.payload);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reject request' });
+  }
+});
 
 // ============================================================================
 // ADMIN: ANNOUNCEMENTS
 // ============================================================================
 
-// GET /api/admin/feedback — list all feedback submissions (admin only)
-app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res) => {
+// GET /api/admin/feedback — list all feedback submissions
+app.get('/api/admin/feedback', authenticateToken, requireStaff, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, user_id, user_email, user_name, feedback_text, created_at, checked
-       FROM feedback
-       ORDER BY created_at DESC
-       LIMIT 200`
+      `SELECT f.id, f.user_id, f.user_email, f.user_name, f.feedback_text, f.created_at, f.checked,
+              u.grade, u.campus, u.region
+       FROM feedback f
+       LEFT JOIN users u ON u.id = f.user_id
+       ORDER BY f.created_at DESC
+       LIMIT 500`
     );
     res.json(result.rows);
   } catch (err) {
@@ -5572,32 +5974,62 @@ app.get('/api/admin/feedback', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
-// PATCH /api/admin/feedback/:id/checked — toggle checked status
-app.patch('/api/admin/feedback/:id/checked', authenticateToken, requireAdmin, async (req, res) => {
+// PATCH /api/admin/feedback/:id/checked — toggle checked status (Moderator+ only)
+app.patch('/api/admin/feedback/:id/checked', authenticateToken, requireStaff, async (req, res) => {
   try {
+    // Moderator+ have access via the hierarchy. Support has a special carve-out
+    // granting full Feedback access despite ranking below Moderator.
+    if (!hasRankFn(req.actorPosition, 'Moderator') && req.actorPosition !== 'Support') {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
     const { checked } = req.body;
     await pool.query('UPDATE feedback SET checked = $1 WHERE id = $2', [!!checked, req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/admin/log — get shared admin log content
-// GET /api/admin/log — get shared admin log content
-app.get('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
+// GET /api/admin/bulletin — get bulletin content
+// GET /api/admin/bulletin — get bulletin content
+app.get('/api/admin/bulletin', authenticateToken, requireStaff, async (req, res) => {
   try {
-    const r = await pool.query('SELECT content, updated_at FROM admin_log WHERE id = 1');
-    res.json({ content: r.rows[0]?.content || '', updatedAt: r.rows[0]?.updated_at || null });
+    const r = await pool.query('SELECT content, updated_at, updated_by FROM bulletin WHERE id = 1');
+    // Also get the updater's name
+    const updatedBy = r.rows[0]?.updated_by;
+    let updatedByName = null;
+    if (updatedBy) {
+      const nr = await pool.query('SELECT name FROM users WHERE id=$1', [updatedBy]);
+      updatedByName = nr.rows[0]?.name || null;
+    }
+    res.json({ content: r.rows[0]?.content || '', updatedAt: r.rows[0]?.updated_at || null, updatedByName });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PUT /api/admin/log — save shared admin log content
-app.put('/api/admin/log', authenticateToken, requireAdmin, async (req, res) => {
+// PUT /api/admin/bulletin — save bulletin content
+app.put('/api/admin/bulletin', authenticateToken, requireStaff, async (req, res) => {
   try {
+    if (req.actorPosition === 'Supervisor') {
+      return res.status(403).json({ error: 'Supervisors can view the bulletin but cannot edit it.' });
+    }
     const { content } = req.body;
     await pool.query(
-      'UPDATE admin_log SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
+      'UPDATE bulletin SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
       [content || '', req.user.id]
     );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Legacy alias — keep old /admin/log routes working during transition
+app.get('/api/admin/log', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT content, updated_at FROM bulletin WHERE id = 1');
+    res.json({ content: r.rows[0]?.content || '', updatedAt: r.rows[0]?.updated_at || null });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.put('/api/admin/log', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const { content } = req.body;
+    await pool.query('UPDATE bulletin SET content=$1, updated_at=CURRENT_TIMESTAMP, updated_by=$2 WHERE id=1', [content||'', req.user.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5644,7 +6076,7 @@ app.delete('/api/admin/ip-blacklist/:id', authenticateToken, requireAdmin, async
 });
 
 // GET /api/admin/announcements — all active (and recent inactive) for admin view
-app.get('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/announcements', authenticateToken, requireStaff, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT a.*, u.name as author_name
@@ -5685,22 +6117,40 @@ app.get('/api/announcements', authenticateToken, async (req, res) => {
 });
 
 // POST /api/admin/announcements — create announcement
-app.post('/api/admin/announcements', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/announcements', authenticateToken, requirePosition('Support'), async (req, res) => {
   try {
     const { message, type } = req.body;
+    const actorPos = req.actorPosition;
     const cleanMessage = typeof message === 'string' ? message.trim() : '';
     if (!cleanMessage || !type) return res.status(400).json({ error: 'message and type required' });
     if (cleanMessage.length > 500) return res.status(400).json({ error: 'Announcement message must be 500 characters or fewer' });
     const VALID_TYPES = ['info', 'urgent'];
     if (!VALID_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid announcement type (must be info or urgent)' });
+    const audience = ['all', 'existing', 'new'].includes(req.body.target_audience) ? req.body.target_audience : 'all';
     const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const adminName = adminRes.rows[0]?.name || 'Admin';
-    const audience = ['all', 'existing', 'new'].includes(req.body.target_audience) ? req.body.target_audience : 'all';
+
+    // Broadcaster has full direct access (per spec). Manager/Director/Owner have direct access.
+    // Moderator attempts require Manager+ approval.
+    // Support/Editor attempts require Moderator+ approval.
+    let minApprover = null;
+    if (actorPos === 'Moderator') minApprover = 'Manager';
+    else if (actorPos === 'Support' || actorPos === 'Editor') minApprover = 'Moderator';
+
+    if (minApprover) {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: adminName, requestorPosition: actorPos,
+        requestType: 'POST_BANNER', targetUserId: null, targetUserName: null,
+        minApproverPosition: minApprover, payload: { message: cleanMessage, type, target_audience: audience }
+      });
+      return res.json({ queued: true, request });
+    }
+
     const result = await pool.query(
       `INSERT INTO announcements (author_id, author_name, message, type, target_audience) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [req.user.id, adminName, cleanMessage, type, audience]
     );
-    await auditLog(req.user.id, adminName, 'CREATE_ANNOUNCEMENT', null, null, { message, type });
+    await staffLog(req.user.id, adminName, actorPos, 'CREATE_ANNOUNCEMENT', null, null, { message: cleanMessage, type });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create announcement' });
@@ -5829,12 +6279,13 @@ app.post('/api/admin/grant-shields-all', authenticateToken, requireAdmin, async 
 // ============================================================================
 
 // GET /api/admin/users — list all users with stats
-app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/users', authenticateToken, requireStaff, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.name, u.email, u.grade, u.is_admin, u.is_banned, u.ban_reason,
-              u.is_new_user, u.campus, u.tz_periods, u.schedule_enhanced, u.created_at, u.last_sync,
-              u.streak_shields_available, u.credits,
+      `SELECT u.id, u.name, u.email, u.grade, u.position, u.is_banned, u.ban_reason,
+              u.is_new_user, u.campus, u.region, u.tz_periods, u.schedule_enhanced,
+              u.created_at, u.updated_at, u.last_sync,
+              u.streak_shields_available, u.credits, u.insignia_selected,
               u.canvas_api_token IS NOT NULL AND u.canvas_api_token != '' AS has_canvas_token,
               COUNT(DISTINCT t.id) FILTER (WHERE t.deleted = false AND t.completed = false) AS active_tasks,
               MAX(tc.completed_at) AS last_completion,
@@ -5859,14 +6310,14 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
   }
 });
 
-// GET /api/admin/users/:id — single user detail + tasks
-app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+// GET /api/admin/users/:id — single user detail + tasks + feedback count
+app.get('/api/admin/users/:id', authenticateToken, requirePosition('Moderator'), async (req, res) => {
   try {
     const userRes = await pool.query(
-      `SELECT id, name, email, grade, is_admin, is_banned, ban_reason, is_new_user,
-              campus, tz_periods, schedule_enhanced, created_at,
+      `SELECT id, name, email, grade, position, is_banned, ban_reason, is_new_user,
+              campus, region, tz_periods, schedule_enhanced, created_at, updated_at,
               streak_shields_available, insignia_days, insignia_selected, credits,
-              last_login_ip,
+              last_login_ip, last_sync,
               canvas_api_token IS NOT NULL AND canvas_api_token != '' AS has_canvas_token
        FROM users WHERE id = $1`,
       [req.params.id]
@@ -5883,57 +6334,108 @@ app.get('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res
     );
     const completedRes = await pool.query(
       `SELECT title, class, actual_time, estimated_time, completed_at
-       FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 20`,
+       FROM tasks_completed WHERE user_id = $1 ORDER BY completed_at DESC LIMIT 50`,
       [req.params.id]
     );
     const insigniaRes = await pool.query(
       `SELECT label, unlocked_at FROM insignia_unlocks WHERE user_id=$1 ORDER BY unlocked_at ASC`,
       [req.params.id]
     );
-    res.json({ user: userRes.rows[0], tasks: tasksRes.rows, recentCompletions: completedRes.rows, insignia: insigniaRes.rows });
+    const feedbackCountRes = await pool.query(
+      `SELECT COUNT(*) AS count FROM feedback WHERE user_id=$1`, [req.params.id]
+    );
+    const activityRes = await pool.query(
+      `SELECT completed_at FROM tasks_completed WHERE user_id=$1 ORDER BY completed_at DESC LIMIT 200`,
+      [req.params.id]
+    );
+    const dismissalsRes = await pool.query(
+      `SELECT b.title, b.is_active, d.dismissed_at
+       FROM hpt_studio_banner_dismissals d
+       JOIN hpt_studio_banners b ON b.id = d.banner_id
+       WHERE d.user_id=$1 ORDER BY d.dismissed_at DESC LIMIT 50`,
+      [req.params.id]
+    );
+    res.json({
+      user: userRes.rows[0],
+      tasks: tasksRes.rows,
+      recentCompletions: completedRes.rows,
+      insignia: insigniaRes.rows,
+      feedbackCount: parseInt(feedbackCountRes.rows[0]?.count || 0),
+      activity: activityRes.rows,
+      dismissals: dismissalsRes.rows,
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user detail' });
   }
 });
 
-// POST /api/admin/users/:id/block-ip — block the user's last known login IP
-app.post('/api/admin/users/:id/block-ip', authenticateToken, requireAdmin, async (req, res) => {
+// POST /api/admin/users/:id/block-ip — block the user's last known login IP (Manager+ only)
+app.post('/api/admin/users/:id/block-ip', authenticateToken, requirePosition('Director'), async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
     const { reason } = req.body;
-
-    // Fetch the stored IP for this user
     const userRes = await pool.query('SELECT name, last_login_ip FROM users WHERE id = $1', [targetId]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-
     const ip = userRes.rows[0].last_login_ip;
-    if (!ip) return res.status(400).json({ error: 'No login IP on record for this user. They must log in at least once for an IP to be recorded.' });
-
+    if (!ip) return res.status(400).json({ error: 'No login IP on record for this user.' });
     await pool.query(
       'INSERT INTO ip_blacklist (ip_address, reason, blocked_by) VALUES ($1, $2, $3) ON CONFLICT (ip_address) DO UPDATE SET reason = $2, blocked_by = $3',
       [ip, reason?.trim() || `Blocked via admin panel (user: ${userRes.rows[0].name})`, req.user.id]
     );
-    await loadIpBlacklist(); // refresh cache immediately
-
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'BLOCK_IP', targetId, userRes.rows[0].name, { ip, reason });
-
+    await loadIpBlacklist();
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'BLOCK_IP', targetId, userRes.rows[0].name, { ip, reason });
     res.json({ success: true, ip });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-
-// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, is_admin, email, password)
-app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+// PATCH /api/admin/users/:id — edit user fields (name, grade, campus, region, position, email, password)
+app.patch('/api/admin/users/:id', authenticateToken, requireStaff, async (req, res) => {
   try {
-    const { name, grade, campus, is_admin, email, password } = req.body;
+    const { name, grade, campus, region, position, email, password } = req.body;
     const targetId = parseInt(req.params.id);
+    const actorPos = req.actorPosition;
 
-    // Prevent self-demotion
-    if (is_admin === false && targetId === req.user.id) {
-      return res.status(400).json({ error: 'You cannot remove your own admin status.' });
+    // Position changes go through the dedicated endpoint
+    if (position !== undefined) {
+      return res.status(400).json({ error: 'Use PATCH /api/admin/staff/:id/position to change positions' });
+    }
+
+    // Editor and below (Broadcaster/Spectator) have no Directory edit access at all —
+    // gated by requireStaff + UI, but double-check here for safety.
+    if (!hasRankFn(actorPos, 'Support') && !PEER_POSITIONS.has(actorPos)) {
+      return res.status(403).json({ error: 'Insufficient permissions to edit users' });
+    }
+
+    // Managers can't change passwords
+    if (password !== undefined && positionRank(actorPos) < positionRank('Director')) {
+      return res.status(403).json({ error: 'Only Directors and above can change passwords' });
+    }
+
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    const actorName = actorR.rows[0]?.name;
+
+    // Moderator edit attempts require Manager+ approval.
+    // Support edit attempts require Moderator+ approval.
+    // Editor cannot reach this endpoint (view-only on Directory).
+    if (actorPos === 'Moderator') {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: actorName, requestorPosition: actorPos,
+        requestType: 'EDIT_USER', targetUserId: targetId, targetUserName: targetR.rows[0]?.name,
+        minApproverPosition: 'Manager', payload: req.body
+      });
+      return res.json({ success: true, queued: true, request });
+    }
+    if (actorPos === 'Support') {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: actorName, requestorPosition: actorPos,
+        requestType: 'EDIT_USER', targetUserId: targetId, targetUserName: targetR.rows[0]?.name,
+        minApproverPosition: 'Moderator', payload: req.body
+      });
+      return res.json({ success: true, queued: true, request });
     }
 
     const fields = [];
@@ -5941,14 +6443,13 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
     let idx = 1;
     if (name !== undefined)   { fields.push(`name = $${idx++}`);   vals.push(name); }
     if (grade !== undefined)  { fields.push(`grade = $${idx++}`);  vals.push(grade); }
+    if (region !== undefined) { fields.push(`region = $${idx++}`); vals.push(region); }
     if (campus !== undefined) {
       const resolvedCampus = VALID_CAMPUSES.includes(campus) ? campus : 'Ashland';
       fields.push(`campus = $${idx++}`);     vals.push(resolvedCampus);
       fields.push(`tz_periods = $${idx++}`); vals.push(getEffectivePeriods(resolvedCampus));
     }
-    if (is_admin !== undefined) { fields.push(`is_admin = $${idx++}`); vals.push(is_admin); }
     if (email !== undefined && email.trim()) {
-      // Check for duplicate email
       const existing = await pool.query('SELECT id FROM users WHERE email=$1 AND id!=$2', [email.trim().toLowerCase(), targetId]);
       if (existing.rows.length > 0) return res.status(400).json({ error: 'Email already in use by another account.' });
       fields.push(`email = $${idx++}`); vals.push(email.trim().toLowerCase());
@@ -5963,11 +6464,9 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
     vals.push(targetId);
     await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx}`, vals);
 
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
     const logFields = { ...req.body };
-    if (logFields.password) logFields.password = '[REDACTED]'; // never log plaintext passwords
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'EDIT_USER', targetId, targetRes.rows[0]?.name, logFields);
+    if (logFields.password) logFields.password = '[REDACTED]';
+    await staffLog(req.user.id, actorName, actorPos, 'EDIT_USER', targetId, targetR.rows[0]?.name, logFields);
     res.json({ success: true });
   } catch (err) {
     console.error('Admin edit user error:', err.message);
@@ -5976,35 +6475,47 @@ app.patch('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, r
 });
 
 // POST /api/admin/users/:id/ban
-app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req, res) => {
+// Manager and Moderator ban attempts require Director+ approval (queued as a request).
+// Director and Owner can ban directly.
+app.post('/api/admin/users/:id/ban', authenticateToken, requirePosition('Moderator'), async (req, res) => {
   try {
     const { reason } = req.body;
     const targetId = parseInt(req.params.id);
+    const actorPos = req.actorPosition;
     if (targetId === req.user.id) return res.status(400).json({ error: 'You cannot ban yourself.' });
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    const actorName = actorR.rows[0]?.name;
 
-    await pool.query(
-      `UPDATE users SET is_banned = true, ban_reason = $1 WHERE id = $2`,
-      [reason || 'This account has been temporarily blocked. Please contact your administrator.', targetId]
-    );
-    // Invalidate sessions by clearing their token can't be done in JWT without a blacklist,
-    // but next login attempt will be rejected.
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'BAN_USER', targetId, targetRes.rows[0]?.name, { reason });
-    res.json({ success: true });
+    if (hasRankFn(actorPos, 'Director')) {
+      await pool.query(
+        `UPDATE users SET is_banned = true, ban_reason = $1 WHERE id = $2`,
+        [reason || 'This account has been temporarily blocked. Please contact your administrator.', targetId]
+      );
+      await staffLog(req.user.id, actorName, actorPos, 'BAN_USER', targetId, targetR.rows[0]?.name, { reason });
+      return res.json({ success: true });
+    }
+
+    // Manager or Moderator — queue for Director+ approval
+    const request = await createStaffRequest({
+      requestorId: req.user.id, requestorName: actorName, requestorPosition: actorPos,
+      requestType: 'BAN_USER', targetUserId: targetId, targetUserName: targetR.rows[0]?.name,
+      minApproverPosition: 'Director', payload: { reason }
+    });
+    res.json({ success: true, queued: true, request });
   } catch (err) {
     res.status(500).json({ error: 'Failed to ban user' });
   }
 });
 
 // POST /api/admin/users/:id/unban
-app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/users/:id/unban', authenticateToken, requirePosition('Manager'), async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
     await pool.query(`UPDATE users SET is_banned = false, ban_reason = NULL WHERE id = $1`, [targetId]);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'UNBAN_USER', targetId, targetRes.rows[0]?.name, {});
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'UNBAN_USER', targetId, targetR.rows[0]?.name, {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to unban user' });
@@ -6012,34 +6523,34 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
 });
 
 // POST /api/admin/users/:id/clear-token — clear Canvas API token
-app.post('/api/admin/users/:id/clear-token', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/users/:id/clear-token', authenticateToken, requirePosition('Manager'), async (req, res) => {
   try {
     const targetId = req.params.id;
     await pool.query(`UPDATE users SET canvas_api_token = NULL, canvas_api_token_iv = NULL WHERE id = $1`, [targetId]);
     invalidateCachedToken(parseInt(targetId));
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'CLEAR_CANVAS_TOKEN', parseInt(targetId), targetRes.rows[0]?.name, {});
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id = $1', [targetId]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'CLEAR_CANVAS_TOKEN', parseInt(targetId), targetR.rows[0]?.name, {});
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Failed to clear token' }); }
 });
 
-// GET /api/admin/users/:id/canvas-token — decrypt and return the user's Canvas API token
-app.get('/api/admin/users/:id/canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+// GET /api/admin/users/:id/canvas-token — decrypt and return Canvas API token (Director+ only)
+app.get('/api/admin/users/:id/canvas-token', authenticateToken, requirePosition('Director'), async (req, res) => {
   try {
     const targetId = parseInt(req.params.id);
     const userRow = await pool.query('SELECT canvas_api_token, canvas_api_token_iv, name FROM users WHERE id=$1', [targetId]);
     if (!userRow.rows[0]) return res.status(404).json({ error: 'User not found' });
     const u = userRow.rows[0];
     const decrypted = getDecryptedCanvasToken(targetId, u);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'VIEW_CANVAS_TOKEN', targetId, u.name, {});
+    const actorR = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'VIEW_CANVAS_TOKEN', targetId, u.name, {});
     res.json({ token: decrypted || null });
   } catch (err) { console.error('Admin view canvas token error:', err); res.status(500).json({ error: 'Failed to retrieve token' }); }
 });
 
-// POST /api/admin/users/:id/set-canvas-token — replace a user's Canvas API token
-app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requireAdmin, async (req, res) => {
+// POST /api/admin/users/:id/set-canvas-token — replace Canvas API token (Manager+ only)
+app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requirePosition('Manager'), async (req, res) => {
   try {
     const { token: newToken } = req.body;
     if (!newToken || !newToken.trim()) return res.status(400).json({ error: 'token is required' });
@@ -6052,23 +6563,24 @@ app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requireAdmi
     const encryptedToken = `${encrypted}:${authTag}`;
     await pool.query('UPDATE users SET canvas_api_token=$1, canvas_api_token_iv=$2 WHERE id=$3', [encryptedToken, iv.toString('hex'), targetId]);
     invalidateCachedToken(targetId);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id=$1', [targetId]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'SET_CANVAS_TOKEN', targetId, targetRes.rows[0]?.name, {});
+    const actorR = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id=$1', [targetId]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'SET_CANVAS_TOKEN', targetId, targetR.rows[0]?.name, {});
     res.json({ success: true });
   } catch (err) { console.error('Admin set canvas token error:', err); res.status(500).json({ error: 'Failed to set token' }); }
 });
 
 // DELETE /api/admin/tasks/:taskId — admin delete a specific task
-app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/tasks/:taskId', authenticateToken, requirePosition('Manager'), async (req, res) => {
   try {
     const taskRes = await pool.query('SELECT title, user_id FROM tasks WHERE id = $1', [req.params.taskId]);
     if (taskRes.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
     const task = taskRes.rows[0];
     await pool.query('UPDATE tasks SET deleted = true WHERE id = $1', [req.params.taskId]);
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    const targetRes = await pool.query('SELECT name FROM users WHERE id = $1', [task.user_id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'DELETE_TASK', task.user_id, targetRes.rows[0]?.name, { task_title: task.title, task_id: req.params.taskId });
+    const actorR = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const targetR = await pool.query('SELECT name FROM users WHERE id = $1', [task.user_id]);
+    await staffLog(req.user.id, actorR.rows[0]?.name, req.actorPosition, 'DELETE_TASK', task.user_id, targetR.rows[0]?.name,
+      { task_title: task.title, task_id: req.params.taskId });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete task' });
@@ -6080,7 +6592,7 @@ app.delete('/api/admin/tasks/:taskId', authenticateToken, requireAdmin, async (r
 // ============================================================================
 
 // GET /api/admin/diagnostics
-app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/diagnostics', authenticateToken, requireStaff, async (req, res) => {
   try {
     // Admin's timezone offset in minutes east of UTC (e.g. -300 for EST, +330 for IST)
     const tzOffsetMinutes = parseInt(req.query.tzOffset) || 0;
@@ -6190,11 +6702,56 @@ app.get('/api/admin/diagnostics', authenticateToken, requireAdmin, async (req, r
 // ADMIN: AUDIT LOG
 // ============================================================================
 
-app.get('/api/admin/audit-log', authenticateToken, requireAdmin, async (req, res) => {
+// GET /api/admin/staff-log — staff log with position-aware visibility
+app.get('/api/admin/staff-log', authenticateToken, requireStaff, async (req, res) => {
   try {
+    const actorPos = req.actorPosition;
+    const actorRank = positionRank(actorPos);
+    const limit = Math.min(parseInt(req.query.limit) || 200, 500);
+    const offset = parseInt(req.query.offset) || 0;
+    const search = req.query.search?.trim() || '';
+    const actionFilter = req.query.action?.trim() || '';
+
+    // Build visibility filter: can see logs of users with lower rank
+    // Exception: Supervisor can see Owner logs too
+    let positionFilter = '';
+    if (actorPos === 'Supervisor') {
+      positionFilter = ''; // sees all
+    } else {
+      // Enumerate positions visible to this actor (those with rank < actorRank),
+      // using the single canonical positionRank() table rather than a duplicate.
+      const visiblePositions = STAFF_POSITIONS.concat(['user'])
+        .filter(p => positionRank(p) < actorRank);
+      if (visiblePositions.length === 0) return res.json([]);
+      positionFilter = `AND l.actor_position = ANY(ARRAY[${visiblePositions.map(p=>`'${p}'`).join(',')}])`;
+    }
+
+    const searchFilter = search ? `AND (l.actor_name ILIKE $3 OR l.action ILIKE $3 OR l.target_user_name ILIKE $3)` : '';
+    const actionFilterSQL = actionFilter ? `AND l.action = '${actionFilter.replace(/'/g,"''")}'` : '';
+
+    const params = [limit, offset];
+    if (search) params.push(`%${search}%`);
+
     const result = await pool.query(
-      `SELECT * FROM admin_audit_log ORDER BY created_at DESC LIMIT 200`
+      `SELECT l.id, l.actor_id, l.actor_name, l.actor_position, l.action,
+              l.target_user_id, l.target_user_name, l.details, l.created_at
+       FROM staff_log l
+       WHERE 1=1 ${positionFilter} ${searchFilter} ${actionFilterSQL}
+       ORDER BY l.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      params
     );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Staff log error:', err);
+    res.status(500).json({ error: 'Failed to fetch staff log' });
+  }
+});
+
+// Legacy alias
+app.get('/api/admin/audit-log', authenticateToken, requireStaff, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM staff_log ORDER BY created_at DESC LIMIT 200`);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch audit log' });
@@ -6313,15 +6870,33 @@ app.get('/api/help', authenticateToken, async (req, res) => {
 });
 
 // PUT help content (admin only)
-app.put('/api/admin/help', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/help', authenticateToken, requirePosition('Support'), async (req, res) => {
   try {
     const { content } = req.body;
+    const actorPos = req.actorPosition;
+    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name;
+
+    // Editor: full direct access. Manager/Director/Owner: direct access.
+    // Moderator attempts require Manager+ approval. Support attempts require Moderator+ approval.
+    let minApprover = null;
+    if (actorPos === 'Moderator') minApprover = 'Manager';
+    else if (actorPos === 'Support') minApprover = 'Moderator';
+
+    if (minApprover) {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: adminName, requestorPosition: actorPos,
+        requestType: 'EDIT_RESOURCE', targetUserId: null, targetUserName: null,
+        minApproverPosition: minApprover, payload: { content }
+      });
+      return res.json({ queued: true, request });
+    }
+
     await pool.query(
       'UPDATE help_content SET content = $1, updated_at = CURRENT_TIMESTAMP, updated_by = $2 WHERE id = 1',
       [content, req.user.id]
     );
-    const adminRes = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-    await auditLog(req.user.id, adminRes.rows[0]?.name, 'UPDATE_HELP', null, null, {
+    await staffLog(req.user.id, adminName, actorPos, 'UPDATE_HELP', null, null, {
       content_length: content?.length ?? 0
     });
     res.json({ success: true });
@@ -6976,13 +7551,15 @@ app.post('/api/studios/banners/:bannerId/dismiss', authenticateToken, async (req
 // ============================================================================
 
 // GET /api/admin/hpt-users
-app.get('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/hpt-users', authenticateToken, requirePosition('Moderator'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT h.id, h.name, h.created_at,
-         COUNT(DISTINCT s.id) AS studio_count
+         COUNT(DISTINCT s.id) AS studio_count,
+         COUNT(DISTINCT sm.user_id) AS member_count
        FROM hpt_users h
        LEFT JOIN hpt_studios s ON s.created_by = h.id
+       LEFT JOIN hpt_studio_members sm ON sm.studio_id = s.id
        GROUP BY h.id ORDER BY h.name`
     );
     res.json(result.rows);
@@ -6992,33 +7569,84 @@ app.get('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, res
 });
 
 // POST /api/admin/hpt-users — create HPT user
-app.post('/api/admin/hpt-users', authenticateToken, requireAdmin, async (req, res) => {
+// Manager+/Director+/Owner: direct. Moderator attempt: requires Manager+ approval.
+app.post('/api/admin/hpt-users', authenticateToken, requirePosition('Moderator'), async (req, res) => {
   try {
     const { name, passcode } = req.body;
     if (!name || !passcode) return res.status(400).json({ error: 'Name and passcode required' });
+    const actorPos = req.actorPosition;
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name || 'Admin';
+
+    if (actorPos === 'Moderator') {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: adminName, requestorPosition: actorPos,
+        requestType: 'ADD_HPT_USER', targetUserId: null, targetUserName: name,
+        minApproverPosition: 'Manager', payload: { name, passcode }
+      });
+      return res.json({ queued: true, request });
+    }
+
     const hash = await bcrypt.hash(passcode, 10);
     const result = await pool.query(
       'INSERT INTO hpt_users (name, passcode_hash) VALUES ($1,$2) RETURNING id, name, created_at',
       [name, hash]
     );
-    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
-    const adminName = adminRes.rows[0]?.name || 'Admin';
-    await auditLog(req.user.id, adminName, 'hpt_user_created', null, name, { name });
+    await staffLog(req.user.id, adminName, actorPos, 'hpt_user_created', null, name, { name });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create HPT user' });
   }
 });
 
+// PATCH /api/admin/hpt-users/:id — edit name and/or regenerate passcode
+// Manager can edit name directly but NOT regenerate passcode (Director+ only per spec).
+// Moderator attempt for either requires Manager+ approval.
+app.patch('/api/admin/hpt-users/:id', authenticateToken, requirePosition('Moderator'), async (req, res) => {
+  try {
+    const { name, passcode } = req.body;
+    const targetId = parseInt(req.params.id);
+    const actorPos = req.actorPosition;
+    const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
+    const adminName = adminRes.rows[0]?.name || 'Admin';
+    const targetR = await pool.query('SELECT name FROM hpt_users WHERE id=$1', [targetId]);
+    if (!targetR.rows[0]) return res.status(404).json({ error: 'HPT user not found' });
+
+    if (actorPos === 'Moderator') {
+      const request = await createStaffRequest({
+        requestorId: req.user.id, requestorName: adminName, requestorPosition: actorPos,
+        requestType: 'EDIT_HPT_USER', targetUserId: targetId, targetUserName: targetR.rows[0].name,
+        minApproverPosition: 'Manager', payload: { name, passcode }
+      });
+      return res.json({ queued: true, request });
+    }
+
+    // Managers can't regenerate passcodes — Director+ only
+    if (passcode !== undefined && !hasRankFn(actorPos, 'Director')) {
+      return res.status(403).json({ error: 'Only Directors and above can regenerate HPT passcodes' });
+    }
+
+    if (name !== undefined) await pool.query('UPDATE hpt_users SET name=$1 WHERE id=$2', [name, targetId]);
+    if (passcode !== undefined) {
+      const hash = await bcrypt.hash(passcode, 10);
+      await pool.query('UPDATE hpt_users SET passcode_hash=$1 WHERE id=$2', [hash, targetId]);
+    }
+    await staffLog(req.user.id, adminName, actorPos, 'hpt_user_edited', targetId, targetR.rows[0].name, { name, passcodeChanged: !!passcode });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to edit HPT user' });
+  }
+});
+
 // DELETE /api/admin/hpt-users/:id
-app.delete('/api/admin/hpt-users/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/hpt-users/:id', authenticateToken, requirePosition('Manager'), async (req, res) => {
   try {
     const r = await pool.query('SELECT name FROM hpt_users WHERE id=$1', [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'HPT user not found' });
     await pool.query('DELETE FROM hpt_users WHERE id=$1', [req.params.id]);
     const adminRes = await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id]);
     const adminName = adminRes.rows[0]?.name || 'Admin';
-    await auditLog(req.user.id, adminName, 'hpt_user_deleted', null, r.rows[0].name, {});
+    await staffLog(req.user.id, adminName, req.actorPosition, 'hpt_user_deleted', null, r.rows[0].name, {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete HPT user' });
