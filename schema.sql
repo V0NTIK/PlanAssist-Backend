@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS users (
     canvas_api_token            TEXT,                           -- AES-256-GCM encrypted Canvas personal access token
     canvas_api_token_iv         TEXT,                           -- GCM initialisation vector
     is_new_user                 BOOLEAN         DEFAULT TRUE,   -- Cleared on first account setup save
-    is_admin                    BOOLEAN         DEFAULT FALSE,
+    position                    VARCHAR(20)     DEFAULT 'user',     -- 'user'|'Moderator'|'Manager'|'Director'|'Supervisor'|'Owner'|'Support'|'Editor'|'Broadcaster'|'Spectator'
     is_banned                   BOOLEAN         DEFAULT FALSE,
     ban_reason                  TEXT,
     show_in_feed                BOOLEAN         DEFAULT TRUE,   -- Opt in/out of the Live Activity Feed
@@ -70,7 +70,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token           TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS canvas_api_token_iv        TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS present_periods            VARCHAR(20)  DEFAULT '2-6';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_user                BOOLEAN      DEFAULT TRUE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin                   BOOLEAN      DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS position                   VARCHAR(20)  DEFAULT 'user';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned                  BOOLEAN      DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason                 TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS show_in_feed               BOOLEAN      DEFAULT TRUE;
@@ -642,15 +642,33 @@ ALTER TABLE feedback ADD COLUMN IF NOT EXISTS checked BOOLEAN NOT NULL DEFAULT F
 -- ADMIN LOG
 -- Single-row table holding admin-editable shared log/notes document.
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS admin_log (
+-- ============================================================================
+-- BULLETIN
+-- Shared staff bulletin board (formerly admin_log).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS bulletin (
     id          INTEGER PRIMARY KEY DEFAULT 1,
     content     TEXT NOT NULL DEFAULT '',
     updated_at  TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_by  INTEGER REFERENCES users(id)
 );
 
-INSERT INTO admin_log (id, content) VALUES (1, '')
+INSERT INTO bulletin (id, content) VALUES (1, '')
 ON CONFLICT (id) DO NOTHING;
+
+-- Migrate existing admin_log content into bulletin if admin_log still exists
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'admin_log') THEN
+    INSERT INTO bulletin (id, content, updated_at, updated_by)
+    SELECT 1, content, updated_at, updated_by FROM admin_log WHERE id = 1
+    ON CONFLICT (id) DO UPDATE
+      SET content    = EXCLUDED.content,
+          updated_at = EXCLUDED.updated_at,
+          updated_by = EXCLUDED.updated_by;
+  END IF;
+END $$;
 
 
 -- ============================================================================
@@ -678,7 +696,7 @@ ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS announcements (
     id              SERIAL PRIMARY KEY,
-    author_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+    author_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
     author_name     TEXT NOT NULL,
     message         TEXT NOT NULL,
     type            TEXT NOT NULL DEFAULT 'info'
@@ -691,6 +709,9 @@ CREATE TABLE IF NOT EXISTS announcements (
 );
 
 ALTER TABLE announcements ADD COLUMN IF NOT EXISTS target_audience VARCHAR(20) DEFAULT 'all';
+-- Fix contradictory NOT NULL + ON DELETE SET NULL — drop NOT NULL so user deletion
+-- doesn't fail with a constraint violation when that user authored an announcement.
+ALTER TABLE announcements ALTER COLUMN author_id DROP NOT NULL;
 
 
 -- ============================================================================
@@ -711,16 +732,71 @@ CREATE TABLE IF NOT EXISTS announcement_dismissals (
 -- Records all admin actions for accountability.
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS admin_audit_log (
+-- ============================================================================
+-- STAFF LOG
+-- Audit trail of all staff actions (formerly admin_audit_log).
+-- actor_position stores the acting staff member's position at time of action
+-- so log visibility rules remain accurate even if positions change later.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS staff_log (
     id               SERIAL PRIMARY KEY,
-    admin_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
-    admin_name       TEXT NOT NULL,
+    actor_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    actor_name       TEXT NOT NULL,
+    actor_position   VARCHAR(20) NOT NULL DEFAULT 'user',
     action           TEXT NOT NULL,
     target_user_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
     target_user_name TEXT,
     details          JSONB,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_staff_log_actor     ON staff_log(actor_id);
+CREATE INDEX IF NOT EXISTS idx_staff_log_created   ON staff_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_staff_log_action    ON staff_log(action);
+
+-- Migrate existing admin_audit_log rows into staff_log
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'admin_audit_log') THEN
+    INSERT INTO staff_log (id, actor_id, actor_name, actor_position, action, target_user_id, target_user_name, details, created_at)
+    SELECT id, admin_id, admin_name, 'Owner', action, target_user_id, target_user_name, details, created_at
+    FROM admin_audit_log
+    ON CONFLICT (id) DO NOTHING;
+    -- Sync the serial sequence after bulk insert
+    PERFORM setval('staff_log_id_seq', COALESCE((SELECT MAX(id) FROM staff_log), 1));
+  END IF;
+END $$;
+
+
+-- ============================================================================
+-- STAFF REQUESTS
+-- Approval-workflow queue for actions that require sign-off from a higher
+-- ranked staff member (e.g. Moderator attempting to ban, Manager promoting
+-- someone to Manager, Director promoting someone to Director).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS staff_requests (
+    id                 SERIAL PRIMARY KEY,
+    requestor_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    requestor_name     TEXT NOT NULL,
+    requestor_position VARCHAR(20) NOT NULL DEFAULT 'user',
+    request_type       TEXT NOT NULL,        -- e.g. 'BAN_USER','EDIT_USER','PROMOTE_POSITION','POST_BANNER','EDIT_RESOURCE','ADD_HPT_USER','EDIT_HPT_USER'
+    target_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    target_user_name   TEXT,
+    -- Minimum position rank required to approve this request (stored as text for readability)
+    min_approver_position VARCHAR(20) NOT NULL DEFAULT 'Manager',
+    payload            JSONB,                -- the action's intended parameters (e.g. { reason, newPosition, etc. })
+    status             VARCHAR(20) NOT NULL DEFAULT 'pending',  -- 'pending' | 'approved' | 'rejected' | 'cancelled'
+    resolved_by        INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    resolved_by_name   TEXT,
+    resolved_at        TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_requests_status   ON staff_requests(status);
+CREATE INDEX IF NOT EXISTS idx_staff_requests_created  ON staff_requests(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_staff_requests_requestor ON staff_requests(requestor_id);
 
 
 -- ============================================================================
@@ -745,6 +821,29 @@ CREATE TRIGGER update_users_updated_at
 -- BACKFILLS
 -- Safe one-time data corrections. All guarded so they are harmless on re-run.
 -- ============================================================================
+
+-- ── is_admin → position migration ──────────────────────────────────────────
+-- Run only when is_admin column still exists (first deploy after schema change).
+-- The column is dropped at the end so this block is guaranteed to run exactly
+-- once — re-running schema.sql afterward will find is_admin already gone and
+-- skip this block entirely, which is essential since this UPDATE would
+-- otherwise clobber any position changes made via the Admin Pane on every
+-- subsequent deploy.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'users' AND column_name = 'is_admin'
+  ) THEN
+    -- All previous admins become Manager (except user id=1 who becomes Owner)
+    UPDATE users SET position = 'Manager' WHERE is_admin = TRUE AND id != 1;
+    UPDATE users SET position = 'Owner'   WHERE id = 1;
+    -- All normal users become 'user'
+    UPDATE users SET position = 'user'    WHERE is_admin = FALSE AND position = 'user';
+    -- Drop the column now that its data has been fully migrated to position.
+    ALTER TABLE users DROP COLUMN is_admin;
+  END IF;
+END $$;
 
 -- Backfill last_sync from MAX(tasks.created_at) for users who appear to never have synced
 UPDATE users u
