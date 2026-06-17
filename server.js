@@ -5674,10 +5674,16 @@ app.get('/api/admin/staff', authenticateToken, requireStaff, async (req, res) =>
        WHERE u.position != 'user'
        ORDER BY u.created_at ASC`
     );
-    // Moderators can only see users below them on the Staff tab
-    // (Supervisors can see all including Owners — handled client-side flag)
+    // Visibility rules per spec:
+    // - Moderator is the ONLY position with restricted Staff-tab visibility:
+    //   "they can't see any other Moderators or Supervisors or Directors or Owners"
+    // - Everyone else (Owner, Supervisor, Director, Manager) sees the full staff list.
+    //   Manager/Director's inability to EDIT certain users is enforced separately
+    //   in the position-change endpoint, not by hiding them here.
+    // - Everyone can always see themselves regardless of rank.
     const rows = result.rows.filter(u => {
-      if (req.actorPosition === 'Supervisor') return true; // sees all
+      if (u.id === req.user.id) return true; // always see yourself
+      if (req.actorPosition !== 'Moderator') return true;
       return positionRank(u.position) < actorRank;
     });
     res.json(rows);
@@ -5695,11 +5701,12 @@ app.get('/api/admin/staff/:id/log', authenticateToken, requireStaff, async (req,
     // Get target's position for visibility check
     const targetPosR = await pool.query('SELECT position FROM users WHERE id=$1', [targetId]);
     const targetPos = targetPosR.rows[0]?.position || 'user';
-    // Visibility: can see logs of users with lower rank
-    // Exception: Supervisor can see Owner logs
+    // Visibility: can see logs of users at or below their own rank (so an Owner
+    // can view another Owner's — or their own — log entries)
+    // Exception: Supervisor can additionally see Owner logs
     const canView = req.actorPosition === 'Supervisor'
       ? true
-      : positionRank(targetPos) < actorRank;
+      : positionRank(targetPos) <= actorRank;
     if (!canView) return res.status(403).json({ error: 'Cannot view this user\'s log' });
     const result = await pool.query(
       `SELECT id, actor_name, actor_position, action, target_user_name, details, created_at
@@ -6349,7 +6356,7 @@ app.get('/api/admin/users/:id', authenticateToken, requirePosition('Moderator'),
       [req.params.id]
     );
     const dismissalsRes = await pool.query(
-      `SELECT b.title, b.is_active, d.dismissed_at
+      `SELECT b.message AS title, b.is_active, d.dismissed_at
        FROM hpt_studio_banner_dismissals d
        JOIN hpt_studio_banners b ON b.id = d.banner_id
        WHERE d.user_id=$1 ORDER BY d.dismissed_at DESC LIMIT 50`,
@@ -6712,16 +6719,17 @@ app.get('/api/admin/staff-log', authenticateToken, requireStaff, async (req, res
     const search = req.query.search?.trim() || '';
     const actionFilter = req.query.action?.trim() || '';
 
-    // Build visibility filter: can see logs of users with lower rank
-    // Exception: Supervisor can see Owner logs too
+    // Build visibility filter: can see logs of users at or below their own rank
+    // (so an Owner can see other Owners' actions, including their own), plus
+    // the Supervisor exception which can additionally see Owner logs.
     let positionFilter = '';
     if (actorPos === 'Supervisor') {
       positionFilter = ''; // sees all
     } else {
-      // Enumerate positions visible to this actor (those with rank < actorRank),
+      // Enumerate positions visible to this actor (rank <= actorRank),
       // using the single canonical positionRank() table rather than a duplicate.
       const visiblePositions = STAFF_POSITIONS.concat(['user'])
-        .filter(p => positionRank(p) < actorRank);
+        .filter(p => positionRank(p) <= actorRank);
       if (visiblePositions.length === 0) return res.json([]);
       positionFilter = `AND l.actor_position = ANY(ARRAY[${visiblePositions.map(p=>`'${p}'`).join(',')}])`;
     }
