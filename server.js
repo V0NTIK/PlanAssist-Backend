@@ -898,16 +898,22 @@ app.post('/api/auth/register', async (req, res) => {
     const user = result.rows[0];
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '90d' });
 
-    res.json({ 
-      token, 
-      user: { 
-        id: user.id, 
-        email: user.email, 
+    // Record the client IP for admin use (IP blocking feature) — registration is a login too
+    const registerIp = (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim().replace(/^::ffff:/, '');
+    if (registerIp) {
+      pool.query('UPDATE users SET last_login_ip = $1 WHERE id = $2', [registerIp, user.id]).catch(() => {});
+    }
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
         name: user.name,
         isNewUser: user.is_new_user,
         isAdmin: isStaff(user.position),
         position: user.position || 'user'
-      } 
+      }
     });
   } catch (error) {
     console.error('Register error:', error);
@@ -6631,7 +6637,7 @@ app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requirePosi
     if (!newToken || !newToken.trim()) return res.status(400).json({ error: 'token is required' });
     const targetId = parseInt(req.params.id);
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(process.env.ENCRYPTION_KEY, 'hex'), iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_BUFFER, iv);
     let encrypted = cipher.update(newToken.trim(), 'utf8', 'hex');
     encrypted += cipher.final('hex');
     const authTag = cipher.getAuthTag().toString('hex');
