@@ -6631,7 +6631,7 @@ app.post('/api/admin/users/:id/set-canvas-token', authenticateToken, requirePosi
     if (!newToken || !newToken.trim()) return res.status(400).json({ error: 'token is required' });
     const targetId = parseInt(req.params.id);
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(process.env.ENCRYPTION_KEY, 'hex'), iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_BUFFER, iv);
     let encrypted = cipher.update(newToken.trim(), 'utf8', 'hex');
     encrypted += cipher.final('hex');
     const authTag = cipher.getAuthTag().toString('hex');
